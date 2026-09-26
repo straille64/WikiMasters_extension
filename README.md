@@ -20,6 +20,8 @@ upstream/   Copie verbatim du code d'origine (commit 3ef2719) + sa doc
 src/        Notre copie de travail : header.user.js (en-tête) + open_cards.js.
 dist/       Build généré, installable tel quel dans Tampermonkey.
 scripts/    build.sh — concatène src/ vers dist/ et vérifie la syntaxe.
+            test.sh  — vérifie la syntaxe et lance tests/.
+tests/      Tests unitaires des helpers purs (node, sans dépendance).
 docs/       API.md (surface réseau relevée), AUDIT.md (bugs et fragilités
             relevés à l'import).
 ```
@@ -30,8 +32,18 @@ docs/       API.md (surface réseau relevée), AUDIT.md (bugs et fragilités
 ./scripts/build.sh
 ```
 
-Produit `dist/wikimasters-bot.user.js` (~11 900 lignes), vérifie l'alignement des
-versions et passe `node --check` si node est disponible.
+Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et passe
+`node --check` si node est disponible.
+
+## Tests
+
+```bash
+./scripts/test.sh
+```
+
+Le code étant un monolithe dans une seule IIFE, il n'y a rien à importer : les tests
+extraient les helpers voulus de `src/open_cards.js` par équilibrage d'accolades puis
+les évaluent — ils portent donc sur le code réellement livré, pas sur une copie.
 
 ## Installation (état actuel : userscript)
 
@@ -55,8 +67,10 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Import complet du bot d'origine, build reproductible
 - [x] Suppression du `@require` distant (le build est autonome)
 - [x] Audit des bugs et fragilités → [docs/AUDIT.md](docs/AUDIT.md)
-- [ ] Correction des bugs de la boucle d'ouverture (erreurs, cooldown, 429)
-- [ ] Échappement HTML systématique
+- [x] Correction des bugs de la boucle d'ouverture (erreurs, cooldown, 429) — audit #1, #2, #3, #5
+- [x] Premiers tests unitaires sur les helpers (`./scripts/test.sh`)
+- [ ] Échappement HTML systématique — helpers `esc()`/`escUrl()` en place, sweep des
+      autres modules à finir (audit #4)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

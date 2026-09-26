@@ -1,7 +1,10 @@
 # Audit du code importé — v1.3.13
 
 Relevé à l'import (commit upstream `3ef2719`), avant toute correction.
-Les numéros de ligne renvoient à `src/open_cards.js`.
+Les numéros de ligne renvoient à la version **importée** de `src/open_cards.js`
+(elles ont bougé depuis les correctifs).
+
+Chaque entrée traitée porte une ligne de statut avec la version du fork.
 
 ## 🔴 Bugs
 
@@ -15,6 +18,15 @@ la nuit = bot qui tourne dans le vide jusqu'au matin.
 **Correctif** : distinguer les cas. `packs_remaining === 0` → cooldown. Erreur
 d'auth → arrêt du module + alerte visible (+ Discord). Erreur inconnue → backoff.
 
+**✅ Corrigé (1.3.13-fork.1)** — la loop classe désormais la réponse en quatre cas :
+auth (`PACK_AUTH_ERROR_RE` sur le message d'API, ou HTTP 401) → `haltPackOpener()`
+qui arrête le module, affiche l'alerte et notifie Discord ; `packs_remaining === 0`
+→ cooldown ; erreur applicative inconnue → backoff exponentiel, arrêt au bout de
+`PACK_MAX_FAILURES` (8) ; 403 → pause puis arrêt au 3ᵉ refus consécutif.
+Effet de bord corrigé au passage : une réponse sans carte **et** sans erreur (avec
+`packs_remaining > 0`) repartait au bout de 1,2–3 s, donc martelait l'API ; elle
+passe maintenant par l'attente de regen.
+
 ### 2. Cooldown jamais lu depuis le serveur
 Même bloc : la durée vient uniquement du réglage utilisateur (`getSetting('packCooldown')`),
 avec une marge fixe de 2 s. Aucune lecture d'un temps restant renvoyé par l'API.
@@ -23,6 +35,13 @@ on perd des slots (trop lent) ou on tape trop tôt en boucle (trop rapide).
 
 **Correctif** : lire le temps restant renvoyé par l'API quand il existe, garder le
 réglage utilisateur en repli, et borner par un plancher de sécurité.
+
+**✅ Corrigé (1.3.13-fork.1)** — `readServerCooldownMs()` sonde les noms de champs
+plausibles (`PACK_CD_ABS_KEYS` pour un instant absolu ISO/epoch, `PACK_CD_REL_KEYS`
+pour une durée relative), y compris imbriqués dans `data.user` / `data.pack`. Valeur
+serveur prioritaire, réglage utilisateur en repli, tout borné par
+`PACK_WAIT_FLOOR_MS` (5 s) et `PACK_WAIT_CEIL_MS` (30 min) pour qu'une valeur
+aberrante ne gèle pas le module. Le log indique la source retenue.
 
 ### 3. Pas de gestion du 429, pas de backoff exponentiel
 `src/open_cards.js:11374-11380` — seul le `403` est traité (pause 60 s) ; tout le
@@ -33,6 +52,13 @@ en boucle. C'est le comportement qui fait repérer un bot par la modération.
 **Correctif** : vérifier `res.ok` et `content-type` avant `res.json()`, respecter
 `Retry-After`, backoff exponentiel plafonné, arrêt au bout de N échecs consécutifs.
 
+**✅ Corrigé (1.3.13-fork.1)** — `openPack()` vérifie `res.ok` **et** le
+`content-type` avant de parser, et lève une `PackApiError` portant `status`,
+`retryAfterMs` (secondes ou date HTTP) et un extrait du corps. La loop respecte
+`Retry-After` quand il est fourni, sinon `packBackoffMs()` (5 s → 5 min max, avec
+jitter pour ne pas retomber en rythme régulier), et s'arrête au bout de 8 échecs
+consécutifs avec alerte + Discord.
+
 ### 4. Aucun échappement HTML
 Les titres de cartes et leurs URL partent bruts dans `innerHTML`
 (ex. `src/open_cards.js:10820-10835` : `href="${url}"`, `title="${title}"`).
@@ -42,10 +68,22 @@ l'affichage ; un `<` dans un titre injecte du HTML dans la page.
 
 **Correctif** : un helper `esc()` unique, appliqué à toute donnée serveur injectée.
 
+**🟡 En cours (1.3.13-fork.1)** — helpers `esc()` (5 caractères, contenu et attributs)
+et `escUrl()` (refuse `javascript:` / `data:` avant d'échapper) ajoutés et appliqués
+au bloc « derniers drops » et aux logs d'ouverture. Reste à passer les autres modules
+(marché, collection, étiquetage) en revue.
+
 ### 5. Stats de session comptées avant vérification
 `handlePackOpened()` (`src/open_cards.js:10758`) sort tôt si `cards` est vide, mais
 n'inspecte jamais `data.error`. Une réponse partielle ou inattendue qui porterait
 quand même un tableau `cards` serait comptée comme un pack réussi.
+
+**Correctif** : refuser de comptabiliser une réponse portant une erreur, et renvoyer
+à l'appelant si le pack a été compté.
+
+**✅ Corrigé (1.3.13-fork.1)** — `handlePackOpened()` sort sur `apiErrorText(data)`
+non vide (avec log explicite « pack non comptabilisé ») et retourne un booléen dont
+la loop se sert pour choisir entre cooldown et backoff.
 
 ## 🟠 Fragilités structurelles
 
@@ -77,6 +115,12 @@ Trois fonctions `fetchPage` distinctes dans trois portées, deux `onUp`/`onMove`
 état global partagé. Le CHANGELOG upstream documente au moins une régression née
 exactement de ça (`ReferenceError` de portée sur `method`, cf. entrée du 20/08).
 Aucun test, aucun lint.
+
+**🟡 En cours (1.3.13-fork.1)** — `tests/helpers.test.mjs` + `scripts/test.sh` : les
+helpers purs sont extraits de la source par équilibrage d'accolades puis évalués, donc
+testés tels qu'ils sont livrés. Couvre `esc`/`escUrl`, `parseRetryAfterMs`,
+`apiErrorText`, `readServerCooldownMs`, `PACK_AUTH_ERROR_RE` et `packBackoffMs`.
+Le découpage en modules reste à faire.
 
 ### 11. Versions incohérentes en amont
 En-tête `@version 1.3.13` mais CHANGELOG en `v1.4.x` : le fichier distribué a

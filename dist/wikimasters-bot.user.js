@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.0
+// @version      1.3.13-fork.1
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.0';
+    const WM_VERSION = '1.3.13-fork.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -112,6 +112,9 @@
 
     let running = false;
     let packLoopEpoch = 0; // jeton de génération : invalide toute boucle Pack Opener précédente
+    // Renseigné par createUI. Permet à la loop (scope module) d'arrêter proprement
+    // le module sur erreur fatale : bouton remis en ▶ START, timer stoppé, dot éteint.
+    let packOpenerStopFn = null;
     let totalPacks = 0;
     let totalCards = 0;
     let cardStats = {};
@@ -1074,6 +1077,28 @@
     function isLogCategoryEnabled(category) {
         const setting = CATEGORY_TO_SETTING[category];
         return setting ? getSetting(setting) : true; // system → toujours visible
+    }
+
+    /* ===================== ÉCHAPPEMENT HTML ===================== */
+
+    // Échappe toute donnée venant du serveur (titres Wikipédia, messages d'erreur
+    // d'API, pseudos) avant injection dans de l'innerHTML. Un titre contenant `"`
+    // cassait l'attribut englobant, un `<` injectait du HTML dans la page.
+    // Les 5 caractères couvrent à la fois le contenu texte et les attributs
+    // délimités par " ou '.
+    const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    function esc(v) {
+        if (v === null || v === undefined) return '';
+        return String(v).replace(/[&<>"']/g, (c) => ESC_MAP[c]);
+    }
+
+    // Idem pour une URL injectée dans un href : on refuse les schémas exécutables
+    // (javascript:, data:) avant d'échapper, sinon un lien suffit à exécuter du code.
+    function escUrl(v) {
+        const raw = String(v === null || v === undefined ? '' : v).trim();
+        if (!raw) return '';
+        if (/^[a-z0-9.+-]*:/i.test(raw) && !/^(https?|mailto):/i.test(raw)) return '';
+        return esc(raw);
     }
 
     function wmLog(msg) {
@@ -8479,6 +8504,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
 
         startBtn.onclick = () => setPackOpenerRunning(!running);
+        // Donne à la loop un moyen d'arrêter le module (session expirée, échecs répétés).
+        packOpenerStopFn = () => setPackOpenerRunning(false);
 
         // Bouton "Ouvrir pack" : ouvre UN seul pack manuellement (utile pour écouler les packs
         // en attente sans lancer la boucle auto). Passe par openPack() → handlePackOpened, donc
@@ -8501,10 +8528,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     await handlePackOpened(data, { animate: true });
                 }
             } catch(err) {
-                if (err && err.message === '403') {
-                    if (alertEl) alertEl.innerHTML = `<span style="color:#EF4444">⛔ 403 — réessaie dans un instant</span>`;
+                if (err && (err.status === 401 || err.status === 403)) {
+                    if (alertEl) alertEl.innerHTML = `<span style="color:#EF4444">⛔ ${err.status} — session expirée ? recharge la page (Ctrl+Shift+R)</span>`;
+                    wmLog(`⛔ Ouverture manuelle refusée (HTTP ${err.status}) — vérifie que tu es toujours connecté au site.`);
                 } else {
-                    if (alertEl) alertEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${err && err.message ? err.message : 'ouverture échouée'}</span>`;
+                    if (alertEl) alertEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(err && err.message ? err.message : 'ouverture échouée')}</span>`;
                 }
             } finally {
                 openPackBtn.disabled = false;
@@ -10671,13 +10699,76 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // (déjà comptée par la loop) d'une ouverture MANUELLE faite depuis le site.
     let botPackOpenInFlight = 0;
 
+    /* ── Bornes d'attente du Pack Opener ──
+       Toute durée d'attente (cooldown serveur, Retry-After, backoff) est bornée :
+       un plancher pour ne jamais marteler l'API, un plafond pour qu'une valeur
+       aberrante renvoyée par le site ne gèle pas le module jusqu'au lendemain. */
+    const PACK_WAIT_FLOOR_MS  = 5 * 1000;
+    const PACK_WAIT_CEIL_MS   = 30 * 60 * 1000;
+    const PACK_BACKOFF_BASE_MS = 5 * 1000;   // 1er échec inconnu → 5 s
+    const PACK_BACKOFF_MAX_MS  = 5 * 60 * 1000;
+    const PACK_MAX_FAILURES    = 8;          // au-delà : arrêt du module + alerte
+    const PACK_MAX_403         = 3;          // 403 répétés = plus un simple hoquet
+
+    const PACK_OPEN_URL = "https://www.wiki-masters.com/api/packs/open";
+
+    // Erreur transport/HTTP enrichie : la loop a besoin du statut et du Retry-After
+    // pour décider (arrêt, backoff, cooldown) au lieu de retry à l'aveugle toutes les 5 s.
+    // status === 0 → réseau injoignable ou réponse illisible (HTML Cloudflare, JSON tronqué).
+    class PackApiError extends Error {
+        constructor(status, opts = {}) {
+            super(opts.message || ('HTTP ' + status));
+            this.name = 'PackApiError';
+            this.status = status;
+            this.retryAfterMs = opts.retryAfterMs || 0;
+            this.body = opts.body || '';
+        }
+    }
+
+    // Retry-After : soit un entier de secondes, soit une date HTTP. Plafonné à 30 min
+    // pour qu'un en-tête absurde ne gèle pas le module.
+    function parseRetryAfterMs(header) {
+        if (!header) return 0;
+        const raw = String(header).trim();
+        const secs = Number(raw);
+        if (Number.isFinite(secs)) return Math.min(Math.max(0, secs * 1000), PACK_WAIT_CEIL_MS);
+        const at = Date.parse(raw);
+        return Number.isFinite(at) ? Math.min(Math.max(0, at - Date.now()), PACK_WAIT_CEIL_MS) : 0;
+    }
+
     async function openPack() {
         botPackOpenInFlight++;
         try {
-            const res = await fetch("https://www.wiki-masters.com/api/packs/open",
-                { method: "POST", credentials: "include" });
-            if (res.status === 403) throw new Error("403");
-            return res.json();
+            let res;
+            try {
+                res = await fetch(PACK_OPEN_URL, { method: "POST", credentials: "include" });
+            } catch (e) {
+                throw new PackApiError(0, { message: 'réseau injoignable (' + (e && e.message || 'fetch échoué') + ')' });
+            }
+            const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
+            const body = await res.text().catch(() => '');
+            if (!res.ok) {
+                throw new PackApiError(res.status, {
+                    message: 'HTTP ' + res.status + ' ' + (res.statusText || ''),
+                    retryAfterMs,
+                    body: body.slice(0, 300),
+                });
+            }
+            // Un 200 ne garantit pas du JSON : page de challenge Cloudflare ou page de
+            // maintenance arrivent en text/html et faisaient exploser res.json().
+            const ctype = (res.headers.get('content-type') || '').toLowerCase();
+            if (!ctype.includes('json')) {
+                throw new PackApiError(0, {
+                    message: 'réponse non-JSON (' + (ctype || 'sans content-type') + ')',
+                    retryAfterMs,
+                    body: body.slice(0, 300),
+                });
+            }
+            try {
+                return JSON.parse(body);
+            } catch (e) {
+                throw new PackApiError(0, { message: 'JSON illisible', retryAfterMs, body: body.slice(0, 300) });
+            }
         } finally {
             botPackOpenInFlight--;
         }
@@ -10776,10 +10867,34 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         wmLog(`🔬 Champs carte de pack : <span style="color:#888;font-size:9px;">${Object.keys(sample).join(', ')}</span>`);
     }
 
+    // Message d'erreur porté par une réponse d'API, normalisé en chaîne ('' si aucune).
+    // L'API renvoie selon les cas `error`, `message` ou `detail`.
+    function apiErrorText(data) {
+        if (!data || typeof data !== 'object') return '';
+        for (const k of ['error', 'message', 'detail']) {
+            const v = data[k];
+            if (typeof v === 'string' && v.trim()) return v.trim();
+            if (v && typeof v === 'object') {
+                const m = v.message || v.msg;
+                if (typeof m === 'string' && m.trim()) return m.trim();
+            }
+            if (v === true) return k;
+        }
+        return '';
+    }
+
+    // Retourne true si le pack a bien été comptabilisé. Une réponse portant à la fois
+    // des `cards` et une erreur est une réponse partielle : on ne la compte pas, sinon
+    // les stats de session dérivent silencieusement.
     async function handlePackOpened(data, opts = {}) {
         const { animate = false } = opts;
         const cards = (data && data.cards) || [];
-        if (!cards.length) return;
+        if (!cards.length) return false;
+        const errText = apiErrorText(data);
+        if (errText) {
+            wmLog(`⚠️ Réponse d'ouverture en erreur — pack <b>non comptabilisé</b> : ${esc(errText)}`);
+            return false;
+        }
         logPackCardFields(cards[0]); // diag : quels identifiants sont dispo pour un deep-link
 
         rolloverDailyStatsIfNeeded(); // reset des stats du jour si on a passé minuit
@@ -10847,12 +10962,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // Le site ouvre les cartes de collection dans une popup SANS URL → pas de
                 // deep-link possible vers la collection. On pointe donc vers la page
                 // Wikipédia de la carte (ouverte dans un nouvel onglet).
-                const nameHtml = url
-                    ? `<a href="${url}" target="wm-card-view" rel="noopener"
+                const safeTitle = esc(title);
+                const safeUrl = escUrl(url);
+                const nameHtml = safeUrl
+                    ? `<a href="${safeUrl}" target="wm-card-view" rel="noopener"
                         style="color:${r.color};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;"
-                        title="Ouvrir « ${title} » sur Wikipédia"
-                        onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${title}</a>`
-                    : `<span style="color:${r.color};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${title}">${title}</span>`;
+                        title="Ouvrir « ${safeTitle} » sur Wikipédia"
+                        onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${safeTitle}</a>`
+                    : `<span style="color:${r.color};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${safeTitle}">${safeTitle}</span>`;
 
                 return `<div style="padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);
                     display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;">
@@ -10869,7 +10986,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 .map(c => c.wikipedia_title)
                 .join(", ");
 
-            if (alertEl) alertEl.innerHTML = `🚨 MOT-CLÉ : ${cardsNames}`;
+            if (alertEl) alertEl.innerHTML = `🚨 MOT-CLÉ : ${esc(cardsNames)}`;
             sendToDiscord(`🚨 MOT-CLÉ détecté : ${cardsNames}`, 65535);
 
             // Historise chaque carte matchée et log dans le dashboard
@@ -10879,7 +10996,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const rarity = (c.rarity || 'C').toUpperCase();
                 const kw = matchedKeyword(c, true) || '?';
                 packKwHits.push({ title, rarity, keyword: kw, ts: now });
-                wmLog(`🎯 Pack match : <b>${title}</b> [${rarity}] · keyword <span style="color:#00FFFF;">${kw}</span>`);
+                wmLog(`🎯 Pack match : <b>${esc(title)}</b> [${esc(rarity)}] · keyword <span style="color:#00FFFF;">${esc(kw)}</span>`);
             });
             if (packKwHits.length > 100) packKwHits = packKwHits.slice(-100);
             savePackKwHits();
@@ -10890,6 +11007,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // Auto-tag des cartes packées selon les recherches enregistrées (non bloquant).
         autoTagPackedCards(cards).catch(() => {});
+        return true;
     }
 
     // Récupération de tags : quand le SITE échoue à poser des tags en LOT
@@ -11331,11 +11449,139 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     /* ===================== LOOP ===================== */
 
+    /* ── Cooldown renvoyé par le serveur (audit #2) ──
+       L'API ne documente pas son champ de temps restant et peut en changer de nom :
+       on sonde les noms plausibles, en acceptant aussi bien un instant absolu qu'une
+       durée relative. Le réglage utilisateur (packCooldown) reste le repli. */
+    const PACK_CD_ABS_KEYS = ['next_pack_at', 'next_pack_time', 'next_pack', 'regen_at',
+        'next_regen_at', 'cooldown_ends_at', 'packs_next_at'];
+    const PACK_CD_REL_KEYS = ['next_pack_in', 'next_pack_in_seconds', 'seconds_until_next_pack',
+        'cooldown_ms', 'cooldown_seconds', 'cooldown_sec', 'cooldown', 'regen_in',
+        'remaining_seconds', 'time_remaining', 'retry_after'];
+
+    // Instant absolu (ISO ou epoch s/ms) → délai restant en ms, ou null si inexploitable.
+    function packCdFromAbsolute(v) {
+        let at = null;
+        if (typeof v === 'number' && Number.isFinite(v)) {
+            // En dessous de 1e9 ce n'est pas un epoch mais une durée : on laisse passer.
+            at = v >= 1e12 ? v : v >= 1e9 ? v * 1000 : null;
+        } else if (typeof v === 'string' && v.trim()) {
+            const parsed = Date.parse(v.trim());
+            if (Number.isFinite(parsed)) at = parsed;
+        }
+        if (at === null) return null;
+        const delta = at - Date.now();
+        return delta >= 0 && delta <= PACK_WAIT_CEIL_MS ? delta : null;
+    }
+
+    // Durée relative → ms. Secondes par défaut, ms si le nom du champ le dit.
+    function packCdFromRelative(v, key) {
+        const n = typeof v === 'string' ? Number(v.trim()) : v;
+        if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return null;
+        const ms = /ms$|millis/i.test(key) ? n : n * 1000;
+        return ms <= PACK_WAIT_CEIL_MS ? ms : null;
+    }
+
+    function readServerCooldownMs(data) {
+        if (!data || typeof data !== 'object') return null;
+        const scopes = [data, data.pack, data.packs, data.user, data.data]
+            .filter(o => o && typeof o === 'object');
+        for (const scope of scopes) {
+            for (const k of PACK_CD_ABS_KEYS) {
+                const ms = packCdFromAbsolute(scope[k]);
+                if (ms !== null) return { ms, source: k };
+            }
+            for (const k of PACK_CD_REL_KEYS) {
+                const ms = packCdFromRelative(scope[k], k);
+                if (ms !== null) return { ms, source: k };
+            }
+        }
+        return null;
+    }
+
+    // Une erreur d'auth est définitive : rien ne se débloquera en attendant le cooldown.
+    const PACK_AUTH_ERROR_RE = /unauthor|unauthent|not authenticated|not logged|non connect|session (expir|invalid)|expired|invalid token|jwt|forbidden|\b401\b|\b403\b/i;
+
+    // Backoff exponentiel plafonné, avec un peu de jitter : un retry à intervalle
+    // parfaitement régulier est exactement ce qui fait repérer un bot.
+    function packBackoffMs(failures) {
+        const exp = PACK_BACKOFF_BASE_MS * Math.pow(2, Math.max(0, failures - 1));
+        return Math.min(exp, PACK_BACKOFF_MAX_MS) + Math.random() * 1000;
+    }
+
+    // Arrêt net du module, signalé partout où l'utilisateur peut le voir (panneau,
+    // log, Discord). Sans ça, une session qui expire la nuit = un bot qui tourne
+    // dans le vide jusqu'au matin, en silence.
+    function haltPackOpener(alertEl, title, detail) {
+        if (alertEl) {
+            alertEl.innerHTML = `<span style="color:#EF4444;font-weight:700;">⛔ ${esc(title)}</span>`
+                + `<br><span style="color:#888;font-size:10px;">${esc(detail)}</span>`;
+        }
+        wmLog(`⛔ Pack Opener arrêté — <b>${esc(title)}</b> · ${esc(detail)}`);
+        sendToDiscord(`⛔ **Pack Opener arrêté**\n${title}\n${detail}`, 15158332);
+        if (packOpenerStopFn) packOpenerStopFn();
+        else running = false; // repli si l'UI n'a pas encore branché son hook
+    }
+
     async function loop(revealEl, lastDropEl, rarityEl, alertEl, epoch) {
 
     // `epoch === packLoopEpoch` : cette boucle est-elle toujours la boucle courante ?
     // Un stop→start génère un nouvel epoch ; l'ancienne boucle sort ici au lieu de doubler.
     const isCurrent = () => running && epoch === packLoopEpoch;
+
+    // Échecs consécutifs, remis à zéro dès qu'un cycle se termine normalement.
+    let failures = 0;
+    let http403 = 0;
+
+    // Attente interruptible avec décompte affiché. Retourne false si la boucle a été
+    // stoppée/relancée pendant l'attente (le ticker est nettoyé aussitôt, pas à la fin).
+    const waitWithTicker = async (ms, label, color) => {
+        const endTime = Date.now() + ms;
+        const render = () => {
+            // PERF : rien de visible → on ne touche pas au DOM.
+            if (document.hidden) return;
+            const overlay = document.getElementById('wm-overlay');
+            if (!overlay || overlay.style.display === 'none') return;
+            const remaining = Math.max(0, endTime - Date.now());
+            if (alertEl) {
+                alertEl.innerHTML = `<span style="color:${color}">${label} ${Math.ceil(remaining / 1000)}s…</span>`;
+            }
+        };
+        render();
+        const tickerId = setInterval(render, 1000);
+        try {
+            while (isCurrent() && Date.now() < endTime) {
+                await new Promise(r => setTimeout(r, 1000));
+            }
+        } finally {
+            clearInterval(tickerId);
+        }
+        return isCurrent();
+    };
+
+    // Attente de régénération : temps serveur s'il est exploitable, réglage sinon,
+    // toujours borné par PACK_WAIT_FLOOR_MS / PACK_WAIT_CEIL_MS.
+    const waitPackCooldown = async (data) => {
+        const settingSec = getSetting('packCooldown');
+        const fromServer = readServerCooldownMs(data);
+        // +2 s de marge : le serveur libère le slot une fraction de seconde après.
+        let waitMs = (fromServer ? fromServer.ms : settingSec * 1000) + 2000;
+        waitMs = Math.min(Math.max(waitMs, PACK_WAIT_FLOOR_MS), PACK_WAIT_CEIL_MS);
+        const waitSec = Math.round(waitMs / 1000);
+        const src = fromServer ? `serveur · ${fromServer.source}` : 'réglage';
+
+        // Log au premier passage puis seulement si la source ou la durée change.
+        const logKey = `${src}:${waitSec}`;
+        if (loop._lastLoggedCd !== logKey) {
+            loop._lastLoggedCd = logKey;
+            const hint = fromServer ? ''
+                : settingSec === 180 ? ', 3 min, abonné'
+                : settingSec === 600 ? ', 10 min, non-abonné' : ', custom';
+            wmLog(`📦 Pack regen : <b>${waitSec}s</b> (${src}${hint})`);
+        }
+        return waitWithTicker(waitMs, '⏳ Regen dans', '#888');
+    };
+
     while (isCurrent()) {
         try {
             // Pause propre si le réseau est coupé (évite de spammer des requêtes en échec)
@@ -11345,61 +11591,91 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
             const data = await openPack();
             if (!isCurrent()) break; // stoppé/relancé pendant l'ouverture → on n'enchaîne pas
+            http403 = 0;             // la requête est passée : le compteur de refus repart
+
+            const errText = apiErrorText(data);
+
+            // ── Erreur d'auth dans le corps JSON → arrêt immédiat, pas de cooldown ──
+            if (errText && PACK_AUTH_ERROR_RE.test(errText)) {
+                haltPackOpener(alertEl, 'session expirée ou accès refusé',
+                    `${errText} — reconnecte-toi à wiki-masters.com puis relance le module.`);
+                break;
+            }
 
             // Comptabilisation + affichage + alertes (mutualisé avec les
             // ouvertures manuelles interceptées, cf. handlePackOpened).
-            await handlePackOpened(data, { animate: true });
+            const counted = await handlePackOpened(data, { animate: true });
+            if (!isCurrent()) break;
 
-            // ✅ Regen
-            if (data.packs_remaining === 0 || data.error) {
-                // Le setting utilisateur est la source de vérité (l'API peut renvoyer
-                // des valeurs liées au prochain slot, pas au cooldown complet)
-                const cdSec = getSetting('packCooldown');
-                const waitMs = cdSec * 1000;
-
-                // Log uniquement au premier passage ou si la valeur a changé
-                if (loop._lastLoggedCd !== cdSec) {
-                    wmLog(`📦 Pack regen : <b>${cdSec}s</b> (${cdSec === 180 ? '3 min, abonné' : cdSec === 600 ? '10 min, non-abonné' : 'custom'})`);
-                    loop._lastLoggedCd = cdSec;
-                }
-
-                // Ticker live qui décompte chaque seconde
-                const endTime = Date.now() + waitMs + 2000;
-                const updateAlert = () => {
-                    // PERF : skip si overlay fermé/hidden — l'alert n'est pas visible
-                    if (document.hidden) return;
-                    const overlay = document.getElementById('wm-overlay');
-                    if (!overlay || overlay.style.display === 'none') return;
-                    const remaining = Math.max(0, endTime - Date.now() - 2000);
-                    alertEl.innerHTML = `<span style="color:#888">⏳ Regen dans ${Math.round(remaining/1000)}s…</span>`;
-                };
-                updateAlert();
-                const tickerId = setInterval(updateAlert, 1000);
-                try {
-                    // Attente interruptible : on sort dès que la boucle n'est plus courante
-                    // (stop/restart) → le ticker est nettoyé aussitôt, pas à la fin du cooldown.
-                    while (isCurrent() && Date.now() < endTime) {
-                        await new Promise(r => setTimeout(r, 1000));
-                    }
-                } finally {
-                    clearInterval(tickerId);
-                }
-                if (!isCurrent()) break;
+            if (counted) {
+                failures = 0;
+                await sleep(1200 + Math.random() * 1800); // ✅ délai humanisé
                 continue;
             }
 
-            // ✅ délai humanisé
-            let delay = 1200 + Math.random() * 1800;
-            await sleep(delay);
+            // ── Plus de packs (ou réponse vide sans erreur) → attente de regen ──
+            const noPacksLeft = Number(data && data.packs_remaining) === 0;
+            if (noPacksLeft || !errText) {
+                failures = 0;
+                if (!(await waitPackCooldown(data))) break;
+                continue;
+            }
+
+            // ── Erreur applicative inconnue (maintenance, quota, bug serveur) ──
+            failures++;
+            if (failures >= PACK_MAX_FAILURES) {
+                haltPackOpener(alertEl, `${failures} échecs d'ouverture d'affilée`,
+                    `dernière erreur : ${errText}`);
+                break;
+            }
+            const apiWait = packBackoffMs(failures);
+            wmLog(`⚠️ Ouverture refusée (${failures}/${PACK_MAX_FAILURES}) : ${esc(errText)}`
+                + ` — retry dans ${Math.round(apiWait / 1000)}s`);
+            if (!(await waitWithTicker(apiWait, '⚠️ Erreur — retry dans', '#fbbf24'))) break;
 
         } catch (err) {
+            if (!isCurrent()) break;
+            const status = err && err.status;
 
-            if (err.message === "403") {
-                alertEl.innerHTML = `<span style="color:#EF4444">⛔ 403 — pause 60s</span>`;
-                await sleep(60000);
-            } else {
-                await sleep(5000);
+            // 401 : la session est morte, aucune attente ne la ressuscitera.
+            if (status === 401) {
+                haltPackOpener(alertEl, 'session expirée (HTTP 401)',
+                    'reconnecte-toi à wiki-masters.com puis relance le module.');
+                break;
             }
+
+            // 403 : protection anti-bot ou perte de droits. Un refus isolé se rattrape
+            // avec une pause ; répété, c'est un blocage franc → on arrête.
+            if (status === 403) {
+                http403++;
+                if (http403 >= PACK_MAX_403) {
+                    haltPackOpener(alertEl, `${http403} refus 403 d'affilée`,
+                        'le site refuse les ouvertures. Recharge la page et vérifie ta session avant de relancer.');
+                    break;
+                }
+                const wait403 = Math.min(Math.max(err.retryAfterMs || 0, 60000), PACK_WAIT_CEIL_MS);
+                wmLog(`⛔ 403 sur l'ouverture (${http403}/${PACK_MAX_403}) — pause ${Math.round(wait403 / 1000)}s`);
+                if (!(await waitWithTicker(wait403, '⛔ 403 — pause', '#EF4444'))) break;
+                continue;
+            }
+
+            failures++;
+            if (failures >= PACK_MAX_FAILURES) {
+                haltPackOpener(alertEl, `${failures} échecs d'ouverture d'affilée`,
+                    `dernière erreur : ${(err && err.message) || 'inconnue'}`);
+                break;
+            }
+
+            // 429 / 5xx / page HTML de Cloudflare : Retry-After s'il est fourni,
+            // sinon backoff exponentiel plafonné.
+            const wait = Math.min(Math.max((err && err.retryAfterMs) || 0, packBackoffMs(failures)), PACK_WAIT_CEIL_MS);
+            const label = status === 429 ? '🚦 429 trop de requêtes — pause'
+                : status ? `⚠️ HTTP ${status} — retry dans`
+                : '⚠️ Réseau — retry dans';
+            wmLog(`⚠️ Ouverture échouée (${failures}/${PACK_MAX_FAILURES}) : ${esc((err && err.message) || 'erreur')}`
+                + (err && err.body ? ` <span style="color:#666;font-size:9px;">${esc(err.body.slice(0, 120))}</span>` : '')
+                + ` — retry dans ${Math.round(wait / 1000)}s`);
+            if (!(await waitWithTicker(wait, label, status === 429 ? '#fbbf24' : '#EF4444'))) break;
         }
     }
 }
