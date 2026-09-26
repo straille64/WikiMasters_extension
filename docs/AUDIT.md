@@ -62,16 +62,30 @@ consécutifs avec alerte + Discord.
 ### 4. Aucun échappement HTML
 Les titres de cartes et leurs URL partent bruts dans `innerHTML`
 (ex. `src/open_cards.js:10820-10835` : `href="${url}"`, `title="${title}"`).
-Un seul échappement dans tout le fichier (`src/open_cards.js:7551`, et il ne traite
-que le guillemet double). Un titre Wikipédia contenant `"` casse l'attribut et
-l'affichage ; un `<` dans un titre injecte du HTML dans la page.
+Un titre Wikipédia contenant `"` casse l'attribut et l'affichage ; un `<` dans un
+titre injecte du HTML dans la page.
+
+Le vrai problème n'était pas l'absence totale d'échappement mais sa **dispersion** :
+trois implémentations partielles (`htmlEsc` sans `'`, `taggerEsc` sans `>` ni `'`,
+`escH` idem) plus six `.replace(/"/g, '&quot;')` écrits à la main, chacun oubliant
+un caractère différent — et ~150 interpolations qui n'en utilisaient aucune.
 
 **Correctif** : un helper `esc()` unique, appliqué à toute donnée serveur injectée.
 
-**🟡 En cours (1.3.13-fork.1)** — helpers `esc()` (5 caractères, contenu et attributs)
-et `escUrl()` (refuse `javascript:` / `data:` avant d'échapper) ajoutés et appliqués
-au bloc « derniers drops » et aux logs d'ouverture. Reste à passer les autres modules
-(marché, collection, étiquetage) en revue.
+**✅ Corrigé (1.3.13-fork.2)** — `esc()` couvre les 5 caractères (contenu **et**
+attributs délimités par `"` ou `'`) et `escUrl()` refuse les schémas exécutables
+(`javascript:`, `data:`) avant d'échapper. `htmlEsc`, `taggerEsc` et `escH` sont
+devenus des alias de `esc()` — les ~50 appels existants gagnent les caractères qui
+leur manquaient sans rien réécrire. Les 6 échappements ad hoc ont été remplacés, et
+149 interpolations de données serveur ou de saisie utilisateur (titres, pseudos,
+messages d'API, noms de tags, noms de fichiers) ont été enrobées, soit 166 points
+d'injection échappés au total.
+
+Écartés volontairement : les messages Discord (markdown, l'échappement HTML y
+afficherait `&amp;`), les chaînes de `confirm()` / `alert()`, la construction d'URL
+et de requêtes. `tests/escaping.test.mjs` verrouille l'ensemble : alias qui délèguent
+bien à `esc()`, aucun échappeur partiel réintroduit, aucune donnée serveur connue
+injectée brute dans du HTML, tout `href` interpolé passant par `escUrl()`.
 
 ### 5. Stats de session comptées avant vérification
 `handlePackOpened()` (`src/open_cards.js:10758`) sort tôt si `cards` est vide, mais
@@ -120,6 +134,7 @@ Aucun test, aucun lint.
 helpers purs sont extraits de la source par équilibrage d'accolades puis évalués, donc
 testés tels qu'ils sont livrés. Couvre `esc`/`escUrl`, `parseRetryAfterMs`,
 `apiErrorText`, `readServerCooldownMs`, `PACK_AUTH_ERROR_RE` et `packBackoffMs`.
+`tests/escaping.test.mjs` y ajoute quatre garde-fous statiques sur l'échappement.
 Le découpage en modules reste à faire.
 
 ### 11. Versions incohérentes en amont

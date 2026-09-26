@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.1
+// @version      1.3.13-fork.2
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.1';
+    const WM_VERSION = '1.3.13-fork.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -363,7 +363,7 @@
             const title = w.card?.wikipedia_title || '?';
             const rar = (w.snapshot_rarity || w.card?.rarity || '').toUpperCase();
             newWins.push({ title, rar, price });
-            wmLog(`🏆 Enchère gagnée : <b>${title}</b> [${rar}] → <span style="color:#ef4444;">${price} 💰</span>`);
+            wmLog(`🏆 Enchère gagnée : <b>${esc(title)}</b> [${rar}] → <span style="color:#ef4444;">${price} 💰</span>`);
 
             // Chasseur ciblé — auto-pause : cette enchère avait été armée par une chasse avec
             // `autoDisable` actif et vient d'être gagnée → on la met en pause toute seule.
@@ -871,7 +871,7 @@
                 border-radius:4px;background:linear-gradient(to right, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.03) 60%, ${r.color}66 100%);
                 border:1px solid ${r.color}33;font-size:10px;">
                 <span style="color:#666;font-family:monospace;font-size:9px;min-width:32px;white-space:nowrap;" title="${d.toLocaleString('fr-FR')}">${label}</span>
-                <span style="color:#fff;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${h.title}">${h.title}</span>
+                <span style="color:#fff;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(h.title)}">${esc(h.title)}</span>
                 ${badge(h.rarity)}
                 <span style="color:#00FFFF;font-size:9px;opacity:0.7;
                     background:rgba(0,255,255,0.1);padding:1px 4px;border-radius:3px;
@@ -1141,7 +1141,7 @@
         a.click();
         document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(url), 1000);
-        wmLog(`💾 Log exporté : <b>${filename}</b> (${logEntries.length} ligne${logEntries.length>1?'s':''})`);
+        wmLog(`💾 Log exporté : <b>${esc(filename)}</b> (${logEntries.length} ligne${logEntries.length>1?'s':''})`);
     }
 
     function sortHits(hits) {
@@ -1247,7 +1247,7 @@
         // QuotaExceededError, si le compte a un gros historique) permettra de confirmer la
         // cause au lieu de continuer à deviner.
         try { localStorage.setItem(KEYWORDS_HUNTER_KEY, JSON.stringify(KEYWORDS_HUNTER)); }
-        catch(e) { wmLog(`⚠️ Sauvegarde Chasseur ciblé ÉCHOUÉE : <b>${e.name || 'Erreur'}</b> — ${e.message || 'inconnue'}. L'entrée reste affichée mais N'A PAS été enregistrée.`); }
+        catch(e) { wmLog(`⚠️ Sauvegarde Chasseur ciblé ÉCHOUÉE : <b>${esc(e.name || 'Erreur')}</b> — ${esc(e.message || 'inconnue')}. L'entrée reste affichée mais N'A PAS été enregistrée.`); }
     }
 
     // Exclusion STRICTE : la carte est exclue si un mot exclu apparaît en SOUS-CHAÎNE
@@ -1314,7 +1314,7 @@
             return `<span style="display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:4px;
                 background:${bg};border:1px solid ${border};
                 font-size:10px;color:${color};margin:2px 2px 0 0;">
-                ${kw}
+                ${esc(kw)}
                 <button onclick="window.${fn}(${i})" style="
                     background:none;border:none;color:#666;cursor:pointer;
                     font-size:12px;padding:0 0 0 2px;line-height:1;" title="Retirer">×</button>
@@ -1330,7 +1330,7 @@
         // rareté requise (si définie) + un indicateur d'auto-pause (si activée). Une chasse
         // en pause est grisée pour être identifiable d'un coup d'œil, sans devoir lire le
         // texte du bouton — cohérent avec le reste des indicateurs d'état du bot.
-        const escH = (s) => String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+        const escH = esc; // alias local historique — cf. section ÉCHAPPEMENT HTML
         const hunterTags = KEYWORDS_HUNTER.map((h, i) => {
             const enabled = h.enabled !== false;
             const modeStr = h.mode === 'fourbe' ? '🕵️ fourbe' : '🤖 auto-bid';
@@ -1509,9 +1509,10 @@
         wmLog(`🔬 Vue cadres : aucune des annonces affichées n'expose d'image exploitable. Champs disponibles : <span style="color:#888;font-size:9px;">${Object.keys(card).join(', ')}</span>`);
     }
 
-    // Échappement HTML pour le texte injecté dans les templates (titres, descriptions Wikipédia).
-    const htmlEsc = (s) => String(s == null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Alias historique de esc() (cf. section ÉCHAPPEMENT HTML). Conservé parce qu'il
+    // est appelé dans tout le rendu du marché ; ne pas en refaire une implémentation
+    // séparée, c'est comme ça qu'on se retrouve avec des échappements partiels.
+    const htmlEsc = esc;
 
     // Sous-titre de la carte. L'endpoint marketplace ne renvoie PAS de description (contrairement
     // à la fiche du site) : les clés description/summary/extract restent sondées au cas où, mais
@@ -1969,7 +1970,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     border-left:3px solid ${r.color}; display:flex; align-items:center;
                     gap:8px; animation:fadeIn 0.2s ease;">
                     ${isKW ? '<span style="font-size:16px">🚨</span>' : ''}
-                    <span style="color:${r.color}; font-weight:600; font-size:13px; flex:1">${title}</span>
+                    <span style="color:${r.color}; font-weight:600; font-size:13px; flex:1">${esc(title)}</span>
                     ${badge(rarity)}
                 </div>`;
             await new Promise(r => setTimeout(r, 400));
@@ -2711,8 +2712,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const card = (activeHitsMap.get(id) || {}).auction?.card;
             const title = (card && card.wikipedia_title) || '?';
             wmLog(val != null
-                ? `🎯 Plafond auto-bid : <b>${title}</b> → ${val.toLocaleString('fr-FR')} 💰`
-                : `♾️ Plafond auto-bid retiré : <b>${title}</b>`);
+                ? `🎯 Plafond auto-bid : <b>${esc(title)}</b> → ${val.toLocaleString('fr-FR')} 💰`
+                : `♾️ Plafond auto-bid retiré : <b>${esc(title)}</b>`);
         }
     };
     window.leadingBidsMap = leadingBidsMap;
@@ -2755,17 +2756,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const mode = bidModeOf(id);
         if (mode === 'manual') {
             autoBidSet.add(id); saveAutoBidSet();
-            wmLog(`🤖 Auto-bid activé (riposte auto en cas de surenchère) : <b>${title}</b>`);
+            wmLog(`🤖 Auto-bid activé (riposte auto en cas de surenchère) : <b>${esc(title)}</b>`);
         } else if (mode === 'autobid') {
             autoBidSet.delete(id); saveAutoBidSet();
             snipeSet.add(id); saveSnipeSet();
-            wmLog(`🕵️ Fourbe activé (snipe à ~${getSetting('snipeSecondsBefore')}s de la fin) : <b>${title}</b>`);
+            wmLog(`🕵️ Fourbe activé (snipe à ~${getSetting('snipeSecondsBefore')}s de la fin) : <b>${esc(title)}</b>`);
         } else {
             snipeSet.delete(id); saveSnipeSet();
             // Si c'est le Hunter agressif qui avait armé cette enchère, il lâche prise et rend
             // le plafond d'origine — sinon son plafond resterait collé à la carte.
             if (disarmHunterFourbe(id)) saveHunterFourbe();
-            wmLog(`⚪ Mise manuelle : <b>${title}</b> — plus d'automatisme sur cette enchère.`);
+            wmLog(`⚪ Mise manuelle : <b>${esc(title)}</b> — plus d'automatisme sur cette enchère.`);
         }
         const el = document.getElementById('wm-market-alert');
         if (el && lastHitsCache.length > 0) renderMarketHits(el, lastHitsCache, []);
@@ -2980,11 +2981,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (res.ok) {
                     markAuctionAsMine(a.id, bidAmount, a);
                     placed++;
-                    const reasonStr = decision.reason ? ` <span style="color:#666;font-size:9px;">(${decision.reason})</span>` : '';
-                    wmLog(`🤖 Hunter : <b>${title}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>${reasonStr}`);
+                    const reasonStr = decision.reason ? ` <span style="color:#666;font-size:9px;">(${esc(decision.reason)})</span>` : '';
+                    wmLog(`🤖 Hunter : <b>${esc(title)}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>${esc(reasonStr)}`);
                     sendToDiscord("🤖 Auto-bid place : **" + title + "** a **" + bidAmount + " coins**", 5763719, 'market');
                 } else {
-                    wmLog(`⚠️ Hunter échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
+                    wmLog(`⚠️ Hunter échoué : <b>${esc(title)}</b> [${rar}] · ${esc(data?.error || 'erreur')}`);
                     sendToDiscord("⚠️ Auto-bid echoue : **" + title + "** - " + (data?.error || "erreur inconnue"), 15548997, 'market');
                 }
             } catch(e) {} finally { bidLockSet.delete(a.id); }
@@ -3015,7 +3016,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             armed++;
             const title = a.card?.wikipedia_title || '?';
             const rar = (a.card?.rarity || '').toUpperCase();
-            wmLog(`🕵️ Hunter agressif : <b>${title}</b> [${rar}] — snipe armé à ~${getSetting('snipeSecondsBefore')}s de la fin, plafond <span style="color:#fbbf24;">${decision.cap} 💰</span>`);
+            wmLog(`🕵️ Hunter agressif : <b>${esc(title)}</b> [${rar}] — snipe armé à ~${getSetting('snipeSecondsBefore')}s de la fin, plafond <span style="color:#fbbf24;">${decision.cap} 💰</span>`);
         }
         return armed;
     }
@@ -3416,7 +3417,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     const priceLabel = a.current_bid != null ? 'mise' : 'base';
                     const owned = collectionMap.get(a.card?.id) || 0;
                     const kw = matchedKeyword(a.card) || '?';
-                    wmLog(`🛒 Nouveau match : <b>${t}</b> [${r}] · ${priceLabel} ${p} 💰 · possession ×${owned} · keyword <span style="color:#00FFFF;">${kw}</span>`);
+                    wmLog(`🛒 Nouveau match : <b>${t}</b> [${r}] · ${priceLabel} ${p} 💰 · possession ×${owned} · keyword <span style="color:#00FFFF;">${esc(kw)}</span>`);
                 });
 
                 // 🛒 Notification Discord groupée
@@ -3461,7 +3462,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // exactement le cas d'une carte en train de dériver.
                     const alreadyOwned = isOwnedDuplicate(a.card?.id, rar);
                     if (alreadyOwned) {
-                        wmLog(`🎯 Chasseur ignoré (déjà possédée en ${rar || '?'}) : <b>${title}</b>`);
+                        wmLog(`🎯 Chasseur ignoré (déjà possédée en ${rar || '?'}) : <b>${esc(title)}</b>`);
                         continue;
                     }
                     // Rareté requise (optionnelle) : aucune mise tant que la carte n'affiche
@@ -3472,7 +3473,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // marqué juste au-dessus, donc l'annonce reste simplement ignorée tant que
                     // sa rareté n'est pas la bonne — jamais reprise par un autre mécanisme.
                     if (h.rarity && h.rarity !== rar) {
-                        wmLog(`🎯 Chasseur ignoré (rareté <b>${rar || '?'}</b> ≠ <b>${h.rarity}</b> requise) : <b>${title}</b>`);
+                        wmLog(`🎯 Chasseur ignoré (rareté <b>${rar || '?'}</b> ≠ <b>${h.rarity}</b> requise) : <b>${esc(title)}</b>`);
                         continue;
                     }
                     // 1) Plafond de l'enchère → respecté par TOUS les chemins de mise (riposte + snipe)
@@ -3495,12 +3496,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // 3) Mise initiale unique (les deux modes), jamais au-dessus du plafond
                     const alreadyLeading = isSelf(a.current_bidder?.username);
                     if (alreadyLeading || bidLockSet.has(a.id) || wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) {
-                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] — pas de mise initiale (${alreadyLeading ? 'déjà meneur' : 'solde/lock'})`);
+                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${esc(title)}</b> [${rar}] — pas de mise initiale (${alreadyLeading ? 'déjà meneur' : 'solde/lock'})`);
                         continue;
                     }
                     const bidAmount = minNextBid(a);
                     if (!autoBidWithinCap(a, bidAmount)) {
-                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}) : <b>${title}</b> [${rar}] — mise min ${bidAmount} &gt; plafond ${h.cap}, pas de mise`);
+                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}) : <b>${esc(title)}</b> [${rar}] — mise min ${bidAmount} &gt; plafond ${h.cap}, pas de mise`);
                         continue;
                     }
                     bidLockSet.add(a.id);
@@ -3515,10 +3516,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const data = await res.json().catch(() => ({}));
                         if (res.ok) {
                             markAuctionAsMine(a.id, bidAmount, a);
-                            wmLog(`🎯 Chasseur (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] → mise <span style="color:#fbbf24;">${bidAmount} 💰</span>${h.mode === 'fourbe' ? ' · snipe armé en fin' : ' · riposte activée'}`);
+                            wmLog(`🎯 Chasseur (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${esc(title)}</b> [${rar}] → mise <span style="color:#fbbf24;">${bidAmount} 💰</span>${h.mode === 'fourbe' ? ' · snipe armé en fin' : ' · riposte activée'}`);
                             sendToDiscord("🎯 Chasseur : **" + title + "** mise **" + bidAmount + " coins** (mode " + h.mode + ", plafond " + h.cap + ")", 3447003, 'market');
                         } else {
-                            wmLog(`⚠️ Chasseur échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
+                            wmLog(`⚠️ Chasseur échoué : <b>${esc(title)}</b> [${rar}] · ${esc(data?.error || 'erreur')}`);
                         }
                     } catch(e) {} finally { bidLockSet.delete(a.id); }
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
@@ -3553,13 +3554,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const rar = (a.card?.rarity || '').toUpperCase();
                         if (res.ok) {
                             markAuctionAsMine(a.id, bidAmount, a);
-                            wmLog(`⭐ Mot-clé prioritaire : <b>${title}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                            wmLog(`⭐ Mot-clé prioritaire : <b>${esc(title)}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                             sendToDiscord(
                                 "⭐ Auto-bid prioritaire : **" + title + "** à **" + bidAmount + " coins**",
                                 16766720, 'market'
                             );
                         } else {
-                            wmLog(`⚠️ Bid prioritaire échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
+                            wmLog(`⚠️ Bid prioritaire échoué : <b>${esc(title)}</b> [${rar}] · ${esc(data?.error || 'erreur')}`);
                         }
                     } catch(e) {} finally { bidLockSet.delete(a.id); }
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
@@ -3580,7 +3581,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     armedFourbe = true;
                     const title = a.card?.wikipedia_title || '?';
                     const rar = (a.card?.rarity || '').toUpperCase();
-                    wmLog(`🕵️ Fourbe armé (mot-clé) : <b>${title}</b> [${rar}] — snipe à ~${getSetting('snipeSecondsBefore')}s de la fin`);
+                    wmLog(`🕵️ Fourbe armé (mot-clé) : <b>${esc(title)}</b> [${rar}] — snipe à ~${getSetting('snipeSecondsBefore')}s de la fin`);
                 }
                 if (armedFourbe) saveSnipeSet();
 
@@ -3613,7 +3614,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             outbidHits.push(a); // → son + notif Discord groupée plus bas
                             const titleOb = a.card?.wikipedia_title || '?';
                             const rarOb = (a.card?.rarity || '').toUpperCase();
-                            wmLog(`😤 Surenchéri : <b>${titleOb}</b> [${rarOb}] · <b>${bidder}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>`);
+                            wmLog(`😤 Surenchéri : <b>${esc(titleOb)}</b> [${rarOb}] · <b>${esc(bidder)}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>`);
                         }
                     }
                 }
@@ -3679,7 +3680,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         markAuctionAsMine(a.id, bidAmount, a);
                         const titleAb = a.card?.wikipedia_title || '?';
                         const rarAb = (a.card?.rarity || '').toUpperCase();
-                        wmLog(`🤖 Auto-bid (riposte) : <b>${titleAb}</b> [${rarAb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                        wmLog(`🤖 Auto-bid (riposte) : <b>${esc(titleAb)}</b> [${rarAb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                         await fetchBalance();
                         sendToDiscord(
                             "🤖 Auto-bid : **" + (a.card?.wikipedia_title || "?") + "** → **" + bidAmount + " 💰** (solde : " + wikibidousBalance + ")",
@@ -3688,7 +3689,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         );
                     } else {
                         const errData = await res.json().catch(() => ({}));
-                        wmLog(`⚠️ Auto-bid (riposte) échoué : <b>${a.card?.wikipedia_title || '?'}</b> · ${errData?.error || 'erreur'}`);
+                        wmLog(`⚠️ Auto-bid (riposte) échoué : <b>${esc(a.card?.wikipedia_title || '?')}</b> · ${esc(errData?.error || 'erreur')}`);
                     }
                 } catch(e) {} finally { bidLockSet.delete(a.id); }
             }
@@ -3714,7 +3715,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         } catch(err) {
             marketStatusEl.innerHTML =
-                `<span style="color:#EF4444;font-size:10px;">⚠️ ${err.message}</span>`;
+                `<span style="color:#EF4444;font-size:10px;">⚠️ ${esc(err.message)}</span>`;
         }
     }
 
@@ -3965,7 +3966,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <div style="padding:7px 8px 8px;border-radius:0 0 6px 6px;
                             background:linear-gradient(160deg, ${rarHex}30 0%, ${rarHex}14 100%);
                             border:1px solid ${rarHex}40;border-top:none;">
-                            <a href="${marketUrl}" target="wm-card-view" rel="noopener"
+                            <a href="${escUrl(marketUrl)}" target="wm-card-view" rel="noopener"
                                 style="display:block;color:#fff;font-size:11.5px;font-weight:700;line-height:1.25;text-decoration:none;
                                 overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${htmlEsc(title)}">${htmlEsc(title)}</a>
                             ${desc ? `<div style="color:#ffffffaa;font-size:9px;line-height:1.3;margin-top:2px;max-height:24px;overflow:hidden;" title="${htmlEsc(desc)}">${htmlEsc(desc)}</div>` : ''}
@@ -4042,9 +4043,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <span onclick="window.wmToggleRowExpand('${a.id}')" title="Agrandir cette enchère" style="cursor:pointer;color:#888;font-size:11px;flex-shrink:0;user-select:none;">▸</span>
                     ${isOutbid ? '<span title="Surenchéri">😤</span>' : isLeading ? '<span title="Meneur">👑</span>' : isNew ? '<span title="Nouvelle annonce">🆕</span>' : ''}
                     ${snipeSet.has(a.id) ? `<span title="Mode Fourbe activé (snipe en fin d'enchère)${getAutoBidMax(a.id) ? ` · plafond ${getAutoBidMax(a.id).toLocaleString('fr-FR')} 💰` : ' · sans plafond'}" style="flex-shrink:0;font-size:9px;">🟣</span>` : ''}
-                    <a href="${marketUrl}" target="wm-card-view" rel="noopener" style="color:#fff;text-decoration:none;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${title}">${title}</a>
+                    <a href="${escUrl(marketUrl)}" target="wm-card-view" rel="noopener" style="color:#fff;text-decoration:none;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(title)}">${esc(title)}</a>
                     <span style="color:#FFD700;font-weight:700;white-space:nowrap;">${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>
-                    <span style="color:#888;white-space:nowrap;max-width:90px;overflow:hidden;text-overflow:ellipsis;" title="${hasBid ? (bidder || '?') : 'aucune mise'}">${hasBid ? (bidder || '?') : '—'}</span>
+                    <span style="color:#888;white-space:nowrap;max-width:90px;overflow:hidden;text-overflow:ellipsis;" title="${hasBid ? esc(bidder || '?') : 'aucune mise'}">${hasBid ? esc(bidder || '?') : '—'}</span>
                     <span id="wm-countdown-${a.id}" style="color:${cdColor};font-family:monospace;font-weight:700;white-space:nowrap;min-width:50px;text-align:right;">${cd}</span>
                     <button data-jumped="${priceJumped ? 1 : 0}"
                         title="Miser le minimum (${minNextBid(a)} 💰)${priceJumped ? ' — ⚠ prix en forte hausse, double-clic requis' : ''}"
@@ -4072,7 +4073,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     ${marketView === 'compact' ? `<span onclick="window.wmToggleRowExpand('${a.id}')" title="Réduire (revenir en compact)" style="cursor:pointer;color:#06b6d4;font-size:11px;flex-shrink:0;user-select:none;">▾</span>` : ''}
                     ${isNew ? '<span style="font-size:11px;" title="Nouvelle annonce">🆕</span>' : ''}
                     ${isOutbid ? '<span style="font-size:11px;" title="Vous avez perdu le lead">😤</span>' : isLeading ? '<span style="font-size:11px;" title="Vous êtes meneur">👑</span>' : ''}
-                    <a href="${marketUrl}" target="wm-card-view" rel="noopener" style="color:#fff;font-size:12px;font-weight:700;flex:1;text-decoration:none;">${title}</a>
+                    <a href="${escUrl(marketUrl)}" target="wm-card-view" rel="noopener" style="color:#fff;font-size:12px;font-weight:700;flex:1;text-decoration:none;">${esc(title)}</a>
                     ${badge(rarity)}
                     ${ownedBadge}
                     ${kw
@@ -4080,7 +4081,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             background:rgba(0,255,255,0.1);padding:1px 4px;border-radius:3px;
                             box-sizing:border-box;width:82px;text-align:center;
                             display:inline-block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                            vertical-align:middle;" title="${kw}">${kw}</span>`
+                            vertical-align:middle;" title="${esc(kw)}">${esc(kw)}</span>`
                         : `<span style="box-sizing:border-box;width:82px;display:inline-block;"></span>`
                     }
                 </div>
@@ -4089,7 +4090,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <span style="font-size:11px;">
                         ${hasBid
                             ? `<span style="color:#FFD700;font-weight:700;">💰 ${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>
-                               <span style="color:#888;font-size:10px;"> par ${bidder || "?"}</span>`
+                               <span style="color:#888;font-size:10px;"> par ${esc(bidder || "?")}</span>`
                             : `<span style="color:#888;font-size:11px;">Base : ${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>`
                         }
                     </span>
@@ -4104,7 +4105,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         ">⏱ ${cd}</span>
                         ${(() => {
                             const seller = a.seller?.username || a.owner?.username || a.user?.username || a.lister?.username || a.created_by?.username || null;
-                            return seller ? `<span style="color:#555;font-size:9px;margin-top:-1px;">vendu par <b style="color:#777;">${seller}</b></span>` : '';
+                            return seller ? `<span style="color:#555;font-size:9px;margin-top:-1px;">vendu par <b style="color:#777;">${esc(seller)}</b></span>` : '';
                         })()}
                     </div>
                 </div>
@@ -4116,9 +4117,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <button title="Rafraîchir le prix réel de cette enchère (mise à jour du prix et de la mise minimale)"
                         onclick="if(window.wmRefreshAuction)window.wmRefreshAuction('${a.id}', this);"
                         style="height:24px;box-sizing:border-box;padding:0 7px;border:1px solid rgba(6,182,212,0.3);border-radius:3px;background:none;color:#06b6d4;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;line-height:1;">↻</button>
-                    <button data-excl="${String(title).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}"
+                    <button data-excl="${esc(title)}"
                         onclick="if(window.wmAddExcludeKeyword)window.wmAddExcludeKeyword(this.dataset.excl);"
-                        title="Exclure strictement « ${String(title).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')} » des recherches"
+                        title="Exclure strictement « ${esc(title)} » des recherches"
                         style="height:24px;box-sizing:border-box;padding:0 7px;border:1px solid rgba(239,68,68,0.3);border-radius:3px;background:none;color:#ef4444;font-size:11px;cursor:pointer;display:inline-flex;align-items:center;">🚫</button>
                     <button data-jumped="${priceJumped ? 1 : 0}"
                         title="Miser.${priceJumped ? ' ⚠ Le prix a bondi de +10% depuis ta dernière mise — double-clic requis pour confirmer.' : ''}"
@@ -4403,15 +4404,15 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             if (res.ok) {
                                 markAuctionAsMine(a.id, bidAmount, a);
                                 const secLeft = Math.round(remaining / 1000);
-                                wmLog(`🕵️ Fourbe (snipe à ${secLeft}s) : <b>${titleSn}</b> [${rarSn}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                                wmLog(`🕵️ Fourbe (snipe à ${secLeft}s) : <b>${esc(titleSn)}</b> [${rarSn}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                                 fetchBalance().catch(() => {});
                                 sendToDiscord("🕵️ Snipe fourbe : **" + titleSn + "** → **" + bidAmount + " 💰**", 10181046, 'market');
                             } else {
                                 const errData = await res.json().catch(() => ({}));
-                                wmLog(`⚠️ Fourbe échoué : <b>${titleSn}</b> [${rarSn}] · ${errData?.error || 'erreur'}`);
+                                wmLog(`⚠️ Fourbe échoué : <b>${esc(titleSn)}</b> [${rarSn}] · ${esc(errData?.error || 'erreur')}`);
                             }
                         } catch(e) {
-                            wmLog(`⚠️ Fourbe exception : <b>${titleSn}</b> · ${e.message}`);
+                            wmLog(`⚠️ Fourbe exception : <b>${esc(titleSn)}</b> · ${esc(e.message)}`);
                         } finally {
                             bidLockSet.delete(a.id);
                         }
@@ -4442,7 +4443,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     const refundFragment = (refund && refund.deltaTotal > 0)
                         ? ` · <span style="color:#4ade80;font-weight:700;">+${refund.deltaTotal.toLocaleString('fr-FR')} 💰</span> (solde ${refund.newBalance.toLocaleString('fr-FR')} 💰)`
                         : '';
-                    wmLog(`⚡ Hot-lane : surenchéri sur <b>${titleOb}</b> [${rarOb}] · <b>${bidder}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>${refundFragment}`);
+                    wmLog(`⚡ Hot-lane : surenchéri sur <b>${esc(titleOb)}</b> [${rarOb}] · <b>${esc(bidder)}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>${refundFragment}`);
 
                     // 🔴 Feedback visuel INSTANTANÉ : on patche le cache d'affichage avec les
                     // données fraîches de la hot lane et on re-render tout de suite (la ligne
@@ -4476,7 +4477,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             );
                             if (res.ok) {
                                 markAuctionAsMine(a.id, bidAmount, a);
-                                wmLog(`⚡ Hot-lane bid : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                                wmLog(`⚡ Hot-lane bid : <b>${esc(titleOb)}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                                 // Refresh balance en arrière-plan, sans bloquer le tick
                                 fetchBalance().catch(() => {});
                                 sendToDiscord(
@@ -4486,10 +4487,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                                 );
                             } else {
                                 const errData = await res.json().catch(() => ({}));
-                                wmLog(`⚠️ Hot-lane bid échoué : <b>${titleOb}</b> [${rarOb}] · ${errData?.error || 'erreur'}`);
+                                wmLog(`⚠️ Hot-lane bid échoué : <b>${esc(titleOb)}</b> [${rarOb}] · ${esc(errData?.error || 'erreur')}`);
                             }
                         } catch(e) {
-                            wmLog(`⚠️ Hot-lane bid exception : <b>${titleOb}</b> · ${e.message}`);
+                            wmLog(`⚠️ Hot-lane bid exception : <b>${esc(titleOb)}</b> · ${esc(e.message)}`);
                         } finally {
                             bidLockSet.delete(a.id);
                         }
@@ -4595,7 +4596,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         try {
             await checkMarketplace(marketAlertEl, marketStatusEl);
         } catch (e) {
-            wmLog(`⚠️ scan échoué : ${e.message || e}`);
+            wmLog(`⚠️ scan échoué : ${esc(e.message || e)}`);
         } finally {
             marketScanInProgress = false;
         }
@@ -4807,7 +4808,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             .map(([r, n]) => `${r}:${n}`).join(' · ');
         wmLog(`🔍 Scan Trash : <b>${trashCards.length}</b> cartes tagguées (${newlyTagged.length > 0 ? `+${newlyTagged.length} depuis dernier scan` : 'inchangé'})${rarityStr ? ` — <span style="color:#888;">${rarityStr}</span>` : ''}`);
         if (skippedMultiTag > 0) {
-            wmLog(`🛡️ Filet de sécurité : <b>${skippedMultiTag}</b> carte(s) « ${sellTag} » ignorée(s) (elles portent aussi un autre tag)`);
+            wmLog(`🛡️ Filet de sécurité : <b>${skippedMultiTag}</b> carte(s) « ${esc(sellTag)} » ignorée(s) (elles portent aussi un autre tag)`);
         }
         if (skippedPendingTrade > 0) {
             wmLog(`⏸️ <b>${skippedPendingTrade}</b> carte(s) exclue(s) temporairement (engagée(s) dans un échange en attente) — réessai après ${PENDING_TRADE_COOLDOWN_MS / 60000} min`);
@@ -4977,7 +4978,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         wmLog(`🔬 <b>/mine</b> : 0 vente active retenue. Champs racine : <span style="color:#fbbf24;">${describe(data)}</span>`);
         wmLog(`🔬 Tableau retenu : <b>${key || 'AUCUN'}</b> (${(list || []).length} entrée(s)) · statuts vus : <b>${statuses}</b>`);
         if (list && list[0]) wmLog(`🔬 Champs d'une entrée : <span style="color:#888;">${describe(list[0])}</span>`);
-        wmLog(`🔬 Aperçu brut : <span style="color:#888;font-family:'JetBrains Mono',monospace;font-size:9px;">${String(raw).replace(/</g, '&lt;')}</span>`);
+        wmLog(`🔬 Aperçu brut : <span style="color:#888;font-family:'JetBrains Mono',monospace;font-size:9px;">${esc(raw)}</span>`);
     }
 
     // Rejoue le diagnostic à la demande, avec une requête fraîche. Utilisable depuis la console
@@ -5065,7 +5066,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 wmLog(`❌ Annulation impossible : <b>${label}</b> · HTTP ${res.status}${body ? ' · ' + body.slice(0, 80) : ''}`);
             }
         } catch(e) {
-            wmLog(`❌ Annulation exception : <b>${label}</b> · ${e.message}`);
+            wmLog(`❌ Annulation exception : <b>${label}</b> · ${esc(e.message)}`);
         }
     }
     window.wmCancelSale = cancelSale;
@@ -5119,7 +5120,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const hasBid = bidder !== null;
             const marketUrl = `https://www.wiki-masters.com/marketplace/${a.id}`;
             // Échappe le titre pour l'attribut data-* (peut contenir guillemets, apostrophes…)
-            const titleAttr = String(title).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+            const titleAttr = esc(title);
             // Badge compteur de remises en vente (nombre de fois invendue+retaguée)
             const cid = a.card?.id ?? a.card_id;
             const retagN = getRetagCount(cid);
@@ -5137,7 +5138,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 animation:fadeIn 0.3s ease;
             ">
                 <div style="display:flex;align-items:center;gap:5px;margin-bottom:2px;">
-                    <a href="${marketUrl}" target="wm-card-view" rel="noopener" style="color:#fff;font-size:11px;font-weight:700;flex:1;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;">${title}</a>
+                    <a href="${escUrl(marketUrl)}" target="wm-card-view" rel="noopener" style="color:#fff;font-size:11px;font-weight:700;flex:1;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;">${esc(title)}</a>
                     ${retagBadge}
                     ${badge(rarity)}
                     ${!hasBid ? `<button
@@ -5151,8 +5152,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:10px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;flex-shrink:0;">✕</button>` : ''}
                 </div>
                 <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;gap:6px;">
-                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${hasBid ? bidder : 'aucune mise'}">
-                        ${hasBid ? `👤 ${bidder}` : '— pas de mise'}
+                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${hasBid ? esc(bidder) : 'aucune mise'}">
+                        ${hasBid ? `👤 ${esc(bidder)}` : '— pas de mise'}
                     </span>
                     <span style="color:#fbbf24;font-weight:700;white-space:nowrap;">
                         ${hasBid ? `${bid} 💰` : `base ${bid} 💰`}
@@ -5373,7 +5374,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const cardId = item.card_id || item.card?.id;
             const duration = getSellDuration(rarity);
             const title = item.card?.wikipedia_title || item.wikipedia_title || '?';
-            if (!cardId) { skipped++; wmLog(`⚠️ Carte ignorée (ID manquant) : ${title}`); continue; }
+            if (!cardId) { skipped++; wmLog(`⚠️ Carte ignorée (ID manquant) : ${esc(title)}`); continue; }
 
             // Prix de base : marché (moyenne × %) si activé & historique dispo, sinon tableau
             const priceInfo = await resolveSellBasePrice(rarity, cardId);
@@ -5429,7 +5430,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     result = await sellCardViaUI(cardId, title, rarity, price, duration);
                     if (result.ok) { success = true; break; }
                     if (result.reason === 'wrong_page' || attempt === MAX_ATTEMPTS) break;
-                    wmLog(`⚠️ Mise en vente <b>${title}</b> échouée (${result.reason}), retry ${attempt}/${MAX_ATTEMPTS-1}…`);
+                    wmLog(`⚠️ Mise en vente <b>${esc(title)}</b> échouée (${esc(result.reason)}), retry ${attempt}/${MAX_ATTEMPTS-1}…`);
                     await new Promise(r => setTimeout(r, 1500));
                     attempt++;
                 }
@@ -5454,14 +5455,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const underTag = priceInfo.undercut
                     ? ` <span style="color:#22d3ee;font-size:9px;">(🃏 undercut : marché ${priceInfo.undercut.market} 💰)</span>`
                     : '';
-                wmLog(`🏷️ Mis en vente : <b>${title}</b> [${rarity}] · base ${price} 💰${priceSrc}${degrTag}${underTag}${retagTag}`);
+                wmLog(`🏷️ Mis en vente : <b>${esc(title)}</b> [${rarity}] · base ${price} 💰${priceSrc}${degrTag}${underTag}${retagTag}`);
             } else if (result && result.reason === 'wrong_page') {
                 skipped++;
                 wmLog(`⚠️ <b>Trash Seller en pause</b> — reste sur <code>/collection</code> pour que la mise en vente automatique fonctionne (elle simule un clic sur tes cartes).`);
                 break; // toutes les cartes suivantes échoueraient pour la même raison
             } else {
                 skipped++;
-                wmLog(`❌ Échec mise en vente : <b>${title}</b> [${rarity}] · <span style="color:#888;font-size:9px;">${result ? result.reason : '?'}</span>`);
+                wmLog(`❌ Échec mise en vente : <b>${esc(title)}</b> [${rarity}] · <span style="color:#888;font-size:9px;">${esc(result ? result.reason : '?')}</span>`);
             }
         }
         return { sold, skipped, deferred, limitReached };
@@ -5535,7 +5536,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             wmLog(`🧪 Test ciblage : aucun cas trouvé (il faut un exemplaire taggué Trash avec un doublon plus ancien non-taggué du même card_id). Rien tenté, aucun risque.`);
             return;
         }
-        wmLog(`🧪 Cas trouvé : <b>${candidate.title}</b> — exemplaire taggué ${candidate.taggedId.slice(0,8)}… (${candidate.taggedCreated}) vs plus ancien ${candidate.oldId.slice(0,8)}… (${candidate.oldCreated}).`);
+        wmLog(`🧪 Cas trouvé : <b>${esc(candidate.title)}</b> — exemplaire taggué ${candidate.taggedId.slice(0,8)}… (${candidate.taggedCreated}) vs plus ancien ${candidate.oldId.slice(0,8)}… (${candidate.oldCreated}).`);
 
         // 3) Snapshot AVANT : mes exemplaires de ce card_id encore possédés.
         const before = await supabaseSelect(`user_cards?card_id=eq.${candidate.cardId}&user_id=eq.${uid}&select=id`);
@@ -5557,13 +5558,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
-                wmLog(`🧪 Test ciblage : mise en vente refusée · HTTP ${res.status} ${data?.error || ''}. Le paramètre supplémentaire fait peut-être planter la requête (schéma strict) — à noter. Aucune vente créée.`);
+                wmLog(`🧪 Test ciblage : mise en vente refusée · HTTP ${res.status} ${esc(data?.error || '')}. Le paramètre supplémentaire fait peut-être planter la requête (schéma strict) — à noter. Aucune vente créée.`);
                 return;
             }
             auctionId = data.auction_id || null;
             wmLog(`🧪 Vente créée${auctionId ? ' (' + auctionId.slice(0,8) + '…)' : ''} — vérification en base dans 3s…`);
         } catch(e) {
-            wmLog(`🧪 Test ciblage : exception réseau à la mise en vente — ${e.message}. Aucune vente créée.`);
+            wmLog(`🧪 Test ciblage : exception réseau à la mise en vente — ${esc(e.message)}. Aucune vente créée.`);
             return;
         }
 
@@ -5588,7 +5589,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             wmLog(`🧪 <b style="color:#ef4444;">RÉSULTAT : ÇA NE MARCHE PAS.</b> Le site a quand même consommé le doublon plus ancien (non-taggué) — le paramètre est ignoré. Annulation immédiate de la vente pour te rendre ta carte…`);
             if (auctionId) {
                 await cancelSale(auctionId, candidate.title, null);
-                wmLog(`🧪 Vente annulée : <b>${candidate.title}</b> restituée (si aucune mise n'a été placée entre-temps — vérifie le log d'annulation ci-dessus).`);
+                wmLog(`🧪 Vente annulée : <b>${esc(candidate.title)}</b> restituée (si aucune mise n'a été placée entre-temps — vérifie le log d'annulation ci-dessus).`);
             } else {
                 wmLog(`🧪 Impossible d'annuler automatiquement (id d'enchère non reçu à la création) — vérifie et annule manuellement sur le site si besoin.`);
             }
@@ -5631,10 +5632,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (!r1.ok) { wmLog(`🧪 Catalogue (cards) : <b style="color:#ef4444;">HTTP ${r1.status}</b> — ${r1.body}`); return; }
         const cardRows = r1.data;
         if (!Array.isArray(cardRows) || cardRows.length === 0) {
-            wmLog(`🧪 Catalogue (cards) : aucune ligne pour "${title}" — vérifie l'orthographe exacte (accents, ponctuation).`);
+            wmLog(`🧪 Catalogue (cards) : aucune ligne pour "${esc(title)}" — vérifie l'orthographe exacte (accents, ponctuation).`);
             return;
         }
-        wmLog(`🧪 Catalogue (cards) pour "${title}" : <b>${cardRows.length}</b> ligne(s) → ${cardRows.map(c => `${c.id} [${c.rarity}]`).join(' · ')}`);
+        wmLog(`🧪 Catalogue (cards) pour "${esc(title)}" : <b>${cardRows.length}</b> ligne(s) → ${cardRows.map(c => `${c.id} [${c.rarity}]`).join(' · ')}`);
 
         for (const c of cardRows) {
             const r2 = await supabaseSelectDebug(`user_cards?card_id=eq.${c.id}&user_id=eq.${uid}&select=id`);
@@ -5647,7 +5648,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!r3.ok) {
                 wmLog(`🧪 Ancien card_id <b>${staleCardId}</b> : <b style="color:#ef4444;">HTTP ${r3.status}</b> — ${r3.body}`);
             } else if (Array.isArray(r3.data) && r3.data.length > 0) {
-                wmLog(`🧪 Ancien card_id <b>${staleCardId}</b> : existe encore dans cards → "${r3.data[0].wikipedia_title}" [${r3.data[0].rarity}]`);
+                wmLog(`🧪 Ancien card_id <b>${staleCardId}</b> : existe encore dans cards → "${esc(r3.data[0].wikipedia_title)}" [${r3.data[0].rarity}]`);
             } else {
                 wmLog(`🧪 Ancien card_id <b>${staleCardId}</b> : <b style="color:#ef4444;">n'existe plus</b> dans la table cards (ligne supprimée/remplacée).`);
             }
@@ -5665,7 +5666,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const r = await supabaseSelectDebug(`cards?id=eq.${cardId}&select=wikipedia_title,rarity`);
         if (!r.ok) { wmLog(`🧪 wmCardTitle : <b style="color:#ef4444;">HTTP ${r.status}</b> — ${r.body}`); return; }
         if (Array.isArray(r.data) && r.data.length > 0) {
-            wmLog(`🧪 ${cardId} → <b>${r.data[0].wikipedia_title}</b> [${r.data[0].rarity}]`);
+            wmLog(`🧪 ${cardId} → <b>${esc(r.data[0].wikipedia_title)}</b> [${r.data[0].rarity}]`);
         } else {
             wmLog(`🧪 ${cardId} → aucune ligne dans cards (id inexistant/supprimé).`);
         }
@@ -5698,7 +5699,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const body = await res.text();
             wmLog(`🧪 POST marketplace après précurseur : ${res.ok ? `<b style="color:#4ade80;">${res.status} — ${body}</b>` : `<b style="color:#ef4444;">${res.status} — ${body}</b>`}`);
         } catch(e) {
-            wmLog(`🧪 POST marketplace : exception — ${e.message}`);
+            wmLog(`🧪 POST marketplace : exception — ${esc(e.message)}`);
         }
     };
 
@@ -5765,7 +5766,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 method: 'DELETE', credentials: 'include'
             });
             if (!res.ok) {
-                wmLog(`❌ Annulation (refresh) échouée : <b>${a.card?.wikipedia_title || '?'}</b> · HTTP ${res.status}`);
+                wmLog(`❌ Annulation (refresh) échouée : <b>${esc(a.card?.wikipedia_title || '?')}</b> · HTTP ${res.status}`);
                 return false;
             }
             // Retire l'entrée sellHistory correspondante (n'est plus en vente)
@@ -5784,7 +5785,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
             return true;
         } catch(e) {
-            wmLog(`❌ Annulation (refresh) exception : <b>${a.card?.wikipedia_title || '?'}</b> · ${e.message}`);
+            wmLog(`❌ Annulation (refresh) exception : <b>${esc(a.card?.wikipedia_title || '?')}</b> · ${esc(e.message)}`);
             return false;
         }
     }
@@ -5859,7 +5860,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 (skipped ? ` <span style="color:#888;">· ${skipped} ignorée(s)</span>` : '');
             wmLog(`🔄 Refresh ventes : ${cancelled} annulée(s), ${sold} remise(s) en vente${keptWithBids ? `, ${keptWithBids} gardée(s) (avec mise)` : ''}`);
         } catch(e) {
-            if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+            if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
         } finally {
             refreshSalesRunning = false;
             if (btn) { btn.disabled = false; btn.innerText = prevLabel || '🔄 Refresh ventes'; }
@@ -6116,7 +6117,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
         } catch(e) {}
 
-        wmLog(`⚠️ Tag "<b>${getSellTagName()}</b>" introuvable sur ton compte — crée-le sur wiki-masters pour activer le retag auto`);
+        wmLog(`⚠️ Tag "<b>${esc(getSellTagName())}</b>" introuvable sur ton compte — crée-le sur wiki-masters pour activer le retag auto`);
         return null;
     }
 
@@ -6156,7 +6157,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (name.length > MAX_TAG_LEN) {
             const full = name;
             name = name.slice(0, MAX_TAG_LEN).trim();
-            wmLog(`✂️ Tag tronqué à ${MAX_TAG_LEN} car. : « ${full} » → « ${name} »`);
+            wmLog(`✂️ Tag tronqué à ${MAX_TAG_LEN} car. : « ${full} » → « ${esc(name)} »`);
         }
 
         const { token } = getSupabaseAccessToken();
@@ -6364,7 +6365,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const found = untagged?.id || items[0]?.id;
                         if (found) {
                             const retryNote = attempt > 0 ? ` <span style="color:#888;font-size:9px;">(tentative ${attempt+1}/${MAX_ATTEMPTS})</span>` : '';
-                            wmLog(`🔎 user_card_id résolu via Supabase : <b>${cardTitle || cardId.slice(0,8)}</b> · ${items.length} exemplaire(s), ${untagged ? 'sans tag' : 'déjà taggué'} → ${found.slice(0,8)}…${retryNote}`);
+                            wmLog(`🔎 user_card_id résolu via Supabase : <b>${esc(cardTitle || cardId.slice(0,8))}</b> · ${items.length} exemplaire(s), ${untagged ? 'sans tag' : 'déjà taggué'} → ${found.slice(0,8)}…${retryNote}`);
                             return found;
                         }
                     }
@@ -6375,7 +6376,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // Erreur réseau/auth : on continue les retries
                 }
             } catch(e) {
-                wmLog(`⚠️ findUserCardId Supabase exception : ${e.message}`);
+                wmLog(`⚠️ findUserCardId Supabase exception : ${esc(e.message)}`);
             }
         }
 
@@ -6398,7 +6399,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
         } catch(e) {}
 
-        wmLog(`🔍 Aucun exemplaire trouvé pour <b>${cardTitle || cardId.slice(0,8)}</b> après ${MAX_ATTEMPTS} tentatives Supabase`);
+        wmLog(`🔍 Aucun exemplaire trouvé pour <b>${esc(cardTitle || cardId.slice(0,8))}</b> après ${MAX_ATTEMPTS} tentatives Supabase`);
         return null;
     }
 
@@ -6469,7 +6470,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!res.ok) { wmLog(`🔬 Introspection Supabase : <b>HTTP ${res.status}</b>${token ? '' : ' (aucun token utilisateur trouvé — es-tu connecté au site ?)'}`); return null; }
             spec = await res.json();
         } catch(e) {
-            wmLog(`🔬 Introspection Supabase échouée : ${e.message}`);
+            wmLog(`🔬 Introspection Supabase échouée : ${esc(e.message)}`);
             return null;
         }
         const defs = spec.definitions || (spec.components && spec.components.schemas) || {};
@@ -6729,7 +6730,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 });
                 body = await res.text();
             } catch(e) {
-                wmLog(`🔬 <b>${t}</b> → erreur réseau : ${e.message}`);
+                wmLog(`🔬 <b>${t}</b> → erreur réseau : ${esc(e.message)}`);
                 continue;
             }
             if (res.ok) {
@@ -6743,7 +6744,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             } else if (/42P01/.test(body)) {
                 absent++; // n'existe pas : normal pour la plupart des noms testés, on compte sans logguer
             } else {
-                wmLog(`🔬 ❔ <b>${t}</b> → HTTP ${res.status} · <span style="color:#888;font-size:9px;">${body.slice(0, 120).replace(/</g, '&lt;')}</span>`);
+                wmLog(`🔬 ❔ <b>${t}</b> → HTTP ${res.status} · <span style="color:#888;font-size:9px;">${esc(body.slice(0, 120))}</span>`);
             }
             await new Promise(r => setTimeout(r, 250)); // on ne martèle pas le serveur
         }
@@ -6859,7 +6860,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     function logRarityDriftResult(row) {
         if (row.error) {
-            wmLog(`🔭 <b>${row.title}</b> : échec · <span style="color:#ef4444;">${row.error}</span>${row.url ? ` <span style="color:#555;font-size:9px;">(${row.url})</span>` : ''}`);
+            wmLog(`🔭 <b>${esc(row.title)}</b> : échec · <span style="color:#ef4444;">${esc(row.error)}</span>${row.url ? ` <span style="color:#555;font-size:9px;">(${row.url})</span>` : ''}`);
             if (/failed to fetch|typeerror/i.test(row.error)) {
                 wmLog(`🔭 Ouvre F12 → Console, regarde s'il y a une ligne rouge <b>CORS</b> ou <b>Content Security Policy</b> — ça confirme un blocage par la page (le script tourne en @grant none, sans moyen natif de le contourner).`);
             }
@@ -6867,8 +6868,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         const dir = row.match ? '' : (RARITY_ORDER[row.impliedRarity] > RARITY_ORDER[row.cachedRarity] ? ' ⬆️ va probablement MONTER' : ' ⬇️ va probablement descendre');
         wmLog(row.match
-            ? `🔭 ✅ <b>${row.title}</b> : WikiMasters dit <b>${row.cachedRarity}</b>, vues réelles (${row.realViews.toLocaleString('fr-FR')}/mois) impliquent aussi <b>${row.impliedRarity}</b> — cohérent.`
-            : `🔭 ⚠️ <b>${row.title}</b> : WikiMasters dit <b>${row.cachedRarity}</b> (cache vieux de ${row.staleness}, ${row.cachedViews ?? '?'} vues mémorisées), mais les vues RÉELLES actuelles (${row.realViews.toLocaleString('fr-FR')}/mois) impliquent <b style="color:#fbbf24;">${row.impliedRarity}</b>.${dir}`);
+            ? `🔭 ✅ <b>${esc(row.title)}</b> : WikiMasters dit <b>${row.cachedRarity}</b>, vues réelles (${row.realViews.toLocaleString('fr-FR')}/mois) impliquent aussi <b>${row.impliedRarity}</b> — cohérent.`
+            : `🔭 ⚠️ <b>${esc(row.title)}</b> : WikiMasters dit <b>${row.cachedRarity}</b> (cache vieux de ${row.staleness}, ${row.cachedViews ?? '?'} vues mémorisées), mais les vues RÉELLES actuelles (${row.realViews.toLocaleString('fr-FR')}/mois) impliquent <b style="color:#fbbf24;">${row.impliedRarity}</b>.${dir}`);
     }
 
     // Console : wmCheckRarityDrift('Anatolie') ou wmCheckRarityDrift(['Anatolie', 'Autre titre'])
@@ -6880,7 +6881,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         const results = [];
         for (const title of list) {
-            wmLog(`🔭 Vérification : <b>${title}</b>…`);
+            wmLog(`🔭 Vérification : <b>${esc(title)}</b>…`);
             const row = await computeCardRarityDrift(title);
             results.push(row);
             logRarityDriftResult(row);
@@ -6911,7 +6912,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function rarityDriftBadgeHtml(row) {
         if (!row) return '';
         if (row.error) {
-            return `<span style="color:#ef4444;font-size:9px;cursor:help;" title="${String(row.error).replace(/"/g, '&quot;')}">⚠️ erreur</span>`;
+            return `<span style="color:#ef4444;font-size:9px;cursor:help;" title="${esc(row.error)}">⚠️ erreur</span>`;
         }
         if (row.match) {
             return `<span style="color:#4ade80;font-size:9px;cursor:help;"
@@ -6979,7 +6980,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             localStorage.removeItem(probeKey);
             wmLog(`💾 ✅ Test d'écriture (10 Ko) réussi — le quota n'est <b>probablement pas</b> la cause.`);
         } catch(e) {
-            wmLog(`💾 ⚠️ <b style="color:#ef4444;">Test d'écriture ÉCHOUÉ</b> : ${e.name || 'Erreur'} — ${e.message || 'inconnue'}. Le quota localStorage est très probablement atteint ou dépassé.`);
+            wmLog(`💾 ⚠️ <b style="color:#ef4444;">Test d'écriture ÉCHOUÉ</b> : ${esc(e.name || 'Erreur')} — ${esc(e.message || 'inconnue')}. Le quota localStorage est très probablement atteint ou dépassé.`);
         }
         console.table(rows);
         return rows;
@@ -7048,11 +7049,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Erreur réseau → retry aussi
             if (attempt < MAX_ATTEMPTS) {
                 const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-                wmLog(`⚠️ Re-tag Trash exception (${e.message}), retry ${attempt}/${MAX_ATTEMPTS-1} dans ${(backoff/1000).toFixed(0)}s…`);
+                wmLog(`⚠️ Re-tag Trash exception (${esc(e.message)}), retry ${attempt}/${MAX_ATTEMPTS-1} dans ${(backoff/1000).toFixed(0)}s…`);
                 await new Promise(r => setTimeout(r, backoff));
                 return reapplyTrashTag(userCardId, attempt + 1);
             }
-            wmLog(`❌ Re-tag Trash exception finale : ${e.message}`);
+            wmLog(`❌ Re-tag Trash exception finale : ${esc(e.message)}`);
             return false;
         }
     }
@@ -7108,7 +7109,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (retagOn) {
                     const ok = await reapplyTrashTag(targetId); // idempotent
                     if (ok) { incrementRetagCount(s.cardId, s.title, s.rarity); retagged++; }
-                    else wmLog(`⚠️ Reprise démarrage : re-tag échoué pour <b>${s.title}</b>`);
+                    else wmLog(`⚠️ Reprise démarrage : re-tag échoué pour <b>${esc(s.title)}</b>`);
                 }
             }
 
@@ -7142,7 +7143,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         creditSoldSale(s, null);
                         const gain = (s.finalPrice || 0) - s.price;
                         const gainStr = gain > 0 ? ` <span style="color:#4ade80;">(+${gain} 💰 🔥)</span>` : '';
-                        wmLog(`💰 Vendu : <b>${s.title}</b> [${s.rarity}] · base ${s.price} → <span style="color:#fbbf24;">${s.finalPrice} 💰</span>${gainStr}`);
+                        wmLog(`💰 Vendu : <b>${esc(s.title)}</b> [${s.rarity}] · base ${s.price} → <span style="color:#fbbf24;">${s.finalPrice} 💰</span>${gainStr}`);
                         sendToDiscord(
                             "💰 **VENDU !**\n" +
                             "**" + s.title + "** [" + s.rarity + "]\n" +
@@ -7155,7 +7156,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         // on ne loggue pas Invendu et on ne déclenche pas le retag.
                         if (!sellHistory.some(h => h.auctionId === s.auctionId)) return;
                         creditUnsoldSale(s);
-                        wmLog(`📭 Invendu : <b>${s.title}</b> [${s.rarity}] · base ${s.price} 💰`);
+                        wmLog(`📭 Invendu : <b>${esc(s.title)}</b> [${s.rarity}] · base ${s.price} 💰`);
                         // Skip le retag si désactivé dans Paramètres
                         if (!getSetting('autoRetagEnabled')) return;
                         // Le user_card_id d'origine peut être stale (transfert lors du listing)
@@ -7177,7 +7178,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                                 sourceTag = 'stale-cache';
                             }
                             if (!targetId) {
-                                wmLog(`⚠️ Re-tag impossible (carte introuvable) : <b>${s.title}</b>`);
+                                wmLog(`⚠️ Re-tag impossible (carte introuvable) : <b>${esc(s.title)}</b>`);
                                 return;
                             }
                             // Dernier check avant l'appel réseau au retag
@@ -7185,9 +7186,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             const ok = await reapplyTrashTag(targetId);
                             if (ok) {
                                 incrementRetagCount(s.cardId, s.title, s.rarity);
-                                wmLog(`🏷️ Tag Trash remis : <b>${s.title}</b> [${s.rarity}] <span style="color:#555;font-size:9px;">(${sourceTag})</span>`);
+                                wmLog(`🏷️ Tag Trash remis : <b>${esc(s.title)}</b> [${s.rarity}] <span style="color:#555;font-size:9px;">(${esc(sourceTag)})</span>`);
                             } else {
-                                wmLog(`💀 Re-tag définitivement échoué : <b>${s.title}</b> · ID tenté : ${targetId.slice(0,8)}… (${sourceTag})`);
+                                wmLog(`💀 Re-tag définitivement échoué : <b>${esc(s.title)}</b> · ID tenté : ${targetId.slice(0,8)}… (${esc(sourceTag)})`);
                             }
                         })();
                     }
@@ -7334,7 +7335,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const rc = RARITY[(e.rarity || '').toUpperCase()] || { color: '#888' };
             return `<div style="display:flex;align-items:center;gap:6px;margin:3px 0;">
                 <span style="color:${rc.color};font-weight:700;font-size:9px;min-width:24px;">${(e.rarity || '').toUpperCase()}</span>
-                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;font-size:9px;" title="${e.title}">${e.title}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;font-size:9px;" title="${esc(e.title)}">${esc(e.title)}</span>
                 ${bar(e.count, maxRetag, '#fbbf24')}
                 <span style="color:#fbbf24;font-weight:700;font-size:9px;min-width:28px;text-align:right;">🔁${e.count}</span>
             </div>`;
@@ -7456,7 +7457,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 <div style="font-size:10px;color:#888;line-height:1.7;">
                     Dernier scan marché : <b style="color:#ccc;">${fmtAgo(apiHealth.lastMarketScanTs)}</b><br>
                     Dernier scan collection : <b style="color:#ccc;">${fmtAgo(apiHealth.lastCollectionTs)}</b><br>
-                    Erreurs : <span style="color:#fbbf24;">429×${apiHealth.err429}</span> · <span style="color:#ef4444;">5xx×${apiHealth.err5xx}</span> · <span style="color:#f97316;">réseau×${apiHealth.errNet}</span>${apiHealth.lastErrTs ? ` <span style="color:#666;">(dernière ${fmtAgo(apiHealth.lastErrTs)} : ${String(apiHealth.lastErrMsg).replace(/</g, '&lt;')})</span>` : ''}
+                    Erreurs : <span style="color:#fbbf24;">429×${apiHealth.err429}</span> · <span style="color:#ef4444;">5xx×${apiHealth.err5xx}</span> · <span style="color:#f97316;">réseau×${apiHealth.errNet}</span>${apiHealth.lastErrTs ? ` <span style="color:#666;">(dernière ${fmtAgo(apiHealth.lastErrTs)} : ${esc(apiHealth.lastErrMsg)})</span>` : ''}
                 </div>`;
             })()}
 
@@ -7594,10 +7595,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     ? `<span style="color:#4ade80;">+${fmt(gain)}</span>`
                     : gain < 0 ? `<span style="color:#ef4444;">${fmt(gain)}</span>` : `<span style="color:#666;">=</span>`)
                 : '';
-            const safeTitle = String(s.title).replace(/"/g, '&quot;');
+            const safeTitle = esc(s.title);
             const titleHtml = s.id
-                ? `<a href="https://www.wiki-masters.com/marketplace/${encodeURIComponent(s.id)}" target="_blank" rel="noopener" title="Ouvrir l'enchère : ${safeTitle}" style="color:#8ab4f8;text-decoration:none;">${s.title} <span style="font-size:8px;opacity:0.7;">🔗</span></a>`
-                : `<span title="${safeTitle}">${s.title}</span>`;
+                ? `<a href="https://www.wiki-masters.com/marketplace/${encodeURIComponent(s.id)}" target="_blank" rel="noopener" title="Ouvrir l'enchère : ${safeTitle}" style="color:#8ab4f8;text-decoration:none;">${safeTitle} <span style="font-size:8px;opacity:0.7;">🔗</span></a>`
+                : `<span title="${safeTitle}">${safeTitle}</span>`;
             return `<div style="display:flex;align-items:center;gap:6px;padding:3px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;">
                 <span style="color:#666;font-size:9px;font-family:'JetBrains Mono',monospace;white-space:nowrap;min-width:64px;">${fmtDate(s.soldAt)}</span>
                 <span style="color:${rc.color};font-weight:700;font-size:9px;min-width:22px;">${s.rarity || '?'}</span>
@@ -8442,7 +8443,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // plus par une relecture de localStorage que les sorties anticipées n'alimentaient pas.
             const source = currentUsernameSource;
             if (currentUsername) {
-                wmLog(`👤 Utilisateur identifié : <b style="color:#4ade80;">${currentUsername}</b> <span style="color:#555;font-size:9px;">(${source})</span>`);
+                wmLog(`👤 Utilisateur identifié : <b style="color:#4ade80;">${esc(currentUsername)}</b> <span style="color:#555;font-size:9px;">(${source})</span>`);
                 // Découverte du tag Trash si pas en cache
                 if (!TRASH_TAG_ID) await discoverTrashTagId();
                 // Réconciliation des ventes en attente (retag des invendues revenues pendant
@@ -9109,9 +9110,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const name = getSetting('sellTagName');
             const id = TRASH_TAG_ID;
             if (id) {
-                tagStatusEl.innerHTML = `<span style="color:#4ade80;">✓ Tag "<b>${name}</b>"</span> · <span style="color:#555;font-family:'JetBrains Mono',monospace;font-size:9px;">${id.slice(0,8)}…</span>`;
+                tagStatusEl.innerHTML = `<span style="color:#4ade80;">✓ Tag "<b>${esc(name)}</b>"</span> · <span style="color:#555;font-family:'JetBrains Mono',monospace;font-size:9px;">${id.slice(0,8)}…</span>`;
             } else {
-                tagStatusEl.innerHTML = `<span style="color:#fbbf24;">⚠ Tag "<b>${name}</b>" non découvert — crée-le sur wiki-masters</span>`;
+                tagStatusEl.innerHTML = `<span style="color:#fbbf24;">⚠ Tag "<b>${esc(name)}</b>" non découvert — crée-le sur wiki-masters</span>`;
             }
         }
         refreshTagStatus();
@@ -9183,7 +9184,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const TAGGER_DIACRITICS = new RegExp('[\\u0300-\\u036f]', 'g');
         const taggerNorm = (s) => (s || '').toString()
             .normalize('NFD').replace(TAGGER_DIACRITICS, '').toLowerCase();
-        const taggerEsc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+        // Alias de esc() : l'implémentation locale oubliait > et ', un titre de tag
+        // contenant l'un des deux passait donc brut dans l'innerHTML.
+        const taggerEsc = esc;
         // Découpe une saisie "japon; marvel" en termes normalisés (OU logique).
         // Séparateur = POINT-VIRGULE (;) pour ne PAS casser les titres à virgule
         // (ex. « Star Wars, épisode I »). Les anciens présets à virgules sont migrés au chargement.
@@ -9233,7 +9236,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!taggerDatalist) return;
             const tags = await fetchUserTags();
             taggerDatalist.innerHTML = tags
-                .map(t => `<option value="${(t.name || '').replace(/"/g, '&quot;')}">`).join('');
+                .map(t => `<option value="${esc(t.name || '')}">`).join('');
         }
 
         const TAGGER_RENDER_CAP = 800; // au-delà, on n'affiche pas toutes les lignes (perf DOM)
@@ -9247,8 +9250,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const tagNames = (m.tags || []).map(t => t.name).filter(Boolean).join(', ');
                 return `<label style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:10px;cursor:pointer;">
                     <input type="checkbox" class="wm-tagger-cb" data-idx="${i}" checked style="accent-color:#4ade80;flex-shrink:0;">
-                    <span style="flex:1;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${title} <span style="color:#666;">[${rar}]</span></span>
-                    ${tagNames ? `<span style="color:#555;font-size:9px;white-space:nowrap;">${tagNames}</span>` : ''}
+                    <span style="flex:1;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(title)} <span style="color:#666;">[${rar}]</span></span>
+                    ${tagNames ? `<span style="color:#555;font-size:9px;white-space:nowrap;">${esc(tagNames)}</span>` : ''}
                 </label>`;
             }).join('');
             if (taggerMatches.length > TAGGER_RENDER_CAP) {
@@ -9439,11 +9442,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         return kws.some(k => text.includes(k));
                     })
                     .map(e => e.it);
-                if (matches.length === 0) { wmLog(`⭐ « ${p.kw} » → « ${tagName} » : aucune carte`); continue; }
+                if (matches.length === 0) { wmLog(`⭐ « ${esc(p.kw)} » → « ${esc(tagName)} » : aucune carte`); continue; }
                 totalMatched += matches.length;
                 const tag = await createTrashTag(tagName);
                 if (!tag.ok || !tag.id) {
-                    wmLog(`⚠️ Étiquette « ${tagName} » non résolue (${tag.error || 'erreur'}) — ${matches.length} carte(s) non taguée(s)`);
+                    wmLog(`⚠️ Étiquette « ${esc(tagName)} » non résolue (${tag.error || 'erreur'}) — ${matches.length} carte(s) non taguée(s)`);
                     totalFail += matches.length;
                     matches.forEach(m => failures.push({ title: titleOf(m), tag: tagName, status: 0, error: 'étiquette non créée/trouvée : ' + (tag.error || '?') }));
                     continue;
@@ -9467,7 +9470,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     taggerStatus.innerHTML = `<span style="color:#06b6d4;">🏷️ ${pi + 1}/${presetList.length} (${taggerEsc(tagName)}) · ${ok}/${matches.length}${fail ? ` · ${fail} échec` : ''}…</span>`;
                 }
                 totalOk += ok; totalFail += fail;
-                wmLog(`✅ « ${p.kw} » → « ${tagName} » : ${ok} ok${fail ? `, <span style="color:#ef4444;">${fail} échec</span>` : ''}`);
+                wmLog(`✅ « ${esc(p.kw)} » → « ${esc(tagName)} » : ${ok} ok${fail ? `, <span style="color:#ef4444;">${fail} échec</span>` : ''}`);
             }
             return { totalOk, totalFail, totalMatched, failures };
         }
@@ -9515,7 +9518,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 renderTaggerFailures(r.failures); // détail des échecs (carte, tag, raison)
                 await populateTagDatalist();
             } catch(e) {
-                taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+                taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
             } finally {
                 taggerScanBtn.disabled = false;
             }
@@ -9542,7 +9545,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 renderTaggerFailures(r.failures); // détail des échecs (carte, tag, raison)
                 await populateTagDatalist();
             } catch(e) {
-                taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+                taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
             } finally {
                 taggerScanBtn.disabled = false;
             }
@@ -9689,7 +9692,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         taggerApplyBtn.disabled = false;
                     }
                 } catch(e) {
-                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
                 } finally {
                     taggerScanBtn.disabled = false;
                 }
@@ -9742,7 +9745,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         taggerApplyBtn.disabled = false;
                     }
                 } catch(e) {
-                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
                 } finally {
                     taggerScanBtn.disabled = false; taggerDuplicatesBtn.disabled = false;
                 }
@@ -9761,11 +9764,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // createTrashTag est un find-or-create générique (vérifie l'existant puis POST /tags)
                 const tag = await createTrashTag(tagName);
                 if (!tag.ok || !tag.id) {
-                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Impossible de créer/trouver l'étiquette « ${tagName} »${tag.error ? ' : ' + tag.error : ''}.</span>`;
+                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Impossible de créer/trouver l'étiquette « ${esc(tagName)} »${tag.error ? ' : ' + tag.error : ''}.</span>`;
                     taggerScanBtn.disabled = false; taggerApplyBtn.disabled = false;
                     return;
                 }
-                wmLog(`🏷️ Étiquetage en masse : « <b>${tagName}</b> » ${tag.alreadyExists ? '(existante)' : '(créée)'} → ${selected.length} carte(s)`);
+                wmLog(`🏷️ Étiquetage en masse : « <b>${esc(tagName)}</b> » ${tag.alreadyExists ? '(existante)' : '(créée)'} → ${selected.length} carte(s)`);
                 let done = 0, ok = 0, fail = 0;
                 const failures = [];
                 const titleOf = (m) => m.card?.wikipedia_title || m.wikipedia_title || (m.id ? m.id.slice(0, 8) + '…' : '?');
@@ -9780,8 +9783,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     });
                     taggerStatus.innerHTML = `<span style="color:#06b6d4;">🏷️ ${done}/${selected.length} traitées · ${ok} ok${fail ? ` · ${fail} échec` : ''}…</span>`;
                 }
-                taggerStatus.innerHTML = `<span style="color:#4ade80;">✔ « ${tagName} » appliquée à ${ok} carte(s)</span>${fail ? ` <span style="color:#ef4444;">· ${fail} échec(s)</span>` : ''}`;
-                wmLog(`✅ Étiquetage terminé : ${ok} ok, ${fail} échec(s) pour « <b>${tagName}</b> »`);
+                taggerStatus.innerHTML = `<span style="color:#4ade80;">✔ « ${esc(tagName)} » appliquée à ${ok} carte(s)</span>${fail ? ` <span style="color:#ef4444;">· ${fail} échec(s)</span>` : ''}`;
+                wmLog(`✅ Étiquetage terminé : ${ok} ok, ${fail} échec(s) pour « <b>${esc(tagName)}</b> »`);
                 renderTaggerFailures(failures); // détail des échecs (carte, tag, raison)
                 await populateTagDatalist();
                 taggerScanBtn.disabled = false;
@@ -9843,7 +9846,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     settingsStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec : HTTP ${res.status}</span>`;
                 }
             } catch(e) {
-                settingsStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec : ${e.message}</span>`;
+                settingsStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec : ${esc(e.message)}</span>`;
             }
         };
 
@@ -9969,8 +9972,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Invalide le cache du tag_id et redécouvre avec le nouveau nom
             TRASH_TAG_ID = null;
             try { localStorage.removeItem(TRASH_TAG_CACHE_KEY); } catch(e) {}
-            tagStatusEl.innerHTML = `<span style="color:#888;">⏳ Découverte du tag "${newName}"…</span>`;
-            wmLog(`🏷️ Nouveau nom de tag : <b>${newName}</b> · redécouverte en cours…`);
+            tagStatusEl.innerHTML = `<span style="color:#888;">⏳ Découverte du tag "${esc(newName)}"…</span>`;
+            wmLog(`🏷️ Nouveau nom de tag : <b>${esc(newName)}</b> · redécouverte en cours…`);
             await discoverTrashTagId();
             refreshTagStatus();
         };
@@ -9987,7 +9990,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!identityInfo) return;
             const ov = (getSetting('usernameOverride') || '').trim();
             identityInfo.innerHTML = currentUsername
-                ? `Reconnu comme : <b style="color:#4ade80;">${currentUsername}</b>${ov ? ' <span style="color:#888;">(forcé)</span>' : ' <span style="color:#888;">(auto)</span>'}`
+                ? `Reconnu comme : <b style="color:#4ade80;">${esc(currentUsername)}</b>${ov ? ' <span style="color:#888;">(forcé)</span>' : ' <span style="color:#888;">(auto)</span>'}`
                 : '<span style="color:#fbbf24;">Aucun pseudo détecté</span>';
         }
         refreshIdentityInfo();
@@ -10025,9 +10028,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             refreshIdentityInfo();
             reapplyIdentityToHits();
             identityStatus.innerHTML = currentUsername
-                ? `<span style="color:#4ade80;">✓ Identité : <b>${currentUsername}</b></span>`
+                ? `<span style="color:#4ade80;">✓ Identité : <b>${esc(currentUsername)}</b></span>`
                 : `<span style="color:#fbbf24;">Toujours aucun pseudo détecté — saisis-le manuellement ci-dessus.</span>`;
-            wmLog(`🔄 Identité rafraîchie : <b>${currentUsername || '— non détecté'}</b>`);
+            wmLog(`🔄 Identité rafraîchie : <b>${esc(currentUsername || '— non détecté')}</b>`);
         };
 
         /* ════════ EXPORT / IMPORT du localStorage ════════ */
@@ -10078,8 +10081,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const a = document.createElement('a');
             a.href = url; a.download = filename; a.click();
             setTimeout(() => URL.revokeObjectURL(url), 1000);
-            ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ Export de <b>${count}</b> clés → <b>${filename}</b></span>`;
-            wmLog(`📤 Export : <b>${count}</b> clés sauvegardées dans <b>${filename}</b>`);
+            ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ Export de <b>${count}</b> clés → <b>${esc(filename)}</b></span>`;
+            wmLog(`📤 Export : <b>${count}</b> clés sauvegardées dans <b>${esc(filename)}</b>`);
         };
 
         // Envoie le backup en pièce jointe via le webhook (multipart). Réutilisé par le
@@ -10099,7 +10102,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 form.append('file', blob, filename);
                 const res = await fetch(webhook, { method: 'POST', body: form });
                 if (res.ok) {
-                    wmLog(`📤 Backup envoyé sur Discord : <b>${filename}</b> (${count} clés)`);
+                    wmLog(`📤 Backup envoyé sur Discord : <b>${esc(filename)}</b> (${count} clés)`);
                     return { ok: true, filename, count };
                 }
                 return { ok: false, error: `HTTP ${res.status}`, status: res.status };
@@ -10121,10 +10124,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             ioxStatus.innerHTML = `<span style="color:#888;">⏳ Envoi du backup sur Discord…</span>`;
             const r = await sendBackupToDiscord();
             if (r.ok) {
-                ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ Backup envoyé sur Discord (<b>${r.filename}</b>)</span>`;
+                ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ Backup envoyé sur Discord (<b>${esc(r.filename)}</b>)</span>`;
             } else {
                 const hint = r.status === 413 ? ' — fichier trop lourd pour le webhook' : '';
-                ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec Discord : ${r.error}${hint}</span>`;
+                ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec Discord : ${esc(r.error)}${hint}</span>`;
             }
             exportDiscordBtn.disabled = false;
             exportDiscordBtn.innerText = prevText;
@@ -10270,11 +10273,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         wmLog(`📥 Import : <b>${written}</b> clés restaurées, <b>${failed.length}</b> ignorée(s) faute de place (${failed.join(', ')}).`);
                     } else {
                         ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ ${written} clés importées${skippedCache ? ` (cache collection ignoré, régénéré au reload)` : ''}. Rechargement…</span>`;
-                        wmLog(`📥 Import : <b>${written}</b> clés restaurées depuis <b>${file.name}</b>${skippedCache ? ` (${skippedCache} clé(s) de cache ignorées)` : ''}. La page va recharger.`);
+                        wmLog(`📥 Import : <b>${written}</b> clés restaurées depuis <b>${esc(file.name)}</b>${skippedCache ? ` (${skippedCache} clé(s) de cache ignorées)` : ''}. La page va recharger.`);
                     }
                     setTimeout(() => location.reload(), 1200);
                 } catch(e) {
-                    ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Erreur : ${e.message}</span>`;
+                    ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Erreur : ${esc(e.message)}</span>`;
                 }
             };
             fileInput.click();
@@ -10311,7 +10314,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     wmLog('🗄️ Backup auto (Tout arrêter) → envoi sur Discord…');
                     window.wmSendBackupToDiscord('(arrêt)').then(r => {
                         if (!r.ok && r.error !== 'no-webhook') {
-                            wmLog(`⚠️ Backup auto Discord échoué : ${r.error}`);
+                            wmLog(`⚠️ Backup auto Discord échoué : ${esc(r.error)}`);
                         }
                     });
                 }
@@ -10848,10 +10851,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (!userCardId) continue;
                 const r = await addTagToUserCard(userCardId, tagId);
                 if (r.ok) {
-                    wmLog(`🏷️ Auto-tag pack : <b>${title}</b> → « <b>${p.tag}</b> » <span style="color:#555;font-size:9px;">(${p.kw})</span>`);
+                    wmLog(`🏷️ Auto-tag pack : <b>${esc(title)}</b> → « <b>${p.tag}</b> » <span style="color:#555;font-size:9px;">(${esc(p.kw)})</span>`);
                     if (tagId === TRASH_TAG_ID) pushToTrashPoolCache(cardId, title, rarity); // ajout direct, sans rescan
                 } else {
-                    wmLog(`⚠️ Auto-tag pack échoué : <b>${title}</b> → « ${p.tag} » · HTTP ${r.status} ${r.error || ''}`);
+                    wmLog(`⚠️ Auto-tag pack échoué : <b>${esc(title)}</b> → « ${p.tag} » · HTTP ${r.status} ${r.error || ''}`);
                 }
             }
         }
@@ -11288,11 +11291,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 continue;
             }
             if (KEYWORDS_ALERT.some(k => k.toLowerCase() === title.toLowerCase())) {
-                wmLog(`⭐ Wishlist : <b>${title}</b> déjà dans les mots-clés.`);
+                wmLog(`⭐ Wishlist : <b>${esc(title)}</b> déjà dans les mots-clés.`);
                 continue;
             }
             if (window.wmAddKeyword) window.wmAddKeyword(title);
-            wmLog(`⭐ Wishlist → mot-clé ajouté : <b style="color:#06b6d4;">${title}</b>`);
+            wmLog(`⭐ Wishlist → mot-clé ajouté : <b style="color:#06b6d4;">${esc(title)}</b>`);
         }
     }
 
@@ -11829,7 +11832,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         function renderKwList() {
             kwListEl.innerHTML = pendingKeywords.map((kw, i) =>
-                `<span class="wm-ob-kw-tag">${kw}<button data-i="${i}" title="Retirer">×</button></span>`
+                `<span class="wm-ob-kw-tag">${esc(kw)}<button data-i="${i}" title="Retirer">×</button></span>`
             ).join('') || '<span style="color:#444;font-size:10px;">Aucun mot-clé ajouté</span>';
             kwListEl.querySelectorAll('button[data-i]').forEach(b => {
                 b.onclick = () => {
@@ -11880,7 +11883,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 tags.forEach(t => {
                     // Pré-sélectionne "Trash" s'il existe
                     const sel = t.name.toLowerCase() === 'trash' ? ' selected' : '';
-                    opts += `<option value="existing:${t.id}" data-name="${t.name.replace(/"/g, '&quot;')}"${sel}>${t.name}</option>`;
+                    opts += `<option value="existing:${t.id}" data-name="${esc(t.name)}"${sel}>${esc(t.name)}</option>`;
                 });
             }
             opts += '<option value="new">➕ Créer un nouveau tag…</option>';
@@ -11925,10 +11928,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 tagChoice = { mode: 'existing', name, id: result.id || null };
                 if (result.id) { TRASH_TAG_ID = result.id; try { localStorage.setItem(TRASH_TAG_CACHE_KEY, result.id); } catch(e) {} }
                 tagStatusEl.innerHTML = result.alreadyExists
-                    ? `<span style="color:#fbbf24;">⚠️ Le tag "<b>${name}</b>" existait déjà — on l'utilisera.</span>`
-                    : `<span style="color:#4ade80;">✅ Tag "<b>${name}</b>" créé et sélectionné !</span>`;
+                    ? `<span style="color:#fbbf24;">⚠️ Le tag "<b>${esc(name)}</b>" existait déjà — on l'utilisera.</span>`
+                    : `<span style="color:#4ade80;">✅ Tag "<b>${esc(name)}</b>" créé et sélectionné !</span>`;
             } else {
-                tagStatusEl.innerHTML = `<span style="color:#ef4444;">❌ Échec : ${result.error}. Tu peux créer le tag manuellement sur wiki-masters.</span>`;
+                tagStatusEl.innerHTML = `<span style="color:#ef4444;">❌ Échec : ${esc(result.error)}. Tu peux créer le tag manuellement sur wiki-masters.</span>`;
             }
         };
 
@@ -11967,7 +11970,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (tagChoice.mode === 'existing' && tagChoice.name) {
                 setSetting('sellTagName', tagChoice.name);
                 if (tagChoice.id) { TRASH_TAG_ID = tagChoice.id; try { localStorage.setItem(TRASH_TAG_CACHE_KEY, tagChoice.id); } catch(e) {} }
-                tagSummary = ` · tag <b>${tagChoice.name}</b>`;
+                tagSummary = ` · tag <b>${esc(tagChoice.name)}</b>`;
             }
             // mode 'new' non créé ou 'skip' → on ne touche pas au réglage tag
 

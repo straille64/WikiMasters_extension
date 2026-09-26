@@ -69,8 +69,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Audit des bugs et fragilités → [docs/AUDIT.md](docs/AUDIT.md)
 - [x] Correction des bugs de la boucle d'ouverture (erreurs, cooldown, 429) — audit #1, #2, #3, #5
 - [x] Premiers tests unitaires sur les helpers (`./scripts/test.sh`)
-- [ ] Échappement HTML systématique — helpers `esc()`/`escUrl()` en place, sweep des
-      autres modules à finir (audit #4)
+- [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
+      d'injection couverts, verrouillé par un test (audit #4)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 
