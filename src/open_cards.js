@@ -1,9 +1,31 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.2';
+    const WM_VERSION = '1.3.13-fork.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
+
+    /* ===================== ÉCHAPPEMENT HTML ===================== */
+
+    // Échappe toute donnée venant du serveur (titres Wikipédia, messages d'erreur
+    // d'API, pseudos) avant injection dans de l'innerHTML. Un titre contenant `"`
+    // cassait l'attribut englobant, un `<` injectait du HTML dans la page.
+    // Les 5 caractères couvrent à la fois le contenu texte et les attributs
+    // délimités par " ou '.
+    const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    function esc(v) {
+        if (v === null || v === undefined) return '';
+        return String(v).replace(/[&<>"']/g, (c) => ESC_MAP[c]);
+    }
+
+    // Idem pour une URL injectée dans un href : on refuse les schémas exécutables
+    // (javascript:, data:) avant d'échapper, sinon un lien suffit à exécuter du code.
+    function escUrl(v) {
+        const raw = String(v === null || v === undefined ? '' : v).trim();
+        if (!raw) return '';
+        if (/^[a-z0-9.+-]*:/i.test(raw) && !/^(https?|mailto):/i.test(raw)) return '';
+        return esc(raw);
+    }
 
     /* ===================== CONFIG ===================== */
 
@@ -1056,28 +1078,6 @@
     function isLogCategoryEnabled(category) {
         const setting = CATEGORY_TO_SETTING[category];
         return setting ? getSetting(setting) : true; // system → toujours visible
-    }
-
-    /* ===================== ÉCHAPPEMENT HTML ===================== */
-
-    // Échappe toute donnée venant du serveur (titres Wikipédia, messages d'erreur
-    // d'API, pseudos) avant injection dans de l'innerHTML. Un titre contenant `"`
-    // cassait l'attribut englobant, un `<` injectait du HTML dans la page.
-    // Les 5 caractères couvrent à la fois le contenu texte et les attributs
-    // délimités par " ou '.
-    const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-    function esc(v) {
-        if (v === null || v === undefined) return '';
-        return String(v).replace(/[&<>"']/g, (c) => ESC_MAP[c]);
-    }
-
-    // Idem pour une URL injectée dans un href : on refuse les schémas exécutables
-    // (javascript:, data:) avant d'échapper, sinon un lien suffit à exécuter du code.
-    function escUrl(v) {
-        const raw = String(v === null || v === undefined ? '' : v).trim();
-        if (!raw) return '';
-        if (/^[a-z0-9.+-]*:/i.test(raw) && !/^(https?|mailto):/i.test(raw)) return '';
-        return esc(raw);
     }
 
     function wmLog(msg) {

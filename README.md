@@ -41,9 +41,18 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 ./scripts/test.sh
 ```
 
-Le code étant un monolithe dans une seule IIFE, il n'y a rien à importer : les tests
-extraient les helpers voulus de `src/open_cards.js` par équilibrage d'accolades puis
-les évaluent — ils portent donc sur le code réellement livré, pas sur une copie.
+- `tests/helpers.test.mjs` et `tests/escaping.test.mjs` : le code étant un monolithe
+  dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
+  `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
+  sur le code réellement livré, pas sur une copie.
+- `tests/smoke.mjs` : charge `dist/` dans un vrai Chromium et vérifie que l'UI se
+  monte (bouton ⚙ compris) sans erreur d'exécution. `node --check` ne valide que la
+  syntaxe : une exception à l'init tue l'IIFE entière et **rien** n'apparaît — c'est
+  le seul test qui attrape ça. Il se saute tout seul si `playwright` n'est pas
+  installé (`npm i -D playwright`).
+
+> ⚠️ Lancer `./scripts/build.sh` **puis** `./scripts/test.sh` avant de coller un build
+> dans Tampermonkey : le test de fumée porte sur `dist/`, pas sur `src/`.
 
 ## Installation (état actuel : userscript)
 
@@ -68,7 +77,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Suppression du `@require` distant (le build est autonome)
 - [x] Audit des bugs et fragilités → [docs/AUDIT.md](docs/AUDIT.md)
 - [x] Correction des bugs de la boucle d'ouverture (erreurs, cooldown, 429) — audit #1, #2, #3, #5
-- [x] Premiers tests unitaires sur les helpers (`./scripts/test.sh`)
+- [x] Tests : helpers, garde-fous d'échappement, et test de fumée navigateur
+      (`./scripts/test.sh`)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
       d'injection couverts, verrouillé par un test (audit #4)
 - [ ] Découpage du monolithe en modules
