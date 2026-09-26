@@ -102,10 +102,13 @@ t('apiErrorText', () => {
 // ── détection auth ──
 t('PACK_AUTH_ERROR_RE', () => {
   for (const m of ['Unauthorized', 'not authenticated', 'JWT expired', 'session expired',
-                   'Forbidden', 'invalid token', 'HTTP 401 dans le message']) {
+                   'invalid token', 'HTTP 401 dans le message']) {
     assert(PACK_AUTH_ERROR_RE.test(m), 'devrait matcher : ' + m);
   }
-  for (const m of ['no packs remaining', 'maintenance en cours', 'internal server error', 'rate limited']) {
+  // 403 / Forbidden est TRANSITOIRE sur ce site (protection anti-bot) : il doit
+  // déclencher une pause et un nouvel essai, jamais l'arrêt du module.
+  for (const m of ['no packs remaining', 'maintenance en cours', 'internal server error',
+                   'rate limited', 'Forbidden', 'HTTP 403']) {
     assert(!PACK_AUTH_ERROR_RE.test(m), 'ne devrait pas matcher : ' + m);
   }
 });

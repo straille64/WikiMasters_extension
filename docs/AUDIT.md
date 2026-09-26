@@ -18,11 +18,20 @@ la nuit = bot qui tourne dans le vide jusqu'au matin.
 **Correctif** : distinguer les cas. `packs_remaining === 0` → cooldown. Erreur
 d'auth → arrêt du module + alerte visible (+ Discord). Erreur inconnue → backoff.
 
-**✅ Corrigé (1.3.13-fork.1)** — la loop classe désormais la réponse en quatre cas :
-auth (`PACK_AUTH_ERROR_RE` sur le message d'API, ou HTTP 401) → `haltPackOpener()`
+**✅ Corrigé (1.3.13-fork.1, ajusté en fork.6)** — la loop classe désormais la réponse :
+auth avérée (HTTP 401, ou `PACK_AUTH_ERROR_RE` sur le message d'API) → `haltPackOpener()`
 qui arrête le module, affiche l'alerte et notifie Discord ; `packs_remaining === 0`
-→ cooldown ; erreur applicative inconnue → backoff exponentiel, arrêt au bout de
-`PACK_MAX_FAILURES` (8) ; 403 → pause puis arrêt au 3ᵉ refus consécutif.
+→ cooldown ; tout le reste (403, 5xx, réseau, erreur applicative) → backoff exponentiel
+plafonné, **sans jamais arrêter le module**.
+
+⚠️ Retour d'usage (fork.6) : la version fork.1 arrêtait aussi le module au 3ᵉ 403
+consécutif et au 8ᵉ échec. En production ça coupait une ouverture automatique qui
+repartait très bien toute seule — le 403 est ici une protection anti-bot **transitoire**,
+pas une perte de droits. `forbidden` et `403` ont donc été retirés de
+`PACK_AUTH_ERROR_RE`, et les deux seuils d'arrêt supprimés : seul le 401 arrête le
+module, parce que lui seul ne se débloquera jamais en attendant. Le seuil restant
+(`PACK_WARN_FAILURES`) ne fait que prévenir une fois, log + Discord. Les logs d'échec
+répétés sont throttlés (3 premiers, puis un sur dix).
 Effet de bord corrigé au passage : une réponse sans carte **et** sans erreur (avec
 `packs_remaining > 0`) repartait au bout de 1,2–3 s, donc martelait l'API ; elle
 passe maintenant par l'attente de regen.

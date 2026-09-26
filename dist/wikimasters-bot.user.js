@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.5
+// @version      1.3.13-fork.6
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.5';
+    const WM_VERSION = '1.3.13-fork.6';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10831,8 +10831,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     const PACK_WAIT_CEIL_MS   = 30 * 60 * 1000;
     const PACK_BACKOFF_BASE_MS = 5 * 1000;   // 1er échec inconnu → 5 s
     const PACK_BACKOFF_MAX_MS  = 5 * 60 * 1000;
-    const PACK_MAX_FAILURES    = 8;          // au-delà : arrêt du module + alerte
-    const PACK_MAX_403         = 3;          // 403 répétés = plus un simple hoquet
+    // Le module ne s'arrête JAMAIS sur des échecs répétés (403, 5xx, réseau) : ce sont
+    // des incidents transitoires dont il se remet tout seul. Ce seuil ne sert qu'à
+    // prévenir une fois (log + Discord) que quelque chose dure.
+    const PACK_WARN_FAILURES   = 8;
 
     const PACK_OPEN_URL = "https://www.wiki-masters.com/api/packs/open";
 
@@ -11623,8 +11625,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return null;
     }
 
-    // Une erreur d'auth est définitive : rien ne se débloquera en attendant le cooldown.
-    const PACK_AUTH_ERROR_RE = /unauthor|unauthent|not authenticated|not logged|non connect|session (expir|invalid)|expired|invalid token|jwt|forbidden|\b401\b|\b403\b/i;
+    /* Une erreur d'AUTH est définitive : rien ne se débloquera en attendant, donc le
+       module s'arrête et le dit. Volontairement restrictif : `forbidden` / 403 n'en
+       font PAS partie — sur ce site c'est une protection anti-bot transitoire, dont
+       l'ouverture repart toute seule après une pause. Les y inclure revenait à couper
+       une automatisation qui fonctionnait très bien. */
+    const PACK_AUTH_ERROR_RE = /unauthor|unauthent|not authenticated|not logged|non connect|session (expir|invalid)|invalid token|jwt|\b401\b/i;
 
     // Backoff exponentiel plafonné, avec un peu de jitter : un retry à intervalle
     // parfaitement régulier est exactement ce qui fait repérer un bot.
@@ -11746,15 +11752,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
 
             // ── Erreur applicative inconnue (maintenance, quota, bug serveur) ──
+            // Même politique que ci-dessous : on réessaie indéfiniment, sans arrêter.
             failures++;
-            if (failures >= PACK_MAX_FAILURES) {
-                haltPackOpener(alertEl, `${failures} échecs d'ouverture d'affilée`,
-                    `dernière erreur : ${errText}`);
-                break;
-            }
             const apiWait = packBackoffMs(failures);
-            wmLog(`⚠️ Ouverture refusée (${failures}/${PACK_MAX_FAILURES}) : ${esc(errText)}`
-                + ` — retry dans ${Math.round(apiWait / 1000)}s`);
+            if (failures <= 3 || failures % 10 === 0) {
+                wmLog(`⚠️ Ouverture refusée (${failures}× d'affilée) : ${esc(errText)}`
+                    + ` — retry dans ${Math.round(apiWait / 1000)}s`);
+            }
             if (!(await waitWithTicker(apiWait, '⚠️ Erreur — retry dans', '#fbbf24'))) break;
 
         } catch (err) {
@@ -11768,26 +11772,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 break;
             }
 
-            // 403 : protection anti-bot ou perte de droits. Un refus isolé se rattrape
-            // avec une pause ; répété, c'est un blocage franc → on arrête.
+            /* 403 : sur ce site c'est un refus TRANSITOIRE (protection anti-bot qui se
+               relâche d'elle-même), pas une perte de droits. Une version intermédiaire
+               arrêtait le module au 3e refus d'affilée : en pratique elle coupait une
+               ouverture automatique qui repartait très bien toute seule après une pause.
+               → on pause et on réessaie indéfiniment, comme à l'origine. */
             if (status === 403) {
                 http403++;
-                if (http403 >= PACK_MAX_403) {
-                    haltPackOpener(alertEl, `${http403} refus 403 d'affilée`,
-                        'le site refuse les ouvertures. Recharge la page et vérifie ta session avant de relancer.');
-                    break;
-                }
                 const wait403 = Math.min(Math.max(err.retryAfterMs || 0, 60000), PACK_WAIT_CEIL_MS);
-                wmLog(`⛔ 403 sur l'ouverture (${http403}/${PACK_MAX_403}) — pause ${Math.round(wait403 / 1000)}s`);
+                // Log seulement les 3 premiers puis tous les 10 : inutile de remplir le
+                // journal pendant une protection anti-bot qui dure.
+                if (http403 <= 3 || http403 % 10 === 0) {
+                    wmLog(`⛔ 403 sur l'ouverture (${http403}× d'affilée) — pause ${Math.round(wait403 / 1000)}s, on réessaie`);
+                }
                 if (!(await waitWithTicker(wait403, '⛔ 403 — pause', '#EF4444'))) break;
                 continue;
             }
 
             failures++;
-            if (failures >= PACK_MAX_FAILURES) {
-                haltPackOpener(alertEl, `${failures} échecs d'ouverture d'affilée`,
-                    `dernière erreur : ${(err && err.message) || 'inconnue'}`);
-                break;
+            // Pas d'arrêt automatique sur échecs répétés : le module doit survivre à une
+            // coupure réseau ou à une maintenance et repartir tout seul. Seul le 401
+            // (session morte, cf. ci-dessus) justifie d'arrêter — rien ne le débloquera.
+            // On signale une fois, puis on continue à réessayer avec un backoff plafonné.
+            if (failures === PACK_WARN_FAILURES) {
+                wmLog(`⚠️ <b>${failures} échecs d'ouverture d'affilée</b> — le bot continue de réessayer. Dernière erreur : ${esc((err && err.message) || 'inconnue')}`);
+                sendToDiscord(`⚠️ **Pack Opener** : ${failures} échecs d'ouverture d'affilée, le bot continue de réessayer.\n${(err && err.message) || 'erreur inconnue'}`, 16753920);
             }
 
             // 429 / 5xx / page HTML de Cloudflare : Retry-After s'il est fourni,
@@ -11796,9 +11805,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const label = status === 429 ? '🚦 429 trop de requêtes — pause'
                 : status ? `⚠️ HTTP ${status} — retry dans`
                 : '⚠️ Réseau — retry dans';
-            wmLog(`⚠️ Ouverture échouée (${failures}/${PACK_MAX_FAILURES}) : ${esc((err && err.message) || 'erreur')}`
-                + (err && err.body ? ` <span style="color:#666;font-size:9px;">${esc(err.body.slice(0, 120))}</span>` : '')
-                + ` — retry dans ${Math.round(wait / 1000)}s`);
+            if (failures <= 3 || failures % 10 === 0) {
+                wmLog(`⚠️ Ouverture échouée (${failures}× d'affilée) : ${esc((err && err.message) || 'erreur')}`
+                    + (err && err.body ? ` <span style="color:#666;font-size:9px;">${esc(err.body.slice(0, 120))}</span>` : '')
+                    + ` — retry dans ${Math.round(wait / 1000)}s`);
+            }
             if (!(await waitWithTicker(wait, label, status === 429 ? '#fbbf24' : '#EF4444'))) break;
         }
     }
