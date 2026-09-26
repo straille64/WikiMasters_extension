@@ -45,6 +45,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
   `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
   sur le code réellement livré, pas sur une copie.
+- `tests/watchlist-modes.test.mjs` : vérifie dans un navigateur qu'un mot-clé en mode
+  manuel ne déclenche jamais de mise, qu'un mot-clé en auto en déclenche une, et que
+  l'interrupteur maître, le plafond de prix et la limite horaire coupent bien.
 - `tests/market-pagination.test.mjs` : vérifie que le scan pagine jusqu'au bout même
   quand l'API n'annonce aucun total, et trouve bien une carte située en page 3.
 - `tests/market-ended.test.mjs` : rejoue un scan marché avec API simulée et vérifie
@@ -86,6 +89,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       non-régression Market Watcher (`./scripts/test.sh`)
 - [x] Market Watcher : ne plus miser sur des enchères déjà terminées (audit #15)
 - [x] Market Watcher : scanner toutes les pages, pas seulement la première (audit #16)
+- [x] Market Watcher : une seule liste de mots-clés, mode 🤖 auto / 👁️ manuel par
+      mot-clé, plafond de prix et limite de mises par heure (audit #17, #18)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
       d'injection couverts, verrouillé par un test (audit #4)
 - [ ] Découpage du monolithe en modules

@@ -14,14 +14,20 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const src = fs.readFileSync(path.join(ROOT, 'src/open_cards.js'), 'utf8');
 const lines = src.split('\n');
 
-// ── 1. Un seul échappeur : les alias délèguent, ils ne réimplémentent pas ──
+// ── 1. Un seul échappeur : tout alias présent délègue, il ne réimplémente pas ──
+// La liste n'est pas figée : un alias peut disparaître avec le code qui l'utilisait
+// (escH est parti avec l'ancien panneau de mots-clés). Ce qui doit rester vrai, c'est
+// qu'aucun alias existant ne réimplémente l'échappement — le contrôle 2 ci-dessous
+// couvre le cas d'un tout nouvel échappeur écrit à la main.
+let aliasesChecked = 0;
 for (const alias of ['htmlEsc', 'taggerEsc', 'escH']) {
-  const re = new RegExp('(?:const|let|var)\\s+' + alias + '\\s*=\\s*(.+)');
-  const m = src.match(re);
-  assert(m, alias + ' introuvable');
+  const m = src.match(new RegExp('(?:const|let|var)\\s+' + alias + '\\s*=\\s*(.+)'));
+  if (!m) continue;
+  aliasesChecked++;
   assert.strictEqual(m[1].split(';')[0].trim(), 'esc',
     `${alias} doit être un alias de esc(), trouvé : ${m[1].slice(0, 60)}`);
 }
+assert(aliasesChecked > 0, 'aucun alias trouvé — le test ne vérifie plus rien, vérifie les noms');
 
 // ── 2. Plus aucun échappement partiel écrit à la main ──
 const PARTIAL = /\.replace\(\s*\/[&<>"']\/g\s*,\s*['"]&(?:amp|lt|gt|quot|#39);['"]\s*\)/;

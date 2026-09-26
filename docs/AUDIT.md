@@ -167,6 +167,55 @@ prochain renommage côté API.
 `total`, page 1 et 2 pleines d'enchères mortes, la carte recherchée en page 3.
 Vérifié : échoue sur le build d'avant (« pages demandées : 1 »), passe après.
 
+### 17. Market Watcher : il misait sur tout
+Signalé en production le 26/09, une fois la pagination réparée (#16). Trois causes
+cumulées, qui ne se voyaient pas tant que le scan ne ramenait que des enchères mortes :
+
+1. le bouton **⚡ Hunter ≤N 💰** faisait miser sur **toute** nouvelle annonce passant
+   sous ce seuil, quel que soit le mot-clé qui l'avait fait remonter — un mot-clé
+   ajouté pour simplement *surveiller* déclenchait donc des mises ;
+2. les mots-clés **⭐ Prioritaires** misaient sans **aucun** plafond
+   (`autoBidWithinCap` retourne `true` quand aucun plafond n'est défini) et
+   activaient la riposte auto-bid, donc l'escalade était illimitée ;
+3. rien ne bornait le **nombre** de mises.
+
+S'y ajoutait le matching par sous-chaîne : `CHAT` attrape « château », « achat »,
+« chatte ». Et quatre listes de mots-clés (Standards / Prioritaires / Fourbe /
+Chasseur ciblé) qu'il fallait connaître par cœur pour savoir laquelle dépensait.
+
+**✅ Corrigé (1.3.13-fork.7)** — une **seule liste** (`wm_watchlist`), chaque entrée
+portant son mode : `manuel` (affichage seul) ou `auto` (mise, plafonnée). Le moteur
+de scan n'est pas réécrit : `compileWatchlist()` compile la liste vers les tableaux
+internes existants, les entrées `auto` empruntant le chemin du Chasseur ciblé, seul
+chemin qui sache déjà gérer mode + plafond + rareté requise. `KEYWORDS_PRIORITY` et
+`KEYWORDS_FOURBE` sont vidés : c'étaient précisément les deux chemins sans plafond.
+Migration automatique depuis les 4 anciennes listes, dont les clés sont conservées
+en secours.
+
+`autoBidAllowed()` devient la porte unique de **toutes** les mises automatiques
+(chasse, riposte, snipe, hot-lane) : interrupteur maître, puis plafond de prix global
+(`globalBidCap`, 500 par défaut), puis limite horaire glissante (`maxBidsPerHour`, 10
+par défaut), puis plafond propre à l'enchère. Le comptage se fait dans
+`markAuctionAsMine()`, point de passage unique d'une mise réussie.
+
+Le bouton « Hunter ≤N 💰 » devient l'**interrupteur maître** des mises automatiques,
+désormais mémorisé : depuis qu'il commande toutes les mises, le remettre à zéro à
+chaque rechargement désarmait le bot sans prévenir.
+
+`tests/watchlist-modes.test.mjs` verrouille les cinq comportements dans un vrai
+navigateur : manuel → 0 mise, auto → 1 mise par annonce, interrupteur en pause → 0,
+plafond global dépassé → 0, limite horaire à 1 → 1 seule mise.
+
+### 18. Scan tronqué à 3 000 annonces
+Le plafond de pagination introduit en fork.5 (`MARKET_MAX_PAGES = 60`, soit 60 × 50)
+coupait le scan à 3 000 annonces. Comme le scan trie par `ending_soon`, ce sont les
+annonces qui **durent le plus longtemps** qui tombaient hors du scan — donc
+précisément celles qu'on a le temps de gagner. Symptôme : « ça ne m'affiche pas tous
+les résultats ».
+
+**✅ Corrigé (1.3.13-fork.7)** — plafond porté à 300 pages (15 000 annonces), et le
+scan **dit** désormais qu'il a été tronqué au lieu de l'avaler en silence.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

@@ -91,6 +91,28 @@ await page.route(new RegExp('^(?!' + origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&
 await page.evaluate(script).catch(e => errors.push('EVAL: ' + (e.message || e)));
 await page.waitForTimeout(2500);
 
+// Le panneau de mots-clés est replié au chargement : on le rend explicitement, car
+// c'est la première chose que l'utilisateur ouvre et une erreur dedans laisserait
+// une zone vide sans rien signaler.
+const panel = await page.evaluate(() => {
+  try {
+    window.wmWatchAddFromForm && null; // handler exposé ?
+    const el = document.getElementById('wm-keywords-panel');
+    if (!el) return { error: 'panneau absent' };
+    el.style.display = 'block';
+    if (typeof window.wmAddKeyword !== 'function') return { error: 'wmAddKeyword absent' };
+    window.wmAddKeyword('essai de mot-clé');   // passe par la liste unifiée
+    return {
+      html: el.innerHTML.length,
+      hasModeBtn: /AUTO|MANUEL/.test(el.innerHTML),
+      hasCap: !!document.getElementById('wm-global-cap'),
+      hasRate: !!document.getElementById('wm-max-bids-hour'),
+      hasAddForm: !!document.getElementById('wm-wl-text'),
+      stored: (localStorage.getItem('wm_watchlist') || '').includes('essai de mot-clé'),
+    };
+  } catch (e) { return { error: e.message }; }
+});
+
 const state = await page.evaluate(() => ({
   count: document.querySelectorAll('[id^="wm-"]').length,
   fab: !!document.getElementById('wm-fab'),
@@ -108,6 +130,14 @@ if (!state.fab) problems.push('bouton flottant #wm-fab absent');
 if (!state.gear) problems.push('écrou #wm-fab-gear absent');
 if (!state.overlay) problems.push('panneau #wm-overlay absent');
 if (state.count < 100) problems.push(`seulement ${state.count} éléments wm-* montés (attendu > 100)`);
+if (panel.error) problems.push('panneau de mots-clés : ' + panel.error);
+else {
+  if (!panel.hasModeBtn) problems.push('panneau : pas de bouton de mode AUTO/MANUEL');
+  if (!panel.hasCap) problems.push('panneau : champ plafond global absent');
+  if (!panel.hasRate) problems.push('panneau : champ limite horaire absent');
+  if (!panel.hasAddForm) problems.push("panneau : formulaire d'ajout absent");
+  if (!panel.stored) problems.push("panneau : le mot-clé ajouté n'a pas été enregistré");
+}
 problems.push(...errors);
 
 if (problems.length) {

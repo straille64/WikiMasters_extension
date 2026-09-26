@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.6
+// @version      1.3.13-fork.7
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.6';
+    const WM_VERSION = '1.3.13-fork.7';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -66,9 +66,12 @@
     const MARKET_API_BASE = "https://www.wiki-masters.com/api/marketplace";
     const MARKET_PAGE_LIMIT = 50;
     const MARKET_PAGE_CONCURRENCY = 5; // pages chargées en parallèle par lot
-    // Plafond dur de pagination (60 × 50 = 3000 annonces) : la boucle s'arrête d'elle-même
-    // sur une page incomplète, ceci n'est qu'un filet si l'API répond n'importe quoi.
-    const MARKET_MAX_PAGES = 60;
+    /* Plafond dur de pagination (300 × 50 = 15 000 annonces). La boucle s'arrête
+       normalement d'elle-même sur une page incomplète ; ce plafond n'est qu'un filet
+       si l'API répond n'importe quoi. Il était à 60 (3 000 annonces) : comme le scan
+       trie par `ending_soon`, ce sont les annonces qui durent le plus longtemps qui
+       tombaient hors du scan — donc précisément celles qu'on a le temps de gagner. */
+    const MARKET_MAX_PAGES = 300;
     const MARKET_MIN_GAP_MS = 1500;    // souffle minimal entre 2 scans
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -920,6 +923,8 @@
         autoSnipeMode:         'wm_autosnipe_mode',
         autoSnipeAdaptiveRatio:'wm_autosnipe_adaptive_ratio',
         minBalanceForAutoSnipe: 'wm_autosnipe_min_balance',
+        globalBidCap:          'wm_global_bid_cap',      // prix max d'UNE mise auto
+        maxBidsPerHour:        'wm_max_bids_per_hour',   // nb max de mises auto / heure
         autoRetagEnabled:      'wm_autoretag_enabled',
         sellTagName:           'wm_sell_tag_name',
         packCooldown:          'wm_pack_cooldown',
@@ -974,6 +979,8 @@
         autoSnipeMode:         'fixed',   // 'fixed' = seuil fixe · 'adaptive' = sous la médiane marché
         autoSnipeAdaptiveRatio: 0.85,     // en mode adaptatif : snipe si prix <= ratio × médiane
         minBalanceForAutoSnipe: 2000,
+        globalBidCap:          500,       // 0 = pas de plafond (déconseillé)
+        maxBidsPerHour:        10,        // 0 = pas de limite (déconseillé)
         autoRetagEnabled:      true,
         sellTagName:           'Trash',
         packCooldown:          180,
@@ -1174,6 +1181,15 @@
             case 'rarity_desc': arr.sort((a,b) => rarOf(b) - rarOf(a)); break;
             case 'rarity_asc':  arr.sort((a,b) => rarOf(a) - rarOf(b)); break;
             case 'title_asc':   arr.sort((a,b) => titleOf(a).localeCompare(titleOf(b))); break;
+            case 'keyword_asc':
+                // Regroupe les annonces par mot-clé qui les a fait remonter, puis fin
+                // proche à l'intérieur de chaque groupe.
+                arr.sort((a, b) => {
+                    const ka = (matchedKeyword(a.card) || '\uffff').toLowerCase();
+                    const kb = (matchedKeyword(b.card) || '\uffff').toLowerCase();
+                    return ka.localeCompare(kb) || endOf(a) - endOf(b);
+                });
+                break;
             case 'recent':      arr.sort((a,b) => seenOf(b) - seenOf(a)); break;
             case 'owned_asc':   arr.sort((a,b) => ownedOf(a) - ownedOf(b) || endOf(a) - endOf(b)); break;
             case 'owned_desc':  arr.sort((a,b) => ownedOf(b) - ownedOf(a) || endOf(a) - endOf(b)); break;
@@ -1232,6 +1248,111 @@
 
     function saveKeywords() {
         try { localStorage.setItem(KEYWORDS_STORAGE_KEY, JSON.stringify(KEYWORDS_ALERT)); } catch(e) {}
+    }
+
+    /* ═══════════ LISTE DE SURVEILLANCE UNIFIÉE ═══════════
+       Une seule liste côté utilisateur. Chaque entrée porte son mode :
+         'auto'   → le bot mise tout seul, dans la limite de son plafond ;
+         'manuel' → l'annonce est seulement affichée, la mise se fait à la main.
+
+       Remplace les quatre listes d'avant (Standards / ⭐ Prioritaires / 🕵️ Fourbe /
+       🎯 Chasseur ciblé). Elles faisaient toutes la même chose à des réglages près, et
+       il fallait les connaître par cœur pour savoir laquelle misait — c'est comme ça
+       qu'on se retrouve à miser sur tout sans l'avoir voulu. Les exclusions restent à
+       part : c'est le contraire d'une recherche, pas un mode de recherche.
+
+       Le moteur de scan n'est PAS réécrit : la liste est *compilée* vers les tableaux
+       internes existants (cf. compileWatchlist). Les entrées 'auto' empruntent le
+       chemin du Chasseur ciblé, seul chemin qui sache déjà gérer mode + plafond +
+       rareté requise. */
+    const WATCHLIST_KEY = 'wm_watchlist';
+    let WATCHLIST = [];
+
+    function normalizeWatchEntry(e) {
+        const kw = String((e && (e.kw != null ? e.kw : e.text)) || '').trim();
+        if (!kw) return null;
+        const cap = Number(e && e.cap);
+        return {
+            kw,
+            mode: (e && e.mode === 'auto') ? 'auto' : 'manuel',
+            cap: Number.isFinite(cap) && cap > 0 ? cap : null, // null → plafond global
+            rarity: normalizeHunterRarity(e && e.rarity),
+            snipe: !!(e && e.snipe),
+            autoDisable: !!(e && e.autoDisable),
+            enabled: !(e && e.enabled === false),
+        };
+    }
+
+    /* Migration unique depuis les 4 anciennes listes. Les anciennes clés ne sont PAS
+       effacées : en cas de souci on revient en arrière sans avoir rien perdu.
+       Ordre du plus spécifique au moins spécifique — une chasse ciblée (qui porte un
+       plafond) l'emporte sur le même mot présent ailleurs. */
+    function migrateWatchlist() {
+        const out = [];
+        const push = (kw, extra) => {
+            const e = normalizeWatchEntry(Object.assign({ kw }, extra));
+            if (e && !out.some(o => o.kw.toLowerCase() === e.kw.toLowerCase())) out.push(e);
+        };
+        for (const h of KEYWORDS_HUNTER) {
+            push(h.text, { mode: 'auto', cap: h.cap, rarity: h.rarity,
+                           snipe: h.mode === 'fourbe', autoDisable: h.autoDisable, enabled: h.enabled });
+        }
+        for (const kw of KEYWORDS_FOURBE)   push(kw, { mode: 'auto', snipe: true });
+        for (const kw of KEYWORDS_PRIORITY) push(kw, { mode: 'auto' });
+        for (const kw of KEYWORDS_ALERT)    push(kw, { mode: 'manuel' });
+        return out;
+    }
+
+    function loadWatchlist() {
+        let raw = null;
+        try { raw = localStorage.getItem(WATCHLIST_KEY); } catch(e) {}
+        if (raw) {
+            try {
+                const arr = JSON.parse(raw);
+                if (Array.isArray(arr)) WATCHLIST = arr.map(normalizeWatchEntry).filter(Boolean);
+            } catch(e) {}
+        } else {
+            WATCHLIST = migrateWatchlist();
+            if (WATCHLIST.length) {
+                saveWatchlist();
+                const autos = WATCHLIST.filter(e => e.mode === 'auto').length;
+                wmLog(`🔀 Mots-clés regroupés en une seule liste : <b>${WATCHLIST.length}</b> entrée(s), dont <b>${autos}</b> en mise automatique. Les anciennes listes sont conservées en secours.`);
+            }
+        }
+        compileWatchlist();
+    }
+
+    function saveWatchlist() {
+        try { localStorage.setItem(WATCHLIST_KEY, JSON.stringify(WATCHLIST)); }
+        catch(e) { wmLog(`⚠️ Sauvegarde des mots-clés ÉCHOUÉE : <b>${esc(e.name || 'Erreur')}</b> — ${esc(e.message || 'inconnue')}`); }
+        compileWatchlist();
+    }
+
+    /* Compile la liste vers les tableaux que le moteur consomme déjà.
+       - KEYWORDS_ALERT  : TOUTES les entrées actives → toutes s'affichent dans le panneau.
+       - KEYWORDS_HUNTER : les entrées 'auto' → chemin Chasseur ciblé, qui respecte un plafond.
+       - PRIORITY / FOURBE : vidés. C'étaient précisément les deux chemins qui misaient
+         SANS aucun plafond et ripostaient à l'infini. */
+    function compileWatchlist() {
+        const live = WATCHLIST.filter(e => e.enabled !== false);
+        KEYWORDS_ALERT = live.map(e => e.kw);
+        KEYWORDS_PRIORITY = [];
+        KEYWORDS_FOURBE = [];
+        KEYWORDS_HUNTER = live.filter(e => e.mode === 'auto').map(e => ({
+            text: e.kw,
+            mode: e.snipe ? 'fourbe' : 'autobid',
+            cap: e.cap != null ? e.cap : getSetting('globalBidCap'),
+            rarity: e.rarity,
+            enabled: true,
+            autoDisable: e.autoDisable,
+        }));
+    }
+
+    // Entrée de la liste qui a fait matcher une carte (pour l'affichage « pourquoi »).
+    function matchedWatchEntry(card) {
+        const fields = [card && card.wikipedia_title || '', card && card.category || ''];
+        return WATCHLIST.find(e => e.enabled !== false
+            && fields.some(f => f.toLowerCase().includes(e.kw.toLowerCase()))) || null;
     }
     function savePriorityKeywords() {
         try { localStorage.setItem(KEYWORDS_PRIORITY_KEY, JSON.stringify(KEYWORDS_PRIORITY)); } catch(e) {}
@@ -1305,124 +1426,123 @@
     function renderKeywordsPanel() {
         const el = document.getElementById('wm-keywords-panel');
         if (!el) return;
+        const autos = WATCHLIST.filter(e => e.enabled !== false && e.mode === 'auto').length;
         const label = document.getElementById('wm-kw-label');
-        if (label) label.innerText = `Mots-clés (${KEYWORDS_ALERT.length + KEYWORDS_PRIORITY.length + KEYWORDS_FOURBE.length + KEYWORDS_HUNTER.length}) · Exclus (${KEYWORDS_EXCLUDE.length})`;
+        if (label) {
+            label.innerText = `Mots-clés (${WATCHLIST.length}) · ${autos} en auto · Exclus (${KEYWORDS_EXCLUDE.length})`;
+        }
 
-        const renderTag = (kw, i, type) => {
-            const isP = type === 'priority', isE = type === 'exclude', isF = type === 'fourbe';
-            const color  = isE ? '#ef4444' : isP ? '#fbbf24' : isF ? '#c084fc' : '#06b6d4';
-            const bg     = isE ? 'rgba(239,68,68,0.08)' : isP ? 'rgba(251,191,36,0.07)' : isF ? 'rgba(192,132,252,0.08)' : 'rgba(0,255,255,0.07)';
-            const border = isE ? 'rgba(239,68,68,0.4)' : isP ? 'rgba(251,191,36,0.35)' : isF ? 'rgba(192,132,252,0.4)' : 'rgba(0,255,255,0.18)';
-            const fn     = isE ? 'wmRemoveExcludeKeyword' : isP ? 'wmRemovePriorityKeyword' : isF ? 'wmRemoveFourbeKeyword' : 'wmRemoveKeyword';
-            return `<span style="display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:4px;
-                background:${bg};border:1px solid ${border};
-                font-size:10px;color:${color};margin:2px 2px 0 0;">
-                ${esc(kw)}
-                <button onclick="window.${fn}(${i})" style="
-                    background:none;border:none;color:#666;cursor:pointer;
-                    font-size:12px;padding:0 0 0 2px;line-height:1;" title="Retirer">×</button>
-            </span>`;
-        };
+        const globalCap = getSetting('globalBidCap');
 
-        const priorityTags = KEYWORDS_PRIORITY.map((kw, i) => renderTag(kw, i, 'priority')).join('');
-        const fourbeTags   = KEYWORDS_FOURBE.map((kw, i)   => renderTag(kw, i, 'fourbe')).join('');
-        const normalTags   = KEYWORDS_ALERT.map((kw, i)   => renderTag(kw, i, 'normal')).join('');
-        const excludeTags  = KEYWORDS_EXCLUDE.map((kw, i)  => renderTag(kw, i, 'exclude')).join('');
-
-        // Chasseur ciblé : chaque tag affiche le mot-clé + son mode + son plafond + sa
-        // rareté requise (si définie) + un indicateur d'auto-pause (si activée). Une chasse
-        // en pause est grisée pour être identifiable d'un coup d'œil, sans devoir lire le
-        // texte du bouton — cohérent avec le reste des indicateurs d'état du bot.
-        const escH = esc; // alias local historique — cf. section ÉCHAPPEMENT HTML
-        const hunterTags = KEYWORDS_HUNTER.map((h, i) => {
-            const enabled = h.enabled !== false;
-            const modeStr = h.mode === 'fourbe' ? '🕵️ fourbe' : '🤖 auto-bid';
-            const rarStr = h.rarity ? ` · <span style="color:${(RARITY[h.rarity] || {}).color || '#5dade2'};font-weight:700;">${h.rarity}</span> requise` : '';
-            const adStr = h.autoDisable ? ` · <span title="Se met en pause toute seule après avoir gagné une enchère">🔁➜⏸️</span>` : '';
-            return `<span style="display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:4px;
-                background:${enabled ? 'rgba(52,152,219,0.1)' : 'rgba(255,255,255,0.03)'};
-                border:1px solid ${enabled ? 'rgba(52,152,219,0.45)' : 'rgba(255,255,255,0.12)'};
-                font-size:10px;color:${enabled ? '#5dade2' : '#666'};margin:2px 2px 0 0;
-                ${enabled ? '' : 'opacity:0.65;'}">
-                ${enabled ? '' : '⏸️ '}${escH(h.text)}
-                <span style="color:#888;font-size:9px;">${modeStr} · ≤${h.cap} 💰${rarStr}${adStr}</span>
-                <button onclick="window.wmToggleHunterEnabled(${i})" style="
-                    background:none;border:none;color:${enabled ? '#4ade80' : '#888'};cursor:pointer;
-                    font-size:11px;padding:0 0 0 2px;line-height:1;"
-                    title="${enabled ? 'Mettre en pause (garde la config, arrête les mises)' : 'Réactiver'}">${enabled ? '⏸️' : '▶️'}</button>
-                <button onclick="window.wmRemoveHunterKeyword(${i})" style="
-                    background:none;border:none;color:#666;cursor:pointer;
-                    font-size:12px;padding:0 0 0 2px;line-height:1;" title="Supprimer définitivement">×</button>
-            </span>`;
+        /* Une ligne par mot-clé, avec ses réglages en clair plutôt que répartis dans
+           quatre listes qu'il fallait connaître par cœur. Le mode se change d'un clic :
+           c'est le réglage qui décide si le bot dépense ou non, il doit donc être le
+           plus visible et le plus facile à inverser. */
+        const rows = WATCHLIST.map((e, i) => {
+            const on = e.enabled !== false;
+            const isAuto = e.mode === 'auto';
+            const color = !on ? '#666' : isAuto ? '#fbbf24' : '#06b6d4';
+            const capTxt = e.cap != null ? e.cap.toLocaleString('fr-FR')
+                : (globalCap > 0 ? globalCap.toLocaleString('fr-FR') + ' (global)' : 'aucun');
+            const rarTxt = e.rarity
+                ? ` · <span style="color:${(RARITY[e.rarity] || {}).color || '#5dade2'};font-weight:700;">${e.rarity}</span>`
+                : '';
+            return `<div style="display:flex;align-items:center;gap:5px;padding:4px 6px;margin-bottom:3px;
+                border-radius:5px;background:${on ? 'rgba(255,255,255,0.03)' : 'transparent'};
+                border:1px solid ${on ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.04)'};${on ? '' : 'opacity:0.5;'}">
+                <button onclick="window.wmWatchToggleMode(${i})"
+                    title="${isAuto ? 'Le bot mise tout seul sur ce mot-clé. Clique pour repasser en manuel.' : 'Affichage seulement : à toi de cliquer Miser. Clique pour laisser le bot miser.'}"
+                    style="flex-shrink:0;padding:2px 6px;border-radius:4px;cursor:pointer;font-size:9px;font-weight:700;
+                    border:1px solid ${isAuto ? 'rgba(251,191,36,0.5)' : 'rgba(6,182,212,0.4)'};
+                    background:${isAuto ? 'rgba(251,191,36,0.12)' : 'rgba(6,182,212,0.1)'};color:${color};">
+                    ${isAuto ? '🤖 AUTO' : '👁️ MANUEL'}</button>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+                    color:${on ? '#ddd' : '#666'};font-size:11px;" title="${esc(e.kw)}">${esc(e.kw)}</span>
+                ${isAuto ? `<span style="color:#888;font-size:9px;white-space:nowrap;"
+                    title="Plafond : le bot ne montera jamais au-dessus.">≤${capTxt} 💰${rarTxt}${e.snipe ? ' · 🕵️' : ''}</span>` : ''}
+                <button onclick="window.wmWatchToggleEnabled(${i})" title="${on ? 'Mettre en pause' : 'Réactiver'}"
+                    style="background:none;border:none;color:${on ? '#4ade80' : '#888'};cursor:pointer;font-size:11px;padding:0 2px;">${on ? '⏸️' : '▶️'}</button>
+                <button onclick="window.wmWatchRemove(${i})" title="Supprimer"
+                    style="background:none;border:none;color:#666;cursor:pointer;font-size:13px;padding:0 2px;line-height:1;">×</button>
+            </div>`;
         }).join('');
 
+        const excludeTags = KEYWORDS_EXCLUDE.map((kw, i) => `
+            <span style="display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:4px;
+                background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.4);
+                font-size:10px;color:#ef4444;margin:2px 2px 0 0;">
+                ${esc(kw)}
+                <button onclick="window.wmRemoveExcludeKeyword(${i})" style="background:none;border:none;
+                    color:#666;cursor:pointer;font-size:12px;padding:0 0 0 2px;line-height:1;" title="Retirer">×</button>
+            </span>`).join('');
+
         el.innerHTML = `
-            <div style="font-size:9px;color:#fbbf24;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">⭐ Prioritaires <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(auto-bid forcé)</span></div>
-            <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${priorityTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
-            <div style="display:flex;gap:4px;margin-bottom:10px;">
-                <input id="wm-kwp-input" type="text" placeholder="Ajouter… (plusieurs : sépare par ;)"
-                    style="flex:1;padding:3px 6px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);
-                    background:#0f0f13;color:#fff;font-size:11px;outline:none;"
-                    onkeydown="if(event.key==='Enter'){window.wmAddPriorityKeyword(this.value);this.value='';}" />
-                <button onclick="const i=document.getElementById('wm-kwp-input');window.wmAddPriorityKeyword(i.value);i.value='';"
-                    style="padding:3px 10px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);
-                    background:rgba(251,191,36,0.1);color:#fbbf24;font-size:13px;cursor:pointer;font-weight:700;">+</button>
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;padding:5px 6px;flex-wrap:wrap;
+                border-radius:5px;background:rgba(239,68,68,0.05);border:1px solid rgba(239,68,68,0.2);">
+                <span style="font-size:9px;color:#ef4444;text-transform:uppercase;letter-spacing:1px;flex-shrink:0;">🛡️ Limites</span>
+                <label style="display:flex;align-items:center;gap:3px;font-size:10px;color:#bbb;white-space:nowrap;">
+                    max
+                    <input id="wm-global-cap" type="number" min="0" step="10" value="${globalCap}"
+                        title="Prix maximum d'une mise automatique, tous mots-clés confondus. 0 = aucune limite (déconseillé)."
+                        style="width:58px;padding:2px 4px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);
+                        background:#0f0f13;color:#fff;font-size:10px;outline:none;" /> 💰/mise
+                </label>
+                <label style="display:flex;align-items:center;gap:3px;font-size:10px;color:#bbb;white-space:nowrap;">
+                    max
+                    <input id="wm-max-bids-hour" type="number" min="0" step="1" value="${getSetting('maxBidsPerHour')}"
+                        title="Nombre maximum de mises automatiques par heure glissante. 0 = aucune limite (déconseillé)."
+                        style="width:44px;padding:2px 4px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);
+                        background:#0f0f13;color:#fff;font-size:10px;outline:none;" /> mises/h
+                </label>
+                <span style="flex:1;"></span>
+                <span style="font-size:9px;color:#666;white-space:nowrap;" title="Mises automatiques passées dans la dernière heure">${bidsLastHour()} cette heure</span>
             </div>
-            <div style="font-size:9px;color:#c084fc;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🕵️ Fourbe <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(snipe auto en fin d'enchère)</span></div>
-            <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${fourbeTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
-            <div style="display:flex;gap:4px;margin-bottom:10px;">
-                <input id="wm-kwf-input" type="text" placeholder="Ajouter… (plusieurs : sépare par ;)"
-                    style="flex:1;padding:3px 6px;border-radius:4px;border:1px solid rgba(192,132,252,0.3);
-                    background:#0f0f13;color:#fff;font-size:11px;outline:none;"
-                    onkeydown="if(event.key==='Enter'){window.wmAddFourbeKeyword(this.value);this.value='';}" />
-                <button onclick="const i=document.getElementById('wm-kwf-input');window.wmAddFourbeKeyword(i.value);i.value='';"
-                    style="padding:3px 10px;border-radius:4px;border:1px solid rgba(192,132,252,0.3);
-                    background:rgba(192,132,252,0.1);color:#c084fc;font-size:13px;cursor:pointer;font-weight:700;">+</button>
+
+            <div style="font-size:9px;color:#06b6d4;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px;">
+                🔍 Mots-clés surveillés
+                <span style="color:#666;text-transform:none;letter-spacing:0;">— 🤖 AUTO : le bot mise · 👁️ MANUEL : affiché seulement</span>
             </div>
-            <div style="font-size:9px;color:#5dade2;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🎯 Chasseur ciblé <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(mise + mode + plafond par mot-clé)</span></div>
-            <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${hunterTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
+            <div style="margin-bottom:7px;">${rows || '<span style="color:#444;font-size:10px;">Aucun mot-clé. Ajoute-en un ci-dessous.</span>'}</div>
+
             <div style="display:flex;gap:4px;margin-bottom:4px;">
-                <input id="wm-kwh-text" type="text" placeholder="Mot-clé (ex. gare ferroviaire japonaise)"
-                    style="flex:1;min-width:0;padding:3px 6px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);
-                    background:#0f0f13;color:#fff;font-size:11px;outline:none;" />
-                <select id="wm-kwh-mode" title="Mode" style="padding:3px 4px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
-                    <option value="fourbe">🕵️ Fourbe</option>
-                    <option value="autobid">🤖 Auto-bid</option>
-                </select>
-                <select id="wm-kwh-rarity" title="Rareté requise : la mise n'a lieu QUE si la carte est actuellement dans cette rareté précise. Utile si tu sais qu'elle va bientôt en changer et que tu ne veux pas miser au mauvais prix. « Toutes » = pas de filtre (comportement d'avant)." style="padding:3px 4px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
-                    <option value="">Toutes raretés</option>
-                    <option value="L">L</option>
-                    <option value="UR">UR</option>
-                    <option value="SR">SR</option>
-                    <option value="R">R</option>
-                    <option value="PC">PC</option>
-                    <option value="C">C</option>
-                </select>
-                <input id="wm-kwh-cap" type="number" min="1" step="1" placeholder="Plafond"
-                    style="width:64px;padding:3px 6px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);
-                    background:#0f0f13;color:#fff;font-size:11px;outline:none;" />
-                <button onclick="window.wmAddHunterKeyword(document.getElementById('wm-kwh-text').value, document.getElementById('wm-kwh-cap').value, document.getElementById('wm-kwh-mode').value, document.getElementById('wm-kwh-rarity').value, document.getElementById('wm-kwh-autodisable').checked)"
-                    style="padding:3px 10px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);
-                    background:rgba(52,152,219,0.12);color:#5dade2;font-size:13px;cursor:pointer;font-weight:700;">+</button>
-            </div>
-            <label style="display:flex;align-items:center;gap:5px;margin:-2px 0 6px;font-size:9px;color:#888;cursor:pointer;user-select:none;"
-                title="Dès que cette chasse remporte une enchère, elle se met automatiquement en pause (⏸️) — pratique pour ne vouloir qu'UN exemplaire. Décoché (par défaut) : elle reste active, pour collectionner plusieurs fois la même carte.">
-                <input type="checkbox" id="wm-kwh-autodisable" style="width:11px;height:11px;accent-color:#5dade2;cursor:pointer;margin:0;flex-shrink:0;">
-                <span>Mettre en pause automatiquement après avoir gagné une enchère</span>
-            </label>
-            <div style="color:#555;font-size:9px;margin-bottom:10px;">Dès qu'une carte matche : mise minimale immédiate, puis <b>fourbe</b> (snipe en fin) ou <b>auto-bid</b> (riposte), jamais au-dessus du plafond. Avec une <b>rareté requise</b> : aucune mise tant que la carte n'est pas dans cette rareté précise — pratique si tu sais qu'elle va bientôt en changer et ne veux pas miser au mauvais prix entre-temps.</div>
-            <div style="font-size:9px;color:#06b6d4;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Standards</div>
-            <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${normalTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
-            <div style="display:flex;gap:4px;margin-bottom:10px;">
-                <input id="wm-kw-input" type="text" placeholder="Ajouter… (plusieurs : sépare par ;)"
-                    style="flex:1;padding:3px 6px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);
+                <input id="wm-wl-text" type="text" placeholder="Mot-clé (plusieurs : sépare par ;)"
+                    style="flex:1;min-width:0;padding:3px 6px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);
                     background:#0f0f13;color:#fff;font-size:11px;outline:none;"
-                    onkeydown="if(event.key==='Enter'){window.wmAddKeyword(this.value);this.value='';}" />
-                <button onclick="const i=document.getElementById('wm-kw-input');window.wmAddKeyword(i.value);i.value='';"
+                    onkeydown="if(event.key==='Enter'){window.wmWatchAddFromForm();}" />
+                <select id="wm-wl-mode" title="Que fait le bot quand il trouve une carte ?"
+                    style="padding:3px 4px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
+                    <option value="manuel">👁️ Manuel</option>
+                    <option value="auto">🤖 Auto</option>
+                </select>
+                <button onclick="window.wmWatchAddFromForm()"
                     style="padding:3px 10px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);
                     background:rgba(6,182,212,0.1);color:#06b6d4;font-size:13px;cursor:pointer;font-weight:700;">+</button>
             </div>
-            <div style="font-size:9px;color:#ef4444;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🚫 Exclus <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(masque strictement les annonces contenant la phrase)</span></div>
+            <div style="display:flex;gap:4px;align-items:center;margin-bottom:8px;font-size:9px;color:#666;flex-wrap:wrap;">
+                <span style="white-space:nowrap;">Si 🤖 auto :</span>
+                <input id="wm-wl-cap" type="number" min="1" step="10" placeholder="plafond"
+                    title="Plafond de prix pour CE mot-clé. Vide = le plafond global ci-dessus s'applique."
+                    style="width:62px;padding:2px 4px;border-radius:4px;border:1px solid rgba(255,255,255,0.12);
+                    background:#0f0f13;color:#fff;font-size:10px;outline:none;" />
+                <select id="wm-wl-rarity" title="Ne miser que si la carte est exactement dans cette rareté."
+                    style="padding:2px 4px;border-radius:4px;border:1px solid rgba(255,255,255,0.12);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
+                    <option value="">Toutes raretés</option>
+                    <option value="L">L</option><option value="UR">UR</option><option value="SR">SR</option>
+                    <option value="R">R</option><option value="PC">PC</option><option value="C">C</option>
+                </select>
+                <label style="display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap;"
+                    title="Ne mise pas tout de suite : attend la toute fin de l'enchère pour tirer une seule fois.">
+                    <input type="checkbox" id="wm-wl-snipe" style="width:11px;height:11px;accent-color:#c084fc;cursor:pointer;margin:0;">
+                    <span>🕵️ snipe en fin</span>
+                </label>
+                <label style="display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap;"
+                    title="Repasse ce mot-clé en pause dès qu'il a remporté une enchère — pour n'en vouloir qu'un exemplaire.">
+                    <input type="checkbox" id="wm-wl-autodisable" style="width:11px;height:11px;accent-color:#5dade2;cursor:pointer;margin:0;">
+                    <span>pause après victoire</span>
+                </label>
+            </div>
+
+            <div style="font-size:9px;color:#ef4444;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🚫 Jamais <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(masque toute annonce contenant la phrase)</span></div>
             <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${excludeTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
             <div style="display:flex;gap:4px;">
                 <input id="wm-kwe-input" type="text" placeholder="Ajouter à exclure… (plusieurs : sépare par ;)"
@@ -1433,8 +1553,81 @@
                     style="padding:3px 10px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);
                     background:rgba(239,68,68,0.1);color:#ef4444;font-size:13px;cursor:pointer;font-weight:700;">+</button>
             </div>`;
+
+        // Les deux limites s'appliquent dès la saisie : pas de bouton « enregistrer » à
+        // oublier, alors que c'est précisément ce qui borne la dépense.
+        const capEl = document.getElementById('wm-global-cap');
+        if (capEl) capEl.onchange = () => {
+            const v = Math.max(0, Math.floor(Number(capEl.value) || 0));
+            setSetting('globalBidCap', v);
+            compileWatchlist(); // les entrées sans plafond propre suivent le global
+            wmLog(v > 0 ? `🛡️ Plafond global : <b>${v.toLocaleString('fr-FR')} 💰</b> par mise.`
+                        : '🛡️ Plafond global retiré — les mises automatiques ne sont plus bornées en prix.');
+            renderKeywordsPanel();
+        };
+        const rateEl = document.getElementById('wm-max-bids-hour');
+        if (rateEl) rateEl.onchange = () => {
+            const v = Math.max(0, Math.floor(Number(rateEl.value) || 0));
+            setSetting('maxBidsPerHour', v);
+            wmLog(v > 0 ? `🛡️ Limite : <b>${v}</b> mise(s) automatique(s) par heure.`
+                        : `🛡️ Limite horaire retirée — le nombre de mises n'est plus borné.`);
+        };
     }
 
+    /* ── Handlers de la liste unifiée, appelés depuis le HTML du panneau ── */
+    window.wmWatchAddFromForm = function () {
+        const txtEl = document.getElementById('wm-wl-text');
+        const raw = txtEl ? txtEl.value : '';
+        const mode = (document.getElementById('wm-wl-mode') || {}).value === 'auto' ? 'auto' : 'manuel';
+        const capRaw = (document.getElementById('wm-wl-cap') || {}).value;
+        const rarity = (document.getElementById('wm-wl-rarity') || {}).value || '';
+        const snipe = !!(document.getElementById('wm-wl-snipe') || {}).checked;
+        const autoDisable = !!(document.getElementById('wm-wl-autodisable') || {}).checked;
+        // Séparateur POINT-VIRGULE, comme partout ailleurs : préserve les titres à virgule.
+        const parts = String(raw || '').split(';').map(x => x.trim()).filter(Boolean);
+        if (!parts.length) return;
+        let added = 0;
+        for (const kw of parts) {
+            if (WATCHLIST.some(e => e.kw.toLowerCase() === kw.toLowerCase())) continue;
+            const entry = normalizeWatchEntry({ kw, mode, cap: capRaw, rarity, snipe, autoDisable });
+            if (entry) { WATCHLIST.push(entry); added++; }
+        }
+        if (!added) return;
+        saveWatchlist();
+        renderKeywordsPanel();
+        const capNum = normalizeWatchEntry({ kw: 'x', cap: capRaw }).cap;
+        const capTxt = mode === 'auto'
+            ? ` · plafond ${(capNum != null ? capNum : getSetting('globalBidCap')).toLocaleString('fr-FR')} 💰`
+            : '';
+        wmLog(`🔍 ${added} mot${added > 1 ? 's' : ''}-clé${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} en <b>${mode === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}</b>${capTxt} : ${esc(parts.join(', '))}`);
+        if (txtEl) txtEl.value = '';
+    };
+
+    window.wmWatchToggleMode = function (i) {
+        const e = WATCHLIST[i];
+        if (!e) return;
+        e.mode = e.mode === 'auto' ? 'manuel' : 'auto';
+        saveWatchlist();
+        renderKeywordsPanel();
+        wmLog(`🔍 <b>${esc(e.kw)}</b> passe en <b>${e.mode === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}</b>.`);
+    };
+
+    window.wmWatchToggleEnabled = function (i) {
+        const e = WATCHLIST[i];
+        if (!e) return;
+        e.enabled = e.enabled === false;
+        saveWatchlist();
+        renderKeywordsPanel();
+    };
+
+    window.wmWatchRemove = function (i) {
+        const e = WATCHLIST[i];
+        if (!e) return;
+        WATCHLIST.splice(i, 1);
+        saveWatchlist();
+        renderKeywordsPanel();
+        wmLog(`🗑️ Mot-clé retiré : <b>${esc(e.kw)}</b>`);
+    };
     // Champs texte d'une carte pour le match mots-clés.
     // - includeDesc=false (défaut) : titre + catégorie SEULEMENT → usage marketplace/auto-bid
     //   (on ne veut PAS miser sur une carte qui ne fait que MENTIONNER un mot-clé dans sa desc).
@@ -2545,6 +2738,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Garde-fou : un lot entier sans aucune nouveauté = l'API ignore le paramètre
             // `page` (ou on tourne en rond). On s'arrête au lieu de boucler jusqu'au plafond.
             if (addedInBatch === 0) break;
+            // Plafond atteint alors que les pages étaient encore pleines : le scan est
+            // TRONQUÉ, et il manque donc des annonces. À dire, pas à avaler en silence.
+            if (more && lastPage + MARKET_PAGE_CONCURRENCY > MARKET_MAX_PAGES) {
+                wmLog(`⚠️ Scan tronqué au plafond de <b>${MARKET_MAX_PAGES} pages</b> (${auctions.length} annonces) — il reste des annonces non scannées.`);
+            }
             await new Promise(r => setTimeout(r, 100)); // petite pause entre les lots
         }
 
@@ -2661,6 +2859,56 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Vérifie si une mise prévue respecte le plafond auto-bid.
     // Si elle le dépasse : désactive l'auto-bid pour cette enchère et retourne false.
     // Sinon retourne true (la mise peut partir).
+    /* ═══════ SÉCURITÉS DES MISES AUTOMATIQUES ═══════
+       Porte unique par laquelle passe TOUTE mise automatique. Avant, chaque chemin
+       (prioritaire, chasseur, riposte, snipe, hot-lane) avait ses propres conditions,
+       et les mots-clés prioritaires n'en avaient aucune : ils misaient sans plafond et
+       ripostaient à l'infini. */
+
+    // Horodatage des mises réellement passées, pour la limite horaire glissante.
+    let bidTimestamps = [];
+    function recordBidPlaced() {
+        bidTimestamps.push(Date.now());
+        if (bidTimestamps.length > 500) bidTimestamps = bidTimestamps.slice(-500);
+    }
+    function bidsLastHour() {
+        const cutoff = Date.now() - 3600000;
+        bidTimestamps = bidTimestamps.filter(t => t > cutoff);
+        return bidTimestamps.length;
+    }
+
+    let _lastRateLogTs = 0;
+    const _capLogged = new Set();
+    function autoBidAllowed(auction, plannedAmount, contexte) {
+        // 1) Interrupteur maître : les mises auto sont-elles armées ?
+        if (!autoSnipeEnabled) return false;
+
+        // 2) Plafond de prix global — jamais dépassé, quel que soit le mot-clé.
+        const globalCap = getSetting('globalBidCap');
+        if (globalCap > 0 && plannedAmount > globalCap) {
+            if (auction && auction.id && !_capLogged.has(auction.id)) {
+                if (_capLogged.size > 500) _capLogged.clear();
+                _capLogged.add(auction.id);
+                const t = (auction.card && auction.card.wikipedia_title) || '?';
+                wmLog(`🛑 Mise annulée (plafond global <b>${globalCap.toLocaleString('fr-FR')} 💰</b>) : <b>${esc(t)}</b> — il aurait fallu ${plannedAmount.toLocaleString('fr-FR')} 💰`);
+            }
+            return false;
+        }
+
+        // 3) Limite du nombre de mises par heure glissante.
+        const maxPerHour = getSetting('maxBidsPerHour');
+        if (maxPerHour > 0 && bidsLastHour() >= maxPerHour) {
+            if (Date.now() - _lastRateLogTs > 300000) { // 5 min : on ne répète pas en boucle
+                _lastRateLogTs = Date.now();
+                wmLog(`⏸️ Limite de <b>${maxPerHour} mises/heure</b> atteinte — les mises automatiques reprendront d'elles-mêmes.`);
+            }
+            return false;
+        }
+
+        // 4) Plafond propre à cette enchère (réglé par mot-clé ou à la main).
+        return autoBidWithinCap(auction, plannedAmount);
+    }
+
     function autoBidWithinCap(auction, plannedAmount) {
         const cap = getAutoBidMax(auction.id);
         if (cap === null) return true; // pas de plafond → illimité
@@ -2771,7 +3019,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     let wikibidousBalance = Infinity; // Infinity = pas encore chargé, on laisse passer
 
     // Auto-snipe initial (nouvelle annonce ≤ 100 wikibidous)
-    let autoSnipeEnabled = false;
+    /* Interrupteur maître des mises automatiques. Mémorisé : depuis qu'il commande
+       TOUTES les mises (et plus un simple seuil de prix), le remettre à zéro à chaque
+       rechargement de page revenait à désarmer le bot sans prévenir. Éteint à la
+       première utilisation, puis on respecte le dernier choix. */
+    const AUTOBID_ARMED_KEY = 'wm_autobid_armed';
+    let autoSnipeEnabled = (() => {
+        try { return localStorage.getItem(AUTOBID_ARMED_KEY) === '1'; } catch(e) { return false; }
+    })();
 
     /* ── Hot lane : poller rapide dédié aux enchères trackées ── */
     // Mutex per-auction partagé entre main scan et hot lane (anti-doublons)
@@ -2860,71 +3115,41 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Ajoute un ou plusieurs mots-clés. Plusieurs termes possibles en les séparant par « ; »
     // (le titre à virgule reste entier, ex. « Star Wars, épisode I »).
-    window.wmAddKeyword = function(input) {
-        const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
-        let added = 0, last = '';
-        for (const kw of terms) {
-            if (KEYWORDS_ALERT.some(k => k.toLowerCase() === kw.toLowerCase())) continue;
-            KEYWORDS_ALERT.push(kw); added++; last = kw;
+    /* ── Adaptateurs des anciens handlers vers la liste unifiée ──
+       Ils écrivaient dans KEYWORDS_ALERT / PRIORITY / FOURBE / HUNTER, qui sont
+       maintenant DÉRIVÉS de WATCHLIST : leurs écritures seraient effacées au premier
+       compileWatchlist(). On les garde comme adaptateurs pour que les appelants
+       restants (import wishlist, onboarding) continuent de fonctionner. */
+    function watchlistAdd(kw, extra, silent) {
+        const entry = normalizeWatchEntry(Object.assign({ kw }, extra || {}));
+        if (!entry) return false;
+        const existing = WATCHLIST.find(e => e.kw.toLowerCase() === entry.kw.toLowerCase());
+        if (existing) { Object.assign(existing, entry); }
+        else { WATCHLIST.push(entry); }
+        saveWatchlist();
+        renderKeywordsPanel();
+        if (!silent) {
+            wmLog(`🔍 Mot-clé ${existing ? 'mis à jour' : 'ajouté'} : <b>${esc(entry.kw)}</b> · ${entry.mode === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}`);
         }
-        if (added === 0) return;
-        saveKeywords();
-        renderKeywordsPanel();
-        if (added > 1) wmLog(`➕ <b>${added}</b> mots-clés ajoutés`);
-    };
-
-    window.wmRemoveKeyword = function(idx) {
-        if (idx < 0 || idx >= KEYWORDS_ALERT.length) return;
-        KEYWORDS_ALERT.splice(idx, 1);
-        saveKeywords();
-        renderKeywordsPanel();
-    };
-
-    window.wmAddPriorityKeyword = function(input) {
-        const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
-        let added = 0, last = '';
-        for (const kw of terms) {
-            if (KEYWORDS_PRIORITY.some(k => k.toLowerCase() === kw.toLowerCase())) continue;
-            KEYWORDS_PRIORITY.push(kw); added++; last = kw;
+        return true;
+    }
+    function watchlistAddMany(input, extra) {
+        const terms = String(input || '').split(';').map(x => x.trim()).filter(Boolean);
+        let added = 0;
+        for (const kw of terms) if (watchlistAdd(kw, extra, true)) added++;
+        if (added) {
+            wmLog(`🔍 <b>${added}</b> mot${added > 1 ? 's' : ''}-clé${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} en <b>${(extra && extra.mode) === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}</b>`);
         }
-        if (added === 0) return;
-        savePriorityKeywords();
-        renderKeywordsPanel();
-        wmLog(added === 1
-            ? `⭐ Mot-clé prioritaire ajouté : <b style="color:#fbbf24;">${last}</b>`
-            : `⭐ <b>${added}</b> mots-clés prioritaires ajoutés`);
-    };
+        return added;
+    }
+    // L'index reçu vient du panneau, qui rend WATCHLIST : il s'y applique directement.
+    function watchlistRemoveAt(idx) { window.wmWatchRemove(idx); }
 
-    window.wmRemovePriorityKeyword = function(idx) {
-        if (idx < 0 || idx >= KEYWORDS_PRIORITY.length) return;
-        const removed = KEYWORDS_PRIORITY.splice(idx, 1)[0];
-        savePriorityKeywords();
-        renderKeywordsPanel();
-        if (removed) wmLog(`⭐ Mot-clé prioritaire retiré : <b style="color:#fbbf24;">${removed}</b>`);
-    };
+    window.wmAddKeyword = function(input) { watchlistAddMany(input, { mode: 'manuel' }); };
 
-    window.wmAddFourbeKeyword = function(input) {
-        const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
-        let added = 0, last = '';
-        for (const kw of terms) {
-            if (KEYWORDS_FOURBE.some(k => k.toLowerCase() === kw.toLowerCase())) continue;
-            KEYWORDS_FOURBE.push(kw); added++; last = kw;
-        }
-        if (added === 0) return;
-        saveFourbeKeywords();
-        renderKeywordsPanel();
-        wmLog(added === 1
-            ? `🕵️ Mot-clé fourbe ajouté : <b style="color:#c084fc;">${last}</b>`
-            : `🕵️ <b>${added}</b> mots-clés fourbe ajoutés`);
-    };
 
-    window.wmRemoveFourbeKeyword = function(idx) {
-        if (idx < 0 || idx >= KEYWORDS_FOURBE.length) return;
-        const removed = KEYWORDS_FOURBE.splice(idx, 1)[0];
-        saveFourbeKeywords();
-        renderKeywordsPanel();
-        if (removed) wmLog(`🕵️ Mot-clé fourbe retiré : <b style="color:#c084fc;">${removed}</b>`);
-    };
+
+
 
     // Rareté requise valide (l'un des 6 codes) — toute autre valeur (y compris vide/absente,
     // le cas normal) veut dire « pas de filtre », comportement identique à avant cette option.
@@ -2946,41 +3171,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // remporte une enchère — pratique pour ne vouloir qu'UN exemplaire. Faux par défaut (une
     // nouvelle chasse reste active tant qu'on ne la coupe pas soi-même), pour ceux qui
     // collectionnent plusieurs fois la même carte.
-    window.wmAddHunterKeyword = function(text, cap, mode, rarity, autoDisable) {
-        const t = String(text || '').trim();
-        const c = Number(cap);
-        const m = (mode === 'fourbe') ? 'fourbe' : 'autobid';
-        const rr = normalizeHunterRarity(rarity);
-        const ad = !!autoDisable;
-        if (!t) { wmLog('⚠️ Chasseur : mot-clé vide'); return; }
-        if (!Number.isFinite(c) || c <= 0) { wmLog('⚠️ Chasseur : plafond invalide (entre un nombre &gt; 0)'); return; }
-        const rarSuffix = rr ? ` · rareté <b>${rr}</b> requise` : '';
-        const adSuffix = ad ? ` · <b>auto-pause</b> après obtention` : '';
-        const existing = KEYWORDS_HUNTER.find(h => h.text.toLowerCase() === t.toLowerCase());
-        if (existing) {
-            existing.cap = c; existing.mode = m; existing.rarity = rr; existing.autoDisable = ad;
-            saveHunterKeywords(); renderKeywordsPanel();
-            wmLog(`🎯 Chasseur mis à jour : <b style="color:#5dade2;">${t}</b> → ${m === 'fourbe' ? 'fourbe' : 'auto-bid'} · plafond ${c} 💰${rarSuffix}${adSuffix}`);
-            return;
-        }
-        KEYWORDS_HUNTER.push({ text: t, cap: c, mode: m, rarity: rr, autoDisable: ad, enabled: true });
-        saveHunterKeywords(); renderKeywordsPanel();
-        wmLog(`🎯 Chasseur ajouté : <b style="color:#5dade2;">${t}</b> → ${m === 'fourbe' ? 'fourbe' : 'auto-bid'} · plafond ${c} 💰${rarSuffix}${adSuffix}`);
-    };
 
     // Bascule pause/active d'une chasse SANS la supprimer — pour la garder configurée
     // (mot-clé, plafond, mode, rareté) et la réactiver d'un clic plus tard.
-    window.wmToggleHunterEnabled = function(idx) {
-        const h = KEYWORDS_HUNTER[idx];
-        if (!h) return;
-        const wasEnabled = h.enabled !== false;
-        h.enabled = !wasEnabled;
-        saveHunterKeywords();
-        renderKeywordsPanel();
-        wmLog(h.enabled
-            ? `🎯 Chasseur réactivé : <b style="color:#5dade2;">${h.text}</b>`
-            : `🎯 Chasseur mis en pause : <b style="color:#5dade2;">${h.text}</b>`);
-    };
 
     window.wmRemoveHunterKeyword = function(idx) {
         if (idx < 0 || idx >= KEYWORDS_HUNTER.length) return;
@@ -3019,19 +3212,20 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     };
 
     loadKeywords();
+    loadWatchlist(); // migre les 4 anciennes listes et compile vers le moteur
     loadMyBids();
 
+    /* Le bouton n'est plus un seuil de prix (« Hunter ≤1000 ») mais l'INTERRUPTEUR
+       MAÎTRE des mises automatiques. Un seuil de prix global qui misait sur tout ce
+       qui passait dessous était exactement le mécanisme qui faisait miser sur tout :
+       le prix se décide maintenant par mot-clé (plafond de l'entrée) et globalement
+       (réglage `globalBidCap`). Ici on ne dit plus qu'une chose, lisible d'un coup
+       d'œil : est-ce que le bot a le droit de miser, oui ou non. */
     function autoSnipeLabel(enabled) {
-        const mode = getSetting('autoSnipeMode');
-        const state = enabled ? 'ON' : 'OFF';
-        // Quand le mode fourbe est actif, le Hunter ne mise PLUS immédiatement : le dire ici,
-        // sinon « Hunter ≤30💰 ON » promet une mise immédiate qui n'aura jamais lieu.
-        const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
-        if (mode === 'adaptive') {
-            return `⚡ Hunter dynamique ${state}${suffix}`;
-        }
-        const price = getSetting('autoSnipePrice');
-        return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
+        const nb = WATCHLIST.filter(e => e.enabled !== false && e.mode === 'auto').length;
+        return enabled
+            ? `🤖 Mises auto ARMÉES · ${nb} mot${nb > 1 ? 's' : ''}-clé${nb > 1 ? 's' : ''}`
+            : '⏸️ Mises auto EN PAUSE';
     }
 
     // Auto-bid Hunter (mise initiale selon le mode fixe/dynamique) sur une LISTE d'enchères.
@@ -3039,6 +3233,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // présentes). bidLockSet garantit qu'une même enchère n'est pas mise deux fois en parallèle.
     async function runHunterAutoBidPass(list) {
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
+        /* Ne mise QUE sur les annonces dont le mot-clé est en mode « auto ». Avant,
+           ce passage misait sur toute nouvelle annonce passant sous un seuil de prix
+           global, quel que soit le mot-clé qui l'avait fait remonter — un mot-clé
+           ajouté pour simplement SURVEILLER déclenchait donc des mises. Les entrées
+           en mode auto sont déjà traitées par le Chasseur ciblé (avec leur plafond),
+           donc en pratique ce filtre ne laisse plus rien passer ici : c'est voulu. */
+        list = list.filter(a => {
+            const e = matchedWatchEntry(a && a.card);
+            return e && e.mode === 'auto';
+        });
+        if (!list.length) return 0;
         if (hunterAggressive) return runHunterFourbePass(list); // pas de mise : on arme le snipe
         let placed = 0;
         for (const a of list) {
@@ -3156,6 +3361,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     window.wmToggleAutoSnipe = function(btn) {
         autoSnipeEnabled = !autoSnipeEnabled;
+        try { localStorage.setItem(AUTOBID_ARMED_KEY, autoSnipeEnabled ? '1' : '0'); } catch(e) {}
         if (autoSnipeEnabled) {
             btn.style.color = '#4ade80';
             btn.style.borderColor = 'rgba(74,222,128,0.4)';
@@ -3231,6 +3437,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // (état optimiste) et re-render la ligne, sans attendre le prochain scan.
     // Le prochain tick hot-lane / scan réconcilie ensuite avec l'état serveur réel.
     function markAuctionAsMine(auctionId, bidAmount, auctionObj) {
+        // Point de passage unique d'une mise réussie → c'est ici qu'on alimente la
+        // limite horaire, plutôt que dans chacun des cinq chemins de mise.
+        recordBidPlaced();
         if (currentUsername) leadingBidsMap.set(auctionId, currentUsername);
         // Mémorise le montant de ma mise (signal d'identité indépendant du pseudo)
         if (Number.isFinite(bidAmount)) myLastBidMap.set(auctionId, bidAmount);
@@ -3614,8 +3823,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         continue;
                     }
                     const bidAmount = minNextBid(a);
-                    if (!autoBidWithinCap(a, bidAmount)) {
-                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}) : <b>${esc(title)}</b> [${rar}] — mise min ${bidAmount} &gt; plafond ${h.cap}, pas de mise`);
+                    if (!autoBidAllowed(a, bidAmount, 'Chasse')) {
+                        // autoBidAllowed() a déjà dit pourquoi quand ça méritait de l'être
+                        // (plafond dépassé, limite horaire). Interrupteur en pause → on se
+                        // tait, sinon chaque annonce trouvée produirait une ligne de log.
+                        if (autoSnipeEnabled) {
+                            wmLog(`🎯 <b>${esc(title)}</b> [${rar}] trouvé — pas de mise (mise minimale ${bidAmount.toLocaleString('fr-FR')} 💰 refusée par les limites)`);
+                        }
                         continue;
                     }
                     bidLockSet.add(a.id);
@@ -3784,7 +3998,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (bidLockSet.has(a.id)) continue;
                 const bidAmount = minNextBid(a);
                 // Respecte le plafond par enchère (coupe l'auto-bid si dépassé)
-                if (!autoBidWithinCap(a, bidAmount)) continue;
+                if (!autoBidAllowed(a, bidAmount, 'Riposte auto-bid')) continue;
                 bidLockSet.add(a.id);
                 await new Promise(r => setTimeout(r, bidDelayMs(a)));
                 // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
@@ -4510,7 +4724,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     && !iAmLeading(a)
                     && wikibidousBalance > 0) {
                     const bidAmount = minNextBid(a);
-                    if (autoBidWithinCap(a, bidAmount)) {
+                    if (autoBidAllowed(a, bidAmount, 'Snipe fourbe')) {
                         bidLockSet.add(a.id);
                         const titleSn = a.card?.wikipedia_title || '?';
                         const rarSn = (a.card?.rarity || '').toUpperCase();
@@ -4586,7 +4800,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (autoBidSet.has(a.id) && wikibidousBalance > 0 && !bidLockSet.has(a.id)
                     && !skipIfAuctionOver(a, 'Hot-lane bid')) {
                     const bidAmount = bidIncrement(bidOb);
-                    if (autoBidWithinCap(a, bidAmount)) { // ne riposte que sous le plafond
+                    if (autoBidAllowed(a, bidAmount, 'Hot-lane')) { // plafond + limite horaire + interrupteur
                         bidLockSet.add(a.id);
                         try {
                             // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane)
@@ -8189,6 +8403,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             <option value="rarity_desc">⭐ Rareté (L→C)</option>
                             <option value="rarity_asc">⭐ Rareté (C→L)</option>
                             <option value="title_asc">🔤 Titre A→Z</option>
+                            <option value="keyword_asc">🔍 Mot-clé (groupé)</option>
                             <option value="owned_asc">📚 Possédées ↑ (manquantes d'abord)</option>
                             <option value="owned_desc">📚 Possédées ↓ (doublons d'abord)</option>
                         </select>
@@ -12088,13 +12303,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
             // 2) Mots-clés (merge avec les défauts existants)
             try {
-                const existing = JSON.parse(localStorage.getItem(KEYWORDS_STORAGE_KEY) || '[]');
-                const merged = [...existing];
-                pendingKeywords.forEach(kw => {
-                    if (!merged.some(k => k.toLowerCase() === kw.toLowerCase())) merged.push(kw);
-                });
-                localStorage.setItem(KEYWORDS_STORAGE_KEY, JSON.stringify(merged));
-                KEYWORDS_ALERT = merged;
+                // Les mots-clés importés entrent en mode MANUEL : un import de wishlist
+                // ne doit jamais se mettre à dépenser tout seul.
+                pendingKeywords.forEach(kw => watchlistAdd(kw, { mode: 'manuel' }, true));
             } catch(e) {}
 
             // 3) Tag : selon le choix (existant sélectionné, créé, ou passé)
@@ -12133,7 +12344,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
               text: "Ouvre tes packs en boucle, tout seul. Il repère les cartes qui matchent tes mots-clés (alerte + son), tient les stats (raretés, drops, sessions) et respecte le cooldown de ton compte. Le bouton <b>▶ START</b> le lance." },
             { el: () => document.getElementById('wm-market-btn') && document.getElementById('wm-market-btn').closest('.wm-panel'),
               title: '🛒 Market Watcher',
-              text: "Surveille le marché en continu. Tu définis des mots-clés : <b>Standards</b> (alerte), <b>⭐ Prioritaires</b> (auto-bid), <b>🕵️ Fourbe</b> (snipe pile en fin d'enchère), <b>🚫 Exclus</b>. Il peut miser et riposter tout seul, avec un plafond par carte. Le <b>⚡ Hunter</b> mise sur tout ce qui passe sous ton seuil ; la case <b>🕵️ mode fourbe</b> juste en dessous change sa façon de miser : plus de mise immédiate, snipe en fin d'enchère plafonné à ce même seuil. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce, densité max) et <b>🖼 Cadres</b> (grille avec l'image de la carte et un bouton Miser sous chacune). Le bouton <b>🔭</b> sur chaque annonce (Détaillé/Cadres) compare les vues Wikipédia réelles du mois dernier au cache de WikiMasters — utile pour repérer une carte dont la rareté est sur le point de changer avant que le site ne s'en aperçoive." },
+              text: "Surveille le marché en continu. Tu ajoutes des <b>mots-clés</b> dans une seule liste, et chacun porte son mode : <b>👁️ MANUEL</b> (l'annonce s'affiche, tu cliques Miser toi-même) ou <b>🤖 AUTO</b> (le bot mise seul, sans jamais dépasser le <b>plafond</b> du mot-clé). Un clic sur le badge du mode le bascule. Deux limites bornent la dépense, en haut du panneau : un <b>prix maximum par mise</b> et un <b>nombre maximum de mises par heure</b>. Le bouton <b>🤖 Mises auto</b> est l'interrupteur maître : en pause, rien ne mise, tout reste affiché. La liste <b>🚫 Jamais</b> masque toute annonce contenant la phrase. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce) et <b>🖼 Cadres</b> (grille avec l'image et un bouton Miser sous chacune). Le <b>tri</b> permet notamment de regrouper par <b>mot-clé</b> ou de classer par <b>rareté</b>. Le bouton <b>🔭</b> sur chaque annonce compare les vues Wikipédia réelles au cache du site — utile pour repérer une carte dont la rareté va changer." },
             { el: () => document.getElementById('wm-trash-btn') && document.getElementById('wm-trash-btn').closest('.wm-panel'),
               title: '🏷️ Trash Seller',
               text: "Met en vente automatiquement toutes les cartes que tu as taguées (« Trash » par défaut). Tu choisis le prix (par rareté ou au prix moyen du marché) et quelles cartes prioriser. Le bouton <b>🔄 Refresh ventes</b> renouvelle les annonces." },

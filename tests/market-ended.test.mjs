@@ -65,7 +65,11 @@ const bidsAttempted = [];
 await page.goto(origin);
 await page.evaluate(() => {
   localStorage.setItem('wm_onboarding_done', '1');
-  localStorage.setItem('wm_keywords_priority', JSON.stringify(['test'])); // mise forcée
+  // Liste unifiée : un mot-clé en mode AUTO, plafond large, + interrupteur maître armé.
+  localStorage.setItem('wm_watchlist', JSON.stringify([{ kw: 'test', mode: 'auto', cap: 5000 }]));
+  localStorage.setItem('wm_autobid_armed', '1');
+  localStorage.setItem('wm_global_bid_cap', '5000');
+  localStorage.setItem('wm_max_bids_per_hour', '0'); // pas de limite pendant le test
   localStorage.setItem('wm_autosnipe_min_balance', '0'); // pas de plancher de solde
   localStorage.setItem('wm_humanized_bid_delay_ms', '0'); // pas d'attente avant la mise
 });

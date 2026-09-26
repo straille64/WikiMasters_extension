@@ -73,7 +73,8 @@ const pagesServed = new Set();
 await page.goto(origin);
 await page.evaluate(() => {
   localStorage.setItem('wm_onboarding_done', '1');
-  localStorage.setItem('wm_keywords_alert', JSON.stringify(['porno'])); // mot-clé simple
+  // Mode MANUEL : ce test ne vérifie que la pagination et l'affichage, pas les mises.
+  localStorage.setItem('wm_watchlist', JSON.stringify([{ kw: 'porno', mode: 'manuel' }]));
   localStorage.setItem('wm_autosnipe_min_balance', '0');
 });
 
