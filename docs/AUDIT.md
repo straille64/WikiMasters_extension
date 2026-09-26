@@ -216,6 +216,51 @@ les résultats ».
 **✅ Corrigé (1.3.13-fork.7)** — plafond porté à 300 pages (15 000 annonces), et le
 scan **dit** désormais qu'il a été tronqué au lieu de l'avaler en silence.
 
+### 19. Le scan marché provoquait des 403 sur l'ouverture de paquets
+Signalé en production le 26/09 : « l'ouverture de paquet ne fonctionne plus », avec
+`⛔ 403 — pause` en boucle. Cause : `MARKET_REFRESH_MS = 10000` et
+`MARKET_MIN_GAP_MS = 1500` étaient calibrés pour un scan d'**une seule page** — le
+site ne voyait alors que ~6 requêtes/min. Depuis que la pagination fonctionne (#16),
+un marché à 5 500 annonces fait **136 pages par scan** ; le scan dure plus longtemps
+que l'intervalle visé, donc il repartait 1,5 s après avoir fini : le marché était
+interrogé **en continu**, des centaines de requêtes par minute. Le site répondait 403,
+y compris sur `/api/packs/open`, sans rapport avec le Pack Opener lui-même.
+
+**✅ Corrigé (1.3.13-fork.8)** — l'espacement entre deux scans est désormais
+**proportionnel au coût du scan** (`lastScanPageCount × MARKET_MS_PER_PAGE`), et non
+plus une constante. Concurrence ramenée de 5 à 3 pages en parallèle, pause entre lots
+de 100 ms à 350 ms. Surtout, un **régime auto-adaptatif** : `marketThrottleFactor`
+double dès qu'une page est refusée (403/429) et redescend après un scan propre — le
+bot trouve lui-même le débit que le site tolère plutôt que de dépendre d'une constante
+devinée. La réactivité ne souffre pas : les enchères suivies restent rafraîchies à la
+seconde par la hot lane, qui ne requête que celles-là.
+
+### 20. Mots-clés : la moitié des résultats manquait
+Signalé en production le 26/09 : « ça n'affiche pas tous les résultats où notre mot
+est ». `keywordFields(card, false)` ne regardait que `wikipedia_title` et `category`,
+alors que la recherche du site porte aussi sur le résumé (`summary`, visible dans les
+champs de carte relevés au log). Une carte comme « Hidjab » — dont la description dit
+« voile porté par certaines **femmes** musulmanes » — était donc invisible pour le
+mot-clé `femme`, tout en étant bien listée sur le marché.
+
+**✅ Corrigé (1.3.13-fork.8)** — chaque entrée de la liste porte un champ `extended` :
+recherche étendue (titre + catégorie + description) ou stricte. Défaut **activé en
+mode manuel** (on veut tout voir, l'affichage ne coûte rien) et **désactivé en mode
+auto** (ne pas miser sur une carte qui ne fait que *mentionner* le mot). Réglable
+entrée par entrée via le badge 🔎. Les entrées existantes prennent ce défaut au
+chargement, sans intervention.
+
+Au passage, le matching passe par un **matcher partagé unique** (`watchEntryMatches`) :
+la classification du scan, la chasse (`matchedHunterEntry`) et l'affichage du mot-clé
+trouvé (`matchedKeyword`) s'appuyaient sur trois implémentations distinctes, si bien
+qu'un réglage comme `extended` se serait appliqué à moitié — une annonce affichée mais
+jamais prise en charge par la mise. L'**exclusion** reste volontairement stricte sur
+titre + catégorie : une exclusion qui pioche dans les descriptions masquerait des
+annonces sans qu'on comprenne pourquoi.
+
+`tests/keyword-extended.test.mjs` vérifie les deux sens : étendu → les 3 cartes
+(titre, catégorie, description), strict → seulement les 2 premières.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

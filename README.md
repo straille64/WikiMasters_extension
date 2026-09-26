@@ -45,6 +45,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
   `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
   sur le code réellement livré, pas sur une copie.
+- `tests/keyword-extended.test.mjs` : vérifie qu'un mot présent uniquement dans la
+  description est bien trouvé en recherche étendue, et ignoré en recherche stricte.
 - `tests/watchlist-modes.test.mjs` : vérifie dans un navigateur qu'un mot-clé en mode
   manuel ne déclenche jamais de mise, qu'un mot-clé en auto en déclenche une, et que
   l'interrupteur maître, le plafond de prix et la limite horaire coupent bien.
@@ -91,6 +93,9 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Market Watcher : scanner toutes les pages, pas seulement la première (audit #16)
 - [x] Market Watcher : une seule liste de mots-clés, mode 🤖 auto / 👁️ manuel par
       mot-clé, plafond de prix et limite de mises par heure (audit #17, #18)
+- [x] Cadence de scan auto-adaptative — le scan complet ne provoque plus de 403 sur
+      l'ouverture de paquets (audit #19)
+- [x] Recherche étendue aux descriptions, réglable par mot-clé (audit #20)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
       d'injection couverts, verrouillé par un test (audit #4)
 - [ ] Découpage du monolithe en modules

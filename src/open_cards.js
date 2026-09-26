@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.7';
+    const WM_VERSION = '1.3.13-fork.8';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -44,7 +44,14 @@
     const MARKET_REFRESH_MS = 10000;
     const MARKET_API_BASE = "https://www.wiki-masters.com/api/marketplace";
     const MARKET_PAGE_LIMIT = 50;
-    const MARKET_PAGE_CONCURRENCY = 5; // pages chargées en parallèle par lot
+    /* Débit du scan. Ces valeurs étaient calibrées pour un scan d'UNE page : le site
+       ne voyait que ~6 requêtes/min. Depuis que la pagination fonctionne (136 pages sur
+       un marché à 5 500 annonces), le même réglage produit des centaines de requêtes par
+       minute — et le site répond 403, y compris sur l'ouverture de paquets. On étale
+       donc le scan, et surtout on espace les scans PROPORTIONNELLEMENT à leur coût. */
+    const MARKET_PAGE_CONCURRENCY = 3;  // pages en parallèle par lot
+    const MARKET_BATCH_PAUSE_MS = 350;  // souffle entre deux lots
+    const MARKET_MS_PER_PAGE = 700;     // budget de temps par page scannée, entre 2 scans
     /* Plafond dur de pagination (300 × 50 = 15 000 annonces). La boucle s'arrête
        normalement d'elle-même sur une page incomplète ; ce plafond n'est qu'un filet
        si l'API répond n'importe quoi. Il était à 60 (3 000 annonces) : comme le scan
@@ -1251,9 +1258,20 @@
         const kw = String((e && (e.kw != null ? e.kw : e.text)) || '').trim();
         if (!kw) return null;
         const cap = Number(e && e.cap);
+        const mode = (e && e.mode === 'auto') ? 'auto' : 'manuel';
+        /* `extended` : chercher aussi dans la description/résumé de la carte, et plus
+           seulement dans le titre et la catégorie. Le site, lui, cherche dans tout —
+           d'où des cartes visibles sur le marché que le bot ne remontait pas.
+           Défaut : ACTIVÉ en mode manuel (on veut tout voir, ça ne coûte rien),
+           DÉSACTIVÉ en mode auto (ne pas miser sur une carte qui ne fait que
+           MENTIONNER le mot). Réglable entrée par entrée. */
+        const extended = (e && e.extended !== undefined && e.extended !== null)
+            ? !!e.extended
+            : mode === 'manuel';
         return {
             kw,
-            mode: (e && e.mode === 'auto') ? 'auto' : 'manuel',
+            mode,
+            extended,
             cap: Number.isFinite(cap) && cap > 0 ? cap : null, // null → plafond global
             rarity: normalizeHunterRarity(e && e.rarity),
             snipe: !!(e && e.snipe),
@@ -1327,11 +1345,19 @@
         }));
     }
 
+    /* Matcher partagé : SEUL endroit qui décide si une entrée correspond à une carte.
+       Tout le reste (classification du scan, chasse, affichage du mot-clé trouvé) passe
+       par ici, pour qu'un réglage comme `extended` ne s'applique pas à moitié. */
+    function watchEntryMatches(entry, card) {
+        if (!entry) return false;
+        const kwLC = entry.kw.toLowerCase();
+        return keywordFields(card, !!entry.extended)
+            .some(f => (f || '').toLowerCase().includes(kwLC));
+    }
+
     // Entrée de la liste qui a fait matcher une carte (pour l'affichage « pourquoi »).
     function matchedWatchEntry(card) {
-        const fields = [card && card.wikipedia_title || '', card && card.category || ''];
-        return WATCHLIST.find(e => e.enabled !== false
-            && fields.some(f => f.toLowerCase().includes(e.kw.toLowerCase()))) || null;
+        return WATCHLIST.find(e => e.enabled !== false && watchEntryMatches(e, card)) || null;
     }
     function savePriorityKeywords() {
         try { localStorage.setItem(KEYWORDS_PRIORITY_KEY, JSON.stringify(KEYWORDS_PRIORITY)); } catch(e) {}
@@ -1391,14 +1417,13 @@
     // Une entrée désactivée (`enabled === false`) est traitée comme absente : elle ne
     // déclenche rien ici, ET elle n'empêche plus le Hunter générique de reprendre la carte
     // (contrairement à une entrée active, qui le bloque volontairement plus loin).
+    /* Passe par le matcher partagé : sans ça, un mot-clé en mode auto ET en recherche
+       étendue serait affiché par le scan mais jamais pris en charge par la chasse. */
     function matchedHunterEntry(input) {
-        const fields = typeof input === "string"
-            ? [input]
-            : [input?.wikipedia_title || "", input?.category || ""];
-        return KEYWORDS_HUNTER.find(h =>
-            h.enabled !== false &&
-            fields.some(f => f.toLowerCase().includes((h.text || '').toLowerCase()))
-        ) || null;
+        const card = typeof input === "string" ? { wikipedia_title: input } : input;
+        const e = WATCHLIST.find(x => x.enabled !== false && x.mode === 'auto' && watchEntryMatches(x, card));
+        if (!e) return null;
+        return KEYWORDS_HUNTER.find(h => (h.text || '').toLowerCase() === e.kw.toLowerCase()) || null;
     }
     function hasHunterKeyword(input) { return !!matchedHunterEntry(input); }
 
@@ -1439,6 +1464,10 @@
                     color:${on ? '#ddd' : '#666'};font-size:11px;" title="${esc(e.kw)}">${esc(e.kw)}</span>
                 ${isAuto ? `<span style="color:#888;font-size:9px;white-space:nowrap;"
                     title="Plafond : le bot ne montera jamais au-dessus.">≤${capTxt} 💰${rarTxt}${e.snipe ? ' · 🕵️' : ''}</span>` : ''}
+                <button onclick="window.wmWatchToggleExtended(${i})"
+                    title="${e.extended ? 'Recherche ÉTENDUE : cherche aussi dans la description de la carte. Clique pour revenir au titre + catégorie seuls.' : 'Recherche stricte : titre + catégorie seulement. Clique pour chercher aussi dans la description (plus de résultats).'}"
+                    style="flex-shrink:0;background:none;border:none;cursor:pointer;font-size:10px;padding:0 2px;
+                    opacity:${e.extended ? '1' : '0.3'};">🔎</button>
                 <button onclick="window.wmWatchToggleEnabled(${i})" title="${on ? 'Mettre en pause' : 'Réactiver'}"
                     style="background:none;border:none;color:${on ? '#4ade80' : '#888'};cursor:pointer;font-size:11px;padding:0 2px;">${on ? '⏸️' : '▶️'}</button>
                 <button onclick="window.wmWatchRemove(${i})" title="Supprimer"
@@ -1479,7 +1508,7 @@
 
             <div style="font-size:9px;color:#06b6d4;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px;">
                 🔍 Mots-clés surveillés
-                <span style="color:#666;text-transform:none;letter-spacing:0;">— 🤖 AUTO : le bot mise · 👁️ MANUEL : affiché seulement</span>
+                <span style="color:#666;text-transform:none;letter-spacing:0;">— 🤖 AUTO : le bot mise · 👁️ MANUEL : affiché seulement · 🔎 : cherche aussi dans la description</span>
             </div>
             <div style="margin-bottom:7px;">${rows || '<span style="color:#444;font-size:10px;">Aucun mot-clé. Ajoute-en un ci-dessous.</span>'}</div>
 
@@ -1513,6 +1542,11 @@
                     title="Ne mise pas tout de suite : attend la toute fin de l'enchère pour tirer une seule fois.">
                     <input type="checkbox" id="wm-wl-snipe" style="width:11px;height:11px;accent-color:#c084fc;cursor:pointer;margin:0;">
                     <span>🕵️ snipe en fin</span>
+                </label>
+                <label style="display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap;"
+                    title="Cherche aussi dans la DESCRIPTION de la carte, et plus seulement dans son titre et sa catégorie — c'est ce que fait la recherche du site. Coché par défaut en mode manuel (on veut tout voir), décoché en mode auto (ne pas miser sur une carte qui ne fait que mentionner le mot).">
+                    <input type="checkbox" id="wm-wl-extended" checked style="width:11px;height:11px;accent-color:#06b6d4;cursor:pointer;margin:0;">
+                    <span>🔎 étendu (description)</span>
                 </label>
                 <label style="display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap;"
                     title="Repasse ce mot-clé en pause dès qu'il a remporté une enchère — pour n'en vouloir qu'un exemplaire.">
@@ -1562,13 +1596,14 @@
         const rarity = (document.getElementById('wm-wl-rarity') || {}).value || '';
         const snipe = !!(document.getElementById('wm-wl-snipe') || {}).checked;
         const autoDisable = !!(document.getElementById('wm-wl-autodisable') || {}).checked;
+        const extended = !!(document.getElementById('wm-wl-extended') || {}).checked;
         // Séparateur POINT-VIRGULE, comme partout ailleurs : préserve les titres à virgule.
         const parts = String(raw || '').split(';').map(x => x.trim()).filter(Boolean);
         if (!parts.length) return;
         let added = 0;
         for (const kw of parts) {
             if (WATCHLIST.some(e => e.kw.toLowerCase() === kw.toLowerCase())) continue;
-            const entry = normalizeWatchEntry({ kw, mode, cap: capRaw, rarity, snipe, autoDisable });
+            const entry = normalizeWatchEntry({ kw, mode, cap: capRaw, rarity, snipe, autoDisable, extended });
             if (entry) { WATCHLIST.push(entry); added++; }
         }
         if (!added) return;
@@ -1589,6 +1624,15 @@
         saveWatchlist();
         renderKeywordsPanel();
         wmLog(`🔍 <b>${esc(e.kw)}</b> passe en <b>${e.mode === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}</b>.`);
+    };
+
+    window.wmWatchToggleExtended = function (i) {
+        const e = WATCHLIST[i];
+        if (!e) return;
+        e.extended = !e.extended;
+        saveWatchlist();
+        renderKeywordsPanel();
+        wmLog(`🔎 <b>${esc(e.kw)}</b> : recherche <b>${e.extended ? 'étendue (titre + catégorie + description)' : 'stricte (titre + catégorie)'}</b>. Effet au prochain scan.`);
     };
 
     window.wmWatchToggleEnabled = function (i) {
@@ -1632,19 +1676,18 @@
 
     // Accepte une string ou un objet card. includeDesc=true → cherche aussi dans la description.
     function hasKeyword(input, includeDesc) {
-        const fields = keywordFields(input, includeDesc);
-        return KEYWORDS_ALERT.some(k =>
-            fields.some(f => f.toLowerCase().includes(k.toLowerCase()))
-        );
+        return matchedKeyword(input, includeDesc) !== null;
     }
 
     function matchedKeyword(input, includeDesc) {
-        const fields = keywordFields(input, includeDesc);
-        // Cherche dans toutes les catégories d'action pour afficher le mot-clé qui a matché.
-        for (const list of [KEYWORDS_ALERT, KEYWORDS_PRIORITY, KEYWORDS_FOURBE]) {
-            for (const k of list) {
-                if (fields.some(f => f.toLowerCase().includes(k.toLowerCase()))) return k;
-            }
+        const card = typeof input === "string" ? { wikipedia_title: input } : input;
+        // includeDesc forcé par l'appelant → on teste large ; sinon chaque entrée
+        // décide avec son propre réglage `extended`.
+        for (const e of WATCHLIST) {
+            if (e.enabled === false) continue;
+            if (includeDesc
+                ? keywordFields(card, true).some(f => (f || '').toLowerCase().includes(e.kw.toLowerCase()))
+                : watchEntryMatches(e, card)) return e.kw;
         }
         return null;
     }
@@ -2627,12 +2670,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     /* ===================== MARKET API ===================== */
 
     // Fetch une page de la marketplace
+    /* Régime de scan auto-adaptatif. Multiplié par 2 dès que le site refuse une page
+       (403 / 429), divisé par 2 après un scan entièrement propre : le bot trouve tout
+       seul le débit que le site tolère, au lieu de dépendre d'une constante devinée. */
+    let marketThrottleFactor = 1;
+    const MARKET_THROTTLE_MAX = 8;
+    let marketScanRefusals = 0;
+
     async function fetchMarketPage(page) {
         const url = `${MARKET_API_BASE}?page=${page}&limit=${MARKET_PAGE_LIMIT}&sort=ending_soon`;
         const t0 = Date.now();
         const res = await fetch(url, { credentials: "include" });
         syncServerClockFromResponse(res, t0);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+            if (res.status === 403 || res.status === 429) marketScanRefusals++;
+            throw new Error(`HTTP ${res.status}`);
+        }
         return res.json();
     }
 
@@ -2722,11 +2775,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (more && lastPage + MARKET_PAGE_CONCURRENCY > MARKET_MAX_PAGES) {
                 wmLog(`⚠️ Scan tronqué au plafond de <b>${MARKET_MAX_PAGES} pages</b> (${auctions.length} annonces) — il reste des annonces non scannées.`);
             }
-            await new Promise(r => setTimeout(r, 100)); // petite pause entre les lots
+            await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS)); // souffle entre les lots
         }
 
         // Le total affiché doit refléter ce qu'on a réellement vu : quand l'API annonce
         // 0 (le bug d'origine), le panneau affichait « 0 annonces » en plein scan.
+        lastScanPageCount = lastPage;
         return { auctions, total: Math.max(reportedTotal || 0, auctions.length), totalPages: expectedPages || lastPage };
     }
 
@@ -3608,26 +3662,49 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                une fois par mot-clé testé contre elle). Comportement de matching identique
                (sous-chaîne, insensible à la casse, titre + catégorie) — seul le nombre de
                recalculs change. */
-            const alertLC    = KEYWORDS_ALERT.map(k => (k || '').toLowerCase());
-            const priorityLC = KEYWORDS_PRIORITY.map(k => (k || '').toLowerCase());
-            const fourbeLC   = KEYWORDS_FOURBE.map(k => (k || '').toLowerCase());
-            const excludeLC  = KEYWORDS_EXCLUDE.map(k => (k || '').toLowerCase());
-            const hunterLC   = KEYWORDS_HUNTER.map(h => ({ h, textLC: (h.text || '').toLowerCase() }));
+            const excludeLC = KEYWORDS_EXCLUDE.map(k => (k || '').toLowerCase());
+            // Une entrée de la liste, son mot-clé déjà en minuscules et son plafond
+            // compilé — préparés une fois pour tout le scan.
+            const watchLC = WATCHLIST
+                .filter(e => e.enabled !== false)
+                .map(e => ({
+                    e,
+                    kwLC: e.kw.toLowerCase(),
+                    hunter: e.mode === 'auto'
+                        ? (KEYWORDS_HUNTER.find(h => (h.text || '').toLowerCase() === e.kw.toLowerCase()) || null)
+                        : null,
+                }));
+            // Le texte long (description/résumé) n'est construit que si au moins un
+            // mot-clé est en recherche étendue : sur ~6 000 annonces, ça compte.
+            const anyExtended = watchLC.some(w => w.e.extended);
+
             function classifyAuctionKeywords(card) {
                 const titleLC = (card?.wikipedia_title || '').toLowerCase();
                 const categoryLC = (card?.category || '').toLowerCase();
-                const matchAny = (lc) => lc.some(k => titleLC.includes(k) || categoryLC.includes(k));
-                let hunterEntry = null;
-                for (const { h, textLC } of hunterLC) {
-                    if (titleLC.includes(textLC) || categoryLC.includes(textLC)) { hunterEntry = h; break; }
+                // Construit une fois par annonce, pas une fois par mot-clé testé.
+                const fullLC = anyExtended
+                    ? keywordFields(card, true).join(' \u0000 ').toLowerCase()
+                    : null;
+
+                let hunterEntry = null, alert = false, matchedEntry = null;
+                for (const { e, kwLC, hunter } of watchLC) {
+                    const hit = (e.extended && fullLC !== null)
+                        ? fullLC.includes(kwLC)
+                        : (titleLC.includes(kwLC) || categoryLC.includes(kwLC));
+                    if (!hit) continue;
+                    alert = true;
+                    if (!matchedEntry) matchedEntry = e;
+                    // Premier mot-clé en mode auto rencontré → c'est lui qui pilotera la mise.
+                    if (!hunterEntry && hunter) hunterEntry = hunter;
                 }
-                const alert = matchAny(alertLC);
-                const priority = matchAny(priorityLC);
-                const fourbe = matchAny(fourbeLC);
                 return {
-                    excluded: excludeLC.length > 0 && matchAny(excludeLC),
-                    alert, priority, fourbe, hunterEntry,
-                    keywordMatch: alert || priority || fourbe || !!hunterEntry
+                    // L'exclusion reste STRICTE sur titre + catégorie : elle doit rester
+                    // prévisible, une exclusion qui pioche dans les descriptions masquerait
+                    // des annonces sans qu'on comprenne pourquoi.
+                    excluded: excludeLC.length > 0
+                        && excludeLC.some(k => titleLC.includes(k) || categoryLC.includes(k)),
+                    alert, priority: false, fourbe: false, hunterEntry, matchedEntry,
+                    keywordMatch: alert,
                 };
             }
             // Réutilisée juste en dessous pour newHits (sinon on re-classerait les mêmes
@@ -4902,6 +4979,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     let marketWatcherTimeout = null;
     let marketScanInProgress = false;
+    let lastScanPageCount = 1; // pages du dernier scan → espacement du suivant
 
     async function runMarketScanLoop(marketAlertEl, marketStatusEl) {
         if (!marketWatcherActive || marketScanInProgress) return;
@@ -4915,10 +4993,27 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             marketScanInProgress = false;
         }
         if (!marketWatcherActive) return;
-        // Vise MARKET_REFRESH_MS entre deux DÉBUTS de scan ; si le scan a déjà
-        // pris plus longtemps, on enchaîne après un minimum de souffle.
+
+        /* Espacement PROPORTIONNEL au coût du scan. Avec l'ancien calcul (viser 10 s
+           entre deux débuts), un scan de 136 pages repartait 1,5 s après avoir fini :
+           le marché était interrogé en continu. Les enchères suivies restent, elles,
+           rafraîchies à la seconde par la hot lane — la réactivité ne dépend pas de
+           la fréquence du scan complet. */
+        if (marketScanRefusals > 0) {
+            const before = marketThrottleFactor;
+            marketThrottleFactor = Math.min(MARKET_THROTTLE_MAX, marketThrottleFactor * 2);
+            if (marketThrottleFactor !== before) {
+                wmLog(`🐢 Le site a refusé ${marketScanRefusals} page(s) du scan — scan ralenti (×${marketThrottleFactor}). Ça protège aussi l'ouverture de paquets.`);
+            }
+        } else if (marketThrottleFactor > 1) {
+            marketThrottleFactor = Math.max(1, marketThrottleFactor / 2);
+            wmLog(`🐇 Scan propre — cadence remontée (×${marketThrottleFactor}).`);
+        }
+        marketScanRefusals = 0;
+
         const elapsed = Date.now() - startedAt;
-        const wait = Math.max(MARKET_MIN_GAP_MS, MARKET_REFRESH_MS - elapsed);
+        const budget = Math.max(MARKET_REFRESH_MS, lastScanPageCount * MARKET_MS_PER_PAGE) * marketThrottleFactor;
+        const wait = Math.max(MARKET_MIN_GAP_MS, budget - elapsed);
         marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl), wait);
     }
 
@@ -12323,7 +12418,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
               text: "Ouvre tes packs en boucle, tout seul. Il repère les cartes qui matchent tes mots-clés (alerte + son), tient les stats (raretés, drops, sessions) et respecte le cooldown de ton compte. Le bouton <b>▶ START</b> le lance." },
             { el: () => document.getElementById('wm-market-btn') && document.getElementById('wm-market-btn').closest('.wm-panel'),
               title: '🛒 Market Watcher',
-              text: "Surveille le marché en continu. Tu ajoutes des <b>mots-clés</b> dans une seule liste, et chacun porte son mode : <b>👁️ MANUEL</b> (l'annonce s'affiche, tu cliques Miser toi-même) ou <b>🤖 AUTO</b> (le bot mise seul, sans jamais dépasser le <b>plafond</b> du mot-clé). Un clic sur le badge du mode le bascule. Deux limites bornent la dépense, en haut du panneau : un <b>prix maximum par mise</b> et un <b>nombre maximum de mises par heure</b>. Le bouton <b>🤖 Mises auto</b> est l'interrupteur maître : en pause, rien ne mise, tout reste affiché. La liste <b>🚫 Jamais</b> masque toute annonce contenant la phrase. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce) et <b>🖼 Cadres</b> (grille avec l'image et un bouton Miser sous chacune). Le <b>tri</b> permet notamment de regrouper par <b>mot-clé</b> ou de classer par <b>rareté</b>. Le bouton <b>🔭</b> sur chaque annonce compare les vues Wikipédia réelles au cache du site — utile pour repérer une carte dont la rareté va changer." },
+              text: "Surveille le marché en continu. Tu ajoutes des <b>mots-clés</b> dans une seule liste, et chacun porte son mode : <b>👁️ MANUEL</b> (l'annonce s'affiche, tu cliques Miser toi-même) ou <b>🤖 AUTO</b> (le bot mise seul, sans jamais dépasser le <b>plafond</b> du mot-clé). Un clic sur le badge du mode le bascule. Deux limites bornent la dépense, en haut du panneau : un <b>prix maximum par mise</b> et un <b>nombre maximum de mises par heure</b>. Le bouton <b>🤖 Mises auto</b> est l'interrupteur maître : en pause, rien ne mise, tout reste affiché. Le badge <b>🔎</b> de chaque mot-clé bascule entre recherche <b>étendue</b> (cherche aussi dans la description de la carte, comme la recherche du site) et <b>stricte</b> (titre + catégorie seuls). La liste <b>🚫 Jamais</b> masque toute annonce contenant la phrase. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce) et <b>🖼 Cadres</b> (grille avec l'image et un bouton Miser sous chacune). Le <b>tri</b> permet notamment de regrouper par <b>mot-clé</b> ou de classer par <b>rareté</b>. Le bouton <b>🔭</b> sur chaque annonce compare les vues Wikipédia réelles au cache du site — utile pour repérer une carte dont la rareté va changer." },
             { el: () => document.getElementById('wm-trash-btn') && document.getElementById('wm-trash-btn').closest('.wm-panel'),
               title: '🏷️ Trash Seller',
               text: "Met en vente automatiquement toutes les cartes que tu as taguées (« Trash » par défaut). Tu choisis le prix (par rareté ou au prix moyen du marché) et quelles cartes prioriser. Le bouton <b>🔄 Refresh ventes</b> renouvelle les annonces." },
