@@ -147,4 +147,45 @@ t('backoff exponentiel plafonné', () => {
   for (let f = 7; f < 20; f++) assert(at(f) <= 5 * 60 * 1000 + 1000, 'plafond à f=' + f);
 });
 
-console.log(`✅ ${n} groupes de tests OK`);
+// ── isAuctionOver : filtre des enchères terminées (Market Watcher) ──
+// Extrait à part : la fonction dépend de serverNow(), qu'on injecte pour piloter
+// l'heure "serveur" et reproduire un PC désynchronisé.
+{
+  const mk = new Function(
+    'serverNow',
+    grab('function isAuctionOver(a, marginMs = 0)') + '\nreturn isAuctionOver;'
+  );
+  const iso = (deltaMs) => new Date(Date.now() + deltaMs).toISOString();
+
+  // Horloge PC juste : serverNow === Date.now()
+  const over = mk(() => Date.now());
+  t('enchère terminée détectée', () => {
+    assert.strictEqual(over({ end_at: iso(-1000) }), true);
+    assert.strictEqual(over({ end_at: iso(-1) }), true);
+  });
+  t('enchère vivante préservée, même à 2s de la fin', () => {
+    assert.strictEqual(over({ end_at: iso(2000) }), false);
+    assert.strictEqual(over({ end_at: iso(3600_000) }), false);
+  });
+  t('marge : exclut aussi ce qui finit dans moins de marginMs', () => {
+    assert.strictEqual(over({ end_at: iso(5000) }, 10000), true);
+    assert.strictEqual(over({ end_at: iso(15000) }, 10000), false);
+  });
+  t('end_at absent ou illisible → on ne présume rien', () => {
+    assert.strictEqual(over({}), false);
+    assert.strictEqual(over({ end_at: null }), false);
+    assert.strictEqual(over({ end_at: 'pouet' }), false);
+    assert.strictEqual(over(null), false);
+  });
+
+  // PC en retard de 30 s : l'enchère est finie côté serveur, pas côté PC.
+  // C'est le cas qui faisait miser dans le vide avant la correction.
+  t('horloge PC décalée : c\'est l\'heure serveur qui tranche', () => {
+    const skewed = mk(() => Date.now() + 30000); // serveur en avance de 30s
+    const endsIn10s = { end_at: iso(10000) };
+    assert.strictEqual(skewed(endsIn10s), true, 'terminée côté serveur');
+    assert.strictEqual(over(endsIn10s), false, 'encore vivante selon l\'horloge du PC');
+  });
+}
+
+console.log(`✅ ${n} groupes de tests OK (total)`);

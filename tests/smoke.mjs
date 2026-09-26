@@ -15,7 +15,7 @@ import http from 'http';
 import { fileURLToPath } from 'url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const BUILD = path.join(ROOT, 'dist/wikimasters-bot.user.js');
+
 
 let chromium;
 try {
@@ -37,6 +37,9 @@ function findChrome() {
   return undefined;
 }
 
+// Argument optionnel : un autre build à tester (utile pour comparer avec une
+// version antérieure).
+const BUILD = process.argv[2] || path.join(ROOT, 'dist/wikimasters-bot.user.js');
 const script = fs.readFileSync(BUILD, 'utf8');
 
 // Page servie en http : `about:blank` a une origine opaque où localStorage lève

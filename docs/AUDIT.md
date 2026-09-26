@@ -99,6 +99,34 @@ quand même un tableau `cards` serait comptée comme un pack réussi.
 non vide (avec log explicite « pack non comptabilisé ») et retourne un booléen dont
 la loop se sert pour choisir entre cooldown et backoff.
 
+### 15. Market Watcher : mises sur des enchères déjà terminées
+Signalé en production le 26/09. Aucun chemin de mise ne vérifiait `end_at` avant de
+poster. Or l'API marketplace continue de lister une enchère tant que le serveur ne l'a
+pas **soldée**, et le scan demande `sort=ending_soon` : les enchères finies, ayant le
+`end_at` le plus ancien, remontaient donc **en tête** du scan. Résultat : c'étaient
+elles que le watcher « trouvait » en premier, et chaque mise repartait avec
+« Cette enchère est terminée » — match, son, notification Discord, chasseur, mot-clé
+prioritaire, armement du mode fourbe et riposte auto-bid, tous sur des enchères mortes.
+
+À noter : le repli Supabase filtrait déjà (`status=eq.active&end_at=gt.${nowIso}`),
+seul le chemin REST principal ne le faisait pas.
+
+**✅ Corrigé (1.3.13-fork.4)** — `isAuctionOver()` tranche contre l'heure **serveur**
+(`serverNow()`, pas l'horloge du PC : un PC décalé raterait la fin de plusieurs
+secondes). Les enchères terminées sont écartées en un point unique, juste avant le
+calcul des `hits`, ce qui couvre d'un coup l'affichage et tous les chemins d'action ;
+leur dernier état connu reste rafraîchi pour que le log « gagnée / perdue » garde son
+gagnant. `skipIfAuctionOver()` ajoute un garde-fou juste avant chaque POST de mise —
+l'enchère peut expirer pendant le délai humanisé — avec dé-doublonnage du log, la hot
+lane repassant sur la même enchère à chaque tick. `auctionLikelyStillLive()` passe lui
+aussi à `serverNow()`, pour que pruning et filtrage partagent la même référence de temps.
+
+`tests/market-ended.test.mjs` rejoue le scénario dans un vrai navigateur, API simulée :
+une annonce morte et une vivante matchant toutes deux le mot-clé. Il vérifie qu'aucune
+mise ne part sur la morte **et** qu'une mise part bien sur la vivante — sans ce second
+contrôle, le test passerait aussi si le bot ne faisait plus rien. Vérifié : il échoue
+sur le build d'avant le correctif, avec les mêmes lignes de log qu'en production.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

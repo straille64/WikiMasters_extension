@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.3';
+    const WM_VERSION = '1.3.13-fork.4';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1568,6 +1568,35 @@
     // Heure "serveur" estimée (corrige le décalage d'horloge du PC).
     function serverNow() { return Date.now() + serverClockOffset; }
 
+    /* Une enchère dont le end_at est passé n'accepte plus aucune mise : le serveur
+       répond « Cette enchère est terminée ». Comparé à l'heure SERVEUR (serverNow),
+       jamais à l'horloge du PC — un PC désynchronisé raterait la fin de plusieurs
+       secondes, ce qui est précisément ce que la synchro d'horloge corrige.
+       marginMs > 0 → considère aussi comme terminées celles qui finissent dans moins
+       de marginMs (utile pour ne pas armer un snipe sur une enchère quasi finie).
+       Sans end_at exploitable on ne présume rien : l'enchère reste traitée comme vivante. */
+    function isAuctionOver(a, marginMs = 0) {
+        const end = a && a.end_at ? new Date(a.end_at).getTime() : NaN;
+        if (!Number.isFinite(end)) return false;
+        return end - serverNow() <= marginMs;
+    }
+
+    // Garde commune à tous les chemins de mise. Entre la décision et le POST il y a un
+    // délai humanisé puis la latence réseau : l'enchère peut expirer entre les deux.
+    const auctionOverLogged = new Set();
+    function skipIfAuctionOver(a, contexte) {
+        if (!isAuctionOver(a)) return false;
+        // La hot lane repasse sur la même enchère à chaque tick : sans dé-doublonnage,
+        // une seule enchère morte noierait tout le log.
+        if (a && a.id && !auctionOverLogged.has(a.id)) {
+            if (auctionOverLogged.size > 500) auctionOverLogged.clear(); // borne mémoire
+            auctionOverLogged.add(a.id);
+            const t = (a.card && a.card.wikipedia_title) || (a.id.slice(0, 8) + '…');
+            wmLog(`⏰ ${contexte} annulé — enchère déjà terminée : <b>${esc(t)}</b>`);
+        }
+        return true;
+    }
+
     // Formate le temps restant d'une enchère depuis end_at ISO string
     function formatCountdown(endAtStr) {
         const ms = new Date(endAtStr).getTime() - serverNow();
@@ -2457,6 +2486,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Cache des ventes actives (mes mises en vente) pour le calcul header
     let lastActiveSales = [];
 
+    // Dernier log « annonces terminées ignorées » (throttle, cf. checkMarketplace).
+    let lastEndedScanLogTs = 0;
+
     // Timestamp de première détection de chaque hit (pour tri "ajout récent")
     // Map<auctionId, ms>. Conservé même quand activeHitsMap.set écrase l'entrée.
     let firstSeenMap = new Map();
@@ -2946,6 +2978,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (bidLockSet.has(a.id)) continue; // la hot lane / une autre passe bid déjà dessus
             bidLockSet.add(a.id);
             await new Promise(r => setTimeout(r, bidDelayMs(a)));
+            // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
+            if (skipIfAuctionOver(a, 'Hunter')) { bidLockSet.delete(a.id); continue; }
             const bidAmount = minNextBid(a);
             try {
                 const res = await fetch(
@@ -3146,7 +3180,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function auctionLikelyStillLive(id) {
         const last = activeHitsMap.get(id);
         if (last && last.auction && last.auction.end_at) {
-            return new Date(last.auction.end_at).getTime() > Date.now() + 5000;
+            // serverNow() et non Date.now() : même référence de temps que isAuctionOver,
+            // sinon un PC décalé prune des enchères encore vivantes (ou l'inverse).
+            return new Date(last.auction.end_at).getTime() > serverNow() + 5000;
         }
         return false;
     }
@@ -3338,7 +3374,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Filtre les hits : mots-clés (standard + prioritaires) OU enchères où je mise.
             // Exclusion STRICTE : une annonce contenant un mot exclu est écartée — SAUF
             // si je mise déjà dessus (je veux toujours voir/suivre mes propres enchères).
-            const hits = auctions.filter(a => {
+            /* ── Enchères déjà terminées ──
+               L'API liste une enchère tant que le serveur ne l'a pas SOLDÉE, et le scan
+               demande `sort=ending_soon` : les enchères finies, ayant le end_at le plus
+               ancien, arrivent donc EN TÊTE du scan. Sans ce filtre ce sont elles que le
+               watcher « trouve » en premier, et chaque mise part sur une enchère morte
+               (« Cette enchère est terminée »), sur tous les chemins à la fois : match +
+               son + Discord, chasseur, mot-clé prioritaire, armement du mode fourbe.
+               On les écarte ici, un seul point de passage pour tout ce qui suit. */
+            const endedAuctions = auctions.filter(a => isAuctionOver(a));
+            const liveAuctions = endedAuctions.length ? auctions.filter(a => !isAuctionOver(a)) : auctions;
+
+            // Leur dernier état connu reste rafraîchi : c'est lui qui sert à logguer
+            // « gagnée / perdue » et le gagnant quand le serveur les retire de la liste.
+            for (const a of endedAuctions) {
+                if (activeHitsMap.has(a.id)) activeHitsMap.set(a.id, { auction: a, endAt: a.end_at });
+            }
+
+            // Log throttlé : c'est un état NORMAL du site, pas une anomalie — inutile de
+            // le répéter à chaque scan (toutes les 30 s).
+            if (endedAuctions.length && Date.now() - lastEndedScanLogTs > 600000) {
+                lastEndedScanLogTs = Date.now();
+                wmLog(`🧹 ${endedAuctions.length} annonce(s) déjà terminée(s) ignorée(s) — le serveur les liste encore tant qu'il ne les a pas soldées.`);
+            }
+
+            const hits = liveAuctions.filter(a => {
                 // Classifie D'ABORD, même pour mes propres mises : sinon kwClassCache resterait
                 // sans entrée pour ces annonces, et newHits (juste en dessous) perdrait la
                 // notif si une enchère où je mise DÉJÀ matche AUSSI un mot-clé (cas réel : bug
@@ -3485,6 +3545,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     }
                     bidLockSet.add(a.id);
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                    // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
+                    if (skipIfAuctionOver(a, 'Chasseur ciblé')) { bidLockSet.delete(a.id); continue; }
                     try {
                         const res = await fetch(
                             `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
@@ -3520,6 +3582,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     }
                     bidLockSet.add(a.id);
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                    // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
+                    if (skipIfAuctionOver(a, 'Bid prioritaire')) { bidLockSet.delete(a.id); continue; }
                     const bidAmount = minNextBid(a);
                     try {
                         const res = await fetch(
@@ -3648,6 +3712,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (!autoBidWithinCap(a, bidAmount)) continue;
                 bidLockSet.add(a.id);
                 await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
+                if (skipIfAuctionOver(a, 'Auto-bid (riposte)')) { bidLockSet.delete(a.id); continue; }
                 try {
                     const res = await fetch(
                         "https://www.wiki-masters.com/api/marketplace/" + a.id + "/bid",
@@ -4442,7 +4508,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // Riposte instantanée si auto-bid activé sur cette enchère ET sous le plafond.
                 // ⚠️ NE PAS faire `continue` si le plafond est atteint : ça sauterait la MàJ de
                 // leadingBidsMap plus bas → l'outbid serait re-détecté au tick suivant.
-                if (autoBidSet.has(a.id) && wikibidousBalance > 0 && !bidLockSet.has(a.id)) {
+                if (autoBidSet.has(a.id) && wikibidousBalance > 0 && !bidLockSet.has(a.id)
+                    && !skipIfAuctionOver(a, 'Hot-lane bid')) {
                     const bidAmount = bidIncrement(bidOb);
                     if (autoBidWithinCap(a, bidAmount)) { // ne riposte que sous le plafond
                         bidLockSet.add(a.id);

@@ -45,6 +45,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
   `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
   sur le code réellement livré, pas sur une copie.
+- `tests/market-ended.test.mjs` : rejoue un scan marché avec API simulée et vérifie
+  qu'aucune mise ne part sur une enchère terminée — ni, à l'inverse, que le filtre
+  n'assèche les enchères vivantes.
 - `tests/smoke.mjs` : charge `dist/` dans un vrai Chromium et vérifie que l'UI se
   monte (bouton ⚙ compris) sans erreur d'exécution. `node --check` ne valide que la
   syntaxe : une exception à l'init tue l'IIFE entière et **rien** n'apparaît — c'est
@@ -77,8 +80,9 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Suppression du `@require` distant (le build est autonome)
 - [x] Audit des bugs et fragilités → [docs/AUDIT.md](docs/AUDIT.md)
 - [x] Correction des bugs de la boucle d'ouverture (erreurs, cooldown, 429) — audit #1, #2, #3, #5
-- [x] Tests : helpers, garde-fous d'échappement, et test de fumée navigateur
-      (`./scripts/test.sh`)
+- [x] Tests : helpers, garde-fous d'échappement, test de fumée navigateur et
+      non-régression Market Watcher (`./scripts/test.sh`)
+- [x] Market Watcher : ne plus miser sur des enchères déjà terminées (audit #15)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
       d'injection couverts, verrouillé par un test (audit #4)
 - [ ] Découpage du monolithe en modules
