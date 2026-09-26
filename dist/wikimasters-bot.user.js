@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.4
+// @version      1.3.13-fork.5
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.4';
+    const WM_VERSION = '1.3.13-fork.5';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -66,6 +66,9 @@
     const MARKET_API_BASE = "https://www.wiki-masters.com/api/marketplace";
     const MARKET_PAGE_LIMIT = 50;
     const MARKET_PAGE_CONCURRENCY = 5; // pages chargées en parallèle par lot
+    // Plafond dur de pagination (60 × 50 = 3000 annonces) : la boucle s'arrête d'elle-même
+    // sur une page incomplète, ceci n'est qu'un filet si l'API répond n'importe quoi.
+    const MARKET_MAX_PAGES = 60;
     const MARKET_MIN_GAP_MS = 1500;    // souffle minimal entre 2 scans
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -2461,42 +2464,93 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return res.json();
     }
 
-    // Fetch TOUTES les pages et retourne tous les auctions
-    async function fetchAllMarketAuctions(onProgress) {
-        const first = await fetchMarketPage(1);
-        const auctions = [...first.auctions];
-        const total = first.total || 0;
-        const totalPages = Math.ceil(total / MARKET_PAGE_LIMIT);
-
-        if (onProgress) onProgress(1, totalPages, auctions.length);
-
-        // Pagination par lots parallèles : MARKET_PAGE_CONCURRENCY pages à la fois
-        // au lieu d'une par une → temps de scan divisé par ~5.
-        for (let start = 2; start <= totalPages; start += MARKET_PAGE_CONCURRENCY) {
-            const batch = [];
-            for (let p = start; p < start + MARKET_PAGE_CONCURRENCY && p <= totalPages; p++) batch.push(p);
-            const results = await Promise.all(
-                batch.map(p => fetchMarketPage(p).catch(() => ({ auctions: [] }))) // page ratée n'arrête pas le scan
-            );
-            for (const data of results) auctions.push(...data.auctions);
-            if (onProgress) onProgress(Math.min(start + batch.length - 1, totalPages), totalPages, auctions.length);
-            // petite pause entre les lots, pas entre chaque page
-            await new Promise(r => setTimeout(r, 100));
-        }
-
-        // Déduplication par id : comme les enchères sont triées par fin proche et que
-        // le temps s'écoule pendant la pagination, une même enchère peut apparaître sur
-        // 2 pages consécutives (elle glisse d'une page à l'autre entre 2 fetches).
-        // On garde la première occurrence de chaque id.
-        const seen = new Set();
-        const deduped = [];
-        for (const a of auctions) {
-            if (a && a.id && !seen.has(a.id)) {
-                seen.add(a.id);
-                deduped.push(a);
+    /* Nombre total d'annonces annoncé par l'API. Le champ a changé de nom (ou disparu) :
+       il valait 0, donc `Math.ceil(0 / 50)` donnait 0 page à paginer et le scan
+       s'arrêtait à la page 1 — qui, triée par `ending_soon`, ne contient que les
+       enchères les plus anciennes, c'est-à-dire les déjà terminées. Le bot ne voyait
+       donc JAMAIS les annonces vivantes. On sonde les noms plausibles, et surtout on
+       ne se sert plus de cette valeur pour décider quand s'arrêter.
+       Retourne null si l'API n'annonce rien d'exploitable. */
+    function readMarketTotal(data) {
+        const scopes = [data, data && data.pagination, data && data.meta]
+            .filter(o => o && typeof o === 'object');
+        for (const scope of scopes) {
+            for (const k of ['total', 'count', 'total_count', 'totalCount', 'totalItems', 'total_items', 'nbHits']) {
+                const n = Number(scope[k]);
+                if (Number.isFinite(n) && n > 0) return n;
             }
         }
-        return { auctions: deduped, total, totalPages };
+        return null;
+    }
+
+    // Fetch TOUTES les pages et retourne tous les auctions
+    async function fetchAllMarketAuctions(onProgress) {
+        // Déduplication à l'absorption : les enchères sont triées par fin proche et le
+        // temps s'écoule pendant la pagination, donc une même annonce peut apparaître
+        // sur 2 pages consécutives. `absorb` retourne le nombre d'entrées RÉELLEMENT
+        // nouvelles, ce qui sert aussi de garde-fou anti-boucle ci-dessous.
+        const seen = new Set();
+        const auctions = [];
+        const absorb = (list) => {
+            let added = 0;
+            for (const a of (list || [])) {
+                if (!a || !a.id || seen.has(a.id)) continue;
+                seen.add(a.id);
+                auctions.push(a);
+                added++;
+            }
+            return added;
+        };
+
+        const first = await fetchMarketPage(1);
+        const firstList = (first && first.auctions) || [];
+        absorb(firstList);
+
+        const reportedTotal = readMarketTotal(first);
+        const expectedPages = reportedTotal ? Math.ceil(reportedTotal / MARKET_PAGE_LIMIT) : null;
+        if (!expectedPages && !fetchAllMarketAuctions._loggedNoTotal) {
+            fetchAllMarketAuctions._loggedNoTotal = true;
+            wmLog(`🔬 Pagination marché : l'API n'annonce pas de total exploitable (champs racine : <span style="color:#888;font-size:9px;">${esc(Object.keys(first || {}).join(', '))}</span>) — pagination jusqu'à une page incomplète.`);
+        }
+        if (onProgress) onProgress(1, expectedPages || '?', auctions.length);
+
+        // Pagination par lots parallèles : MARKET_PAGE_CONCURRENCY pages à la fois
+        // au lieu d'une par une → temps de scan divisé par ~5. On continue tant que
+        // les pages reviennent PLEINES : une page incomplète est la dernière. Ne
+        // dépend donc plus du total annoncé par l'API.
+        let lastPage = 1;
+        let more = firstList.length >= MARKET_PAGE_LIMIT;
+        for (let start = 2; more && start <= MARKET_MAX_PAGES; start += MARKET_PAGE_CONCURRENCY) {
+            const batch = [];
+            for (let p = start; p < start + MARKET_PAGE_CONCURRENCY && p <= MARKET_MAX_PAGES; p++) {
+                if (expectedPages && p > expectedPages) break;
+                batch.push(p);
+            }
+            if (!batch.length) break;
+
+            const results = await Promise.all(batch.map(p => fetchMarketPage(p)
+                .then(d => ({ ok: true, list: (d && d.auctions) || [] }))
+                // Une page ratée n'arrête pas le scan — et ne doit surtout pas être prise
+                // pour une page incomplète, sinon un hoquet réseau tronque tout le scan.
+                .catch(() => ({ ok: false, list: [] }))));
+
+            let addedInBatch = 0;
+            for (const r of results) {
+                addedInBatch += absorb(r.list);
+                if (r.ok && r.list.length < MARKET_PAGE_LIMIT) more = false;
+            }
+            lastPage = batch[batch.length - 1];
+            if (onProgress) onProgress(lastPage, expectedPages || lastPage, auctions.length);
+
+            // Garde-fou : un lot entier sans aucune nouveauté = l'API ignore le paramètre
+            // `page` (ou on tourne en rond). On s'arrête au lieu de boucler jusqu'au plafond.
+            if (addedInBatch === 0) break;
+            await new Promise(r => setTimeout(r, 100)); // petite pause entre les lots
+        }
+
+        // Le total affiché doit refléter ce qu'on a réellement vu : quand l'API annonce
+        // 0 (le bug d'origine), le panneau affichait « 0 annonces » en plein scan.
+        return { auctions, total: Math.max(reportedTotal || 0, auctions.length), totalPages: expectedPages || lastPage };
     }
 
     /* ===================== MARKET WATCHER ===================== */

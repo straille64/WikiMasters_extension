@@ -127,6 +127,37 @@ mise ne part sur la morte **et** qu'une mise part bien sur la vivante — sans c
 contrôle, le test passerait aussi si le bot ne faisait plus rien. Vérifié : il échoue
 sur le build d'avant le correctif, avec les mêmes lignes de log qu'en production.
 
+### 16. Market Watcher : une seule page scannée, donc aucune carte trouvée
+Signalé en production le 26/09, juste après le correctif #15. `fetchAllMarketAuctions`
+faisait `const total = first.total || 0` puis `totalPages = Math.ceil(total / 50)`.
+Le champ `total` de l'API a changé de nom (ou disparu) : il valait 0, donc **0 page à
+paginer** et le scan s'arrêtait à la page 1.
+
+Or le scan demande `sort=ending_soon` : cette page 1 ne contient que les enchères au
+`end_at` le plus ancien, c'est-à-dire les déjà terminées. Le bot ne voyait donc
+**jamais** une seule annonce vivante. Les deux bugs se masquaient l'un l'autre : avant
+#15 le bot misait sur ces mortes (donc « il trouvait »), après #15 il les écartait
+correctement et il ne restait plus rien. Symptôme utilisateur : `🧹 49 annonce(s) déjà
+terminée(s) ignorée(s)`, `✅ 0 annonce`, « Aucune carte recherchée en vente », alors
+que le site affichait des dizaines d'annonces correspondantes à 5–11 h de la fin.
+
+Le panneau affichait aussi « 0 annonces » en plein scan, ce qui aurait dû mettre la
+puce à l'oreille : c'était `total` qui était lu, pas ce qui avait été récupéré.
+
+**✅ Corrigé (1.3.13-fork.5)** — la pagination ne dépend plus d'un total annoncé : on
+continue tant que les pages reviennent **pleines**, une page incomplète étant la
+dernière, avec plafond dur `MARKET_MAX_PAGES` (60 × 50 = 3000) et arrêt si un lot
+entier n'apporte aucune nouveauté (API qui ignorerait `page`). Une page en erreur
+n'est plus confondue avec une page incomplète, sinon un hoquet réseau tronquerait tout
+le scan. `readMarketTotal()` sonde les noms plausibles mais ne sert plus qu'à
+l'affichage, et le total affiché retombe sur le nombre d'annonces réellement vues.
+Un log de diagnostic liste une fois les champs racine de la réponse, pour repérer le
+prochain renommage côté API.
+
+`tests/market-pagination.test.mjs` rejoue le scénario : 3 pages de 50 sans champ
+`total`, page 1 et 2 pleines d'enchères mortes, la carte recherchée en page 3.
+Vérifié : échoue sur le build d'avant (« pages demandées : 1 »), passe après.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
