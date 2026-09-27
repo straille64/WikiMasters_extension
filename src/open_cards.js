@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.8';
+    const WM_VERSION = '1.3.13-fork.9';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -743,7 +743,23 @@
                 `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales`,
                 { credentials: "include" }
             );
-            if (!res.ok) return null;
+            if (!res.ok) {
+                // Trace l'échec dans le cache (cf. SALES_FAIL_TTL) pour ne pas redemander
+                // cette carte à chaque scan. `failed` la rend invisible à getCachedSales,
+                // donc l'affichage reste « en cours de chargement », pas une fausse donnée.
+                salesCache[cardId] = { median: 0, count: 0, last: null, avg: null,
+                                       min: null, max: null, failed: true,
+                                       status: res.status, fetchedAt: Date.now() };
+                saveSalesCache();
+                if (res.status === 403 || res.status === 429) {
+                    salesEndpointCooldownUntil = Date.now() + 5 * 60 * 1000;
+                    if (Date.now() - _salesCooldownLogged > 5 * 60 * 1000) {
+                        _salesCooldownLogged = Date.now();
+                        wmLog(`🐢 Le site refuse l'historique des ventes (HTTP ${res.status}) — récupération des cotes en pause 5 min. Ça libère du débit pour l'ouverture de paquets.`);
+                    }
+                }
+                return null;
+            }
             const data = await res.json();
             const sales = (data.sales || []).filter(s => Number.isFinite(s.final_price));
             const prices = sales.map(s => s.final_price);
@@ -2733,9 +2749,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         const reportedTotal = readMarketTotal(first);
         const expectedPages = reportedTotal ? Math.ceil(reportedTotal / MARKET_PAGE_LIMIT) : null;
-        if (!expectedPages && !fetchAllMarketAuctions._loggedNoTotal) {
+        /* L'API n'annonce pas de total, mais elle expose `hasMore` (champs racine
+           observés : auctions, page, limit, hasMore). C'est le signal FAISANT AUTORITÉ :
+           on ne déduit plus la fin du scan d'une page incomplète, on la lit. */
+        const hasMoreOf = (d) => (d && typeof d.hasMore === 'boolean') ? d.hasMore : null;
+        if (!expectedPages && hasMoreOf(first) === null && !fetchAllMarketAuctions._loggedNoTotal) {
             fetchAllMarketAuctions._loggedNoTotal = true;
-            wmLog(`🔬 Pagination marché : l'API n'annonce pas de total exploitable (champs racine : <span style="color:#888;font-size:9px;">${esc(Object.keys(first || {}).join(', '))}</span>) — pagination jusqu'à une page incomplète.`);
+            wmLog(`🔬 Pagination marché : ni total ni hasMore exploitable (champs racine : <span style="color:#888;font-size:9px;">${esc(Object.keys(first || {}).join(', '))}</span>) — pagination jusqu'à une page incomplète.`);
         }
         if (onProgress) onProgress(1, expectedPages || '?', auctions.length);
 
@@ -2744,7 +2764,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // les pages reviennent PLEINES : une page incomplète est la dernière. Ne
         // dépend donc plus du total annoncé par l'API.
         let lastPage = 1;
-        let more = firstList.length >= MARKET_PAGE_LIMIT;
+        // `hasMore` quand l'API le donne, sinon repli sur « la page était pleine ».
+        const firstMore = hasMoreOf(first);
+        let more = firstMore !== null ? firstMore : firstList.length >= MARKET_PAGE_LIMIT;
+        // Pages refusées (403/429) : elles étaient silencieusement abandonnées, soit ~50
+        // annonces perdues chacune — d'où des résultats manquants sans le moindre signal.
+        const failedPages = [];
         for (let start = 2; more && start <= MARKET_MAX_PAGES; start += MARKET_PAGE_CONCURRENCY) {
             const batch = [];
             for (let p = start; p < start + MARKET_PAGE_CONCURRENCY && p <= MARKET_MAX_PAGES; p++) {
@@ -2754,15 +2779,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!batch.length) break;
 
             const results = await Promise.all(batch.map(p => fetchMarketPage(p)
-                .then(d => ({ ok: true, list: (d && d.auctions) || [] }))
+                .then(d => ({ ok: true, page: p, list: (d && d.auctions) || [], more: hasMoreOf(d) }))
                 // Une page ratée n'arrête pas le scan — et ne doit surtout pas être prise
                 // pour une page incomplète, sinon un hoquet réseau tronque tout le scan.
-                .catch(() => ({ ok: false, list: [] }))));
+                .catch(() => ({ ok: false, page: p, list: [], more: null }))));
 
             let addedInBatch = 0;
             for (const r of results) {
+                if (!r.ok) { failedPages.push(r.page); continue; }
                 addedInBatch += absorb(r.list);
-                if (r.ok && r.list.length < MARKET_PAGE_LIMIT) more = false;
+                if (r.more !== null) { if (!r.more) more = false; }
+                else if (r.list.length < MARKET_PAGE_LIMIT) more = false;
             }
             lastPage = batch[batch.length - 1];
             if (onProgress) onProgress(lastPage, expectedPages || lastPage, auctions.length);
@@ -2776,6 +2803,29 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 wmLog(`⚠️ Scan tronqué au plafond de <b>${MARKET_MAX_PAGES} pages</b> (${auctions.length} annonces) — il reste des annonces non scannées.`);
             }
             await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS)); // souffle entre les lots
+        }
+
+        /* Deuxième passe sur les pages refusées. Le site répond 403 par rafales quand on
+           le sollicite trop : abandonner ces pages, c'est perdre ~50 annonces chacune
+           SANS que rien ne le signale — exactement le « il ne trouve pas tout ». On
+           laisse retomber la pression, puis on les rejoue une par une. */
+        if (failedPages.length) {
+            await new Promise(r => setTimeout(r, 2000));
+            const stillFailed = [];
+            for (const p of failedPages) {
+                try {
+                    const d = await fetchMarketPage(p);
+                    absorb((d && d.auctions) || []);
+                } catch (e) {
+                    stillFailed.push(p);
+                }
+                await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+            }
+            if (stillFailed.length) {
+                wmLog(`⚠️ Scan incomplet : <b>${stillFailed.length} page(s)</b> refusée(s) par le site même après un second essai — il manque jusqu'à ${stillFailed.length * MARKET_PAGE_LIMIT} annonces. Le scan va se ralentir tout seul.`);
+            } else {
+                wmLog(`✅ ${failedPages.length} page(s) d'abord refusée(s), récupérée(s) au second essai.`);
+            }
         }
 
         // Le total affiché doit refléter ce qu'on a réellement vu : quand l'API annonce

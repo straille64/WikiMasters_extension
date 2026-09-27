@@ -45,6 +45,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
   `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
   sur le code réellement livré, pas sur une copie.
+- `tests/scan-resilience.test.mjs` : sous refus 403, vérifie qu'une page rejetée est
+  bien rejouée (aucune annonce perdue) et que l'endpoint des cotes n'est pas martelé.
 - `tests/keyword-extended.test.mjs` : vérifie qu'un mot présent uniquement dans la
   description est bien trouvé en recherche étendue, et ignoré en recherche stricte.
 - `tests/watchlist-modes.test.mjs` : vérifie dans un navigateur qu'un mot-clé en mode
@@ -96,6 +98,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Cadence de scan auto-adaptative — le scan complet ne provoque plus de 403 sur
       l'ouverture de paquets (audit #19)
 - [x] Recherche étendue aux descriptions, réglable par mot-clé (audit #20)
+- [x] Scan résilient aux refus 403 : pages rejouées, historique des ventes plus
+      redemandé en boucle (audit #21, #22)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
       d'injection couverts, verrouillé par un test (audit #4)
 - [ ] Découpage du monolithe en modules

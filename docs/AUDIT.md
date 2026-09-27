@@ -261,6 +261,46 @@ annonces sans qu'on comprenne pourquoi.
 `tests/keyword-extended.test.mjs` vérifie les deux sens : étendu → les 3 cartes
 (titre, catégorie, description), strict → seulement les 2 premières.
 
+### 21. `/sales` refusé en 403 → redemandé indéfiniment
+Relevé dans la console du navigateur (capture utilisateur du 27/09) :
+`GET /api/marketplace/cards/{id}/sales 403` répété **à l'identique** des dizaines de
+fois pour la même carte, entremêlé de `POST /api/packs/open 403`.
+
+`fetchCardSales()` faisait `if (!res.ok) return null;` **sans rien mémoriser**.
+`getCachedSales()` restait donc vide pour cette carte, `queueSalesFetch()` la remettait
+en file au scan suivant, et une carte refusée était redemandée à chaque scan, pour
+toujours. Avec un marché à plusieurs milliers d'annonces, c'est ce qui saturait l'API —
+et faisait tomber l'ouverture de paquets en 403 par ricochet, sans que le Pack Opener
+n'ait quoi que ce soit à se reprocher.
+
+**✅ Corrigé (1.3.13-fork.9)** — l'échec est mémorisé (`failed: true`,
+`SALES_FAIL_TTL` = 10 min). Une entrée d'échec est invisible pour `getCachedSales()`
+(l'affichage reste « en chargement », jamais une fausse cote) mais bien vue par
+`queueSalesFetch()`, qui n'insiste plus. Sur 403/429, `salesEndpointCooldownUntil`
+met toute la récupération des cotes en pause 5 min et vide la file, au lieu de
+continuer à taper toutes les 2 s.
+
+### 22. Pages de scan refusées, silencieusement perdues
+Même capture : le scan affichait 1 annonce trouvée là où le marché en contenait
+beaucoup plus. `fetchAllMarketAuctions` traitait une page en erreur comme
+`{ ok: false, list: [] }` et passait à la suivante — soit **~50 annonces perdues par
+page refusée**, sans le moindre signal. Sous rafale de 403, des pans entiers du marché
+disparaissaient du scan.
+
+**✅ Corrigé (1.3.13-fork.9)** — les pages refusées sont collectées puis **rejouées**
+une par une après une pause, et ce qui reste irrécupérable est **dit** :
+« Scan incomplet : N page(s) refusée(s) […] il manque jusqu'à N × 50 annonces ».
+
+La même capture a aussi livré les champs racine réels de la réponse :
+`auctions, page, limit, hasMore`. La pagination s'appuie désormais sur **`hasMore`**,
+signal faisant autorité, au lieu de déduire la fin du scan d'une page incomplète ;
+le repli heuristique reste en place si le champ disparaît.
+
+`tests/scan-resilience.test.mjs` rejoue les deux : une page refusée au premier essai
+doit être récupérée (101 annonces attendues, contre 51 sur le build d'avant — soit
+exactement les 50 perdues), et l'endpoint `/sales` refusé en boucle ne doit jamais
+recevoir plus d'un appel par carte.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
