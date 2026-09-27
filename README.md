@@ -131,6 +131,9 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       d'injection couverts, verrouillé par un test (audit #4)
 - [x] Trash Seller : plus de reprise silencieuse après un rechargement, et refus de
       vendre si la fenêtre ouverte n'affiche pas la carte visée (audit #35)
+- [x] Trash Seller : succès de la mise en vente lu sur la réponse du site (plus de vente
+      créée comptée comme échec, ni de double mise en vente), retour automatique sur
+      /collection, aperçu de tout le pool (audit #36)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

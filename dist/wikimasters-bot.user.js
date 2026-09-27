@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.19
+// @version      1.3.13-fork.20
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.19';
+    const WM_VERSION = '1.3.13-fork.20';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -6168,17 +6168,55 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // pas une "mauvaise page" au sens d'une navigation manuelle de l'utilisateur ailleurs. On
     // retente donc le retour ici avant de conclure à un vrai blocage (réutilisé aussi en fin de
     // sellCardViaUI, juste après avoir cliqué "Lancer l'enchère").
+    function onCollectionPage() { return location.pathname.startsWith('/collection'); }
+
+    async function waitForCollection(ms) {
+        const deadline = Date.now() + ms;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 120));
+            if (onCollectionPage()) return true;
+        }
+        return onCollectionPage();
+    }
+
     async function ensureOnCollectionPage() {
-        if (location.pathname.startsWith('/collection')) return true;
+        if (onCollectionPage()) return true;
+
+        // 1) Retour arrière : la page de l'enchère a été EMPILÉE par-dessus /collection par le
+        //    routeur du site. C'est le chemin le plus fiable — pas de bouton à deviner, et la
+        //    page n'est pas rechargée (le bot reste en vie).
+        try { history.back(); } catch(e) {}
+        if (await waitForCollection(2500)) return true;
+
+        // 2) Bouton du site, quand il existe.
         const backBtn = findButtonByText('Retour au marché');
         if (backBtn) {
             backBtn.click();
-            for (let i = 0; i < 20; i++) {
-                await new Promise(r => setTimeout(r, 150));
-                if (location.pathname.startsWith('/collection')) return true;
-            }
+            if (await waitForCollection(2500)) return true;
         }
-        return location.pathname.startsWith('/collection');
+
+        // 3) N'importe quel lien de navigation vers la collection (navigation SPA, pas de
+        //    rechargement non plus).
+        const link = [...document.querySelectorAll('a[href]')]
+            .find(a => /^\/collection(\?|#|$)/.test(a.getAttribute('href') || '') && !isBotOwnNode(a));
+        if (link) {
+            link.click();
+            if (await waitForCollection(2500)) return true;
+        }
+
+        // 4) Dernier recours : navigation dure. Elle RECHARGE la page, donc le script repart de
+        //    zéro — on pose un marqueur horodaté pour que le Trash Seller reprenne malgré la
+        //    reprise auto désactivée. Le marqueur ne vaut que pour une navigation déclenchée
+        //    par le bot, et pour une minute : un F5 de l'utilisateur ne relance toujours rien.
+        if (trashSellerRunning) {
+            try {
+                sessionStorage.setItem('wm_trashseller_selfnav', String(Date.now()));
+                wmLog('↩️ Retour forcé sur <code>/collection</code> (le site avait navigué ailleurs après la mise en vente).');
+                location.assign('/collection');
+            } catch(e) {}
+            await new Promise(r => setTimeout(r, 3000)); // la page part, on n'ira pas plus loin
+        }
+        return onCollectionPage();
     }
 
     async function sellCardViaUI(cardId, title, rarity, price, duration) {
@@ -6244,12 +6282,26 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         _lastUiListingAuctionId = null;
         launchBtn.click();
-        await new Promise(r => setTimeout(r, 900)); // laisse la requête + navigation vers la page de l'enchère se faire
 
-        // Sur succès, le site NAVIGUE vers la page de l'enchère créée (le bouton et toute la
-        // page collection disparaissent avec elle). Toujours présent → refusé côté site
-        // (impossible de lire le message d'erreur exact depuis ce flux, contrairement au POST).
-        if (document.body.contains(launchBtn)) return { ok: false, reason: 'modal_still_open' };
+        // Succès = le POST /api/marketplace du SITE a répondu OK (l'intercepteur remplit
+        // _lastUiListingAuctionId). C'est le seul signal fiable : juger sur la disparition du
+        // bouton dépendait du temps de démontage React et déclarait « échec » des ventes
+        // pourtant créées — elles n'étaient alors ni enregistrées ni comptées, et la carte
+        // suivante repartait sur une page qui n'était plus /collection.
+        let listedId = null, modalGoneAt = 0;
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 150));
+            if (_lastUiListingAuctionId) { listedId = _lastUiListingAuctionId; break; }
+            if (!document.body.contains(launchBtn)) {
+                // Fenêtre fermée : on laisse un délai de grâce à la réponse réseau avant de
+                // conclure sans identifiant (la vente existe, mais on ne pourra pas la suivre).
+                if (!modalGoneAt) modalGoneAt = Date.now();
+                else if (Date.now() - modalGoneAt > 2000) break;
+            }
+        }
+        if (!listedId && !modalGoneAt) return { ok: false, reason: 'modal_still_open' };
+        if (!listedId) wmLog(`⚠️ <b>${esc(title)}</b> mise en vente sans identifiant d'enchère lisible — elle ne pourra pas être suivie automatiquement.`);
 
         // Revient sur /collection (sinon la carte suivante ne retrouverait plus la barre de
         // recherche). Pas bloquant si ça échoue : la prochaine sellCardViaUI() retentera via
@@ -6259,7 +6311,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const nextSearchInput = document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]');
         if (nextSearchInput) setReactInputValue(nextSearchInput, ''); // nettoie pour la prochaine carte
 
-        return { ok: true, auctionId: _lastUiListingAuctionId };
+        return { ok: true, auctionId: listedId };
     }
 
     async function sellBatch(cards, statusEl) {
@@ -6668,11 +6720,24 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // Mêmes créneaux que la vente réelle : plafond de ventes simultanées moins
         // celles déjà en cours.
-        const maxActive = Math.max(1, Number(getSetting('maxActiveSales')) || 1);
-        const active = Array.isArray(lastActiveSales) ? lastActiveSales.length : 0;
+        // Même source que la vente réelle : le COMPTEUR serveur fait autorité (le site ne
+        // détaille plus la liste des ventes actives, donc sa longueur vaut 0 alors que des
+        // ventes tournent — l'aperçu annonçait alors des créneaux libres qui n'existaient pas).
+        const state = await fetchSellingState().catch(() => null);
+        const maxActive = Math.max(1, effectiveMaxActive(state && state.max));
+        const active = state && Number.isFinite(state.count)
+            ? state.count
+            : (Array.isArray(lastActiveSales) ? lastActiveSales.length : 0);
         const slots = Math.max(0, maxActive - active);
 
-        const batch = await selectTrashBatch(pool, Math.max(slots, 1));
+        // Tout le pool, dans l'ordre réel de passage — c'est la question à laquelle l'aperçu
+        // doit répondre (« lesquelles vont être vendues, dans quel sens »). N'afficher que la
+        // prochaine fournée revenait à montrer 1 ligne sur 8 dès que les créneaux étaient pleins.
+        const ordered = await selectTrashBatch(pool, pool.length);
+        // La cote se lit carte par carte : on borne pour ne pas lancer 300 requêtes sur un
+        // gros pool. Au-delà, on annonce le reste sans prix.
+        const PREVIEW_MAX = 60;
+        const batch = ordered.slice(0, PREVIEW_MAX);
         const rows = [];
         for (const item of batch) {
             const cardId = item.card_id || item.card?.id;
@@ -6681,7 +6746,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const info = await resolveSellBasePrice(rarity, cardId);
             rows.push({ title, rarity, price: info.price, info, duration: getSellDuration(rarity) });
         }
-        return { rows, poolSize: pool.length, slots, active, maxActive };
+        return { rows, poolSize: pool.length, slots, active, maxActive,
+                 truncated: Math.max(0, ordered.length - batch.length) };
     }
 
     function renderSalePreview(data) {
@@ -6695,6 +6761,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const fmtDur = (m) => m >= 60 ? `${Math.round(m / 60)} h` : `${m} min`;
         const rows = data.rows.map((r, i) => {
             const rc = RARITY[r.rarity] || { color: '#888' };
+            const now = i < (data.slots || 0); // part à la prochaine passe
             // D'où vient le prix : c'est l'information la plus utile de l'aperçu.
             const pctNote = r.info.pct !== undefined && r.info.pct !== 100
                 ? ` × ${r.info.pct} % → ${r.info.marketPrice} 💰` : '';
@@ -6708,8 +6775,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const degr = r.info.degressive
                 ? ` <span style="color:#f97316;" title="Invendue ${r.info.degressive.retag} fois : -${r.info.degressive.discountPct} % (avant ${r.info.degressive.before} 💰)">📉</span>`
                 : '';
-            return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;">
-                <span style="color:#555;min-width:14px;text-align:right;font-family:'JetBrains Mono',monospace;">${i + 1}</span>
+            return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;${now ? 'background:rgba(74,222,128,0.06);' : ''}">
+                <span style="color:${now ? '#4ade80' : '#555'};min-width:14px;text-align:right;font-family:'JetBrains Mono',monospace;"
+                    title="${now ? 'Part à la prochaine passe' : 'En attente d\'un créneau libre'}">${i + 1}</span>
                 <span style="color:${rc.color};font-weight:700;min-width:22px;">${r.rarity}</span>
                 <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;" title="${esc(r.title)}">${esc(r.title)}</span>
                 <span style="font-size:9px;white-space:nowrap;">${src}${degr}</span>
@@ -6727,9 +6795,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     style="background:none;border:none;color:#666;cursor:pointer;font-size:12px;line-height:1;padding:0 2px;">×</button>
             </div>
             <div style="font-size:9px;color:#666;margin-bottom:3px;">
-                ${data.rows.length} carte(s) sur les <b>${data.slots}</b> créneau(x) libres
-                (${data.active}/${data.maxActive} ventes en cours) · pool de ${data.poolSize} ·
+                ${data.poolSize} carte(s) dans le pool · ${data.rows.length} affichée(s)${data.truncated ? ` (+${data.truncated} sans prix)` : ''} ·
+                <b style="color:#4ade80;">${data.slots}</b> partiront tout de suite
+                (${data.active}/${data.maxActive} ventes en cours) ·
                 stratégie « ${esc(getSetting('trashSellStrategy'))} » · total <b style="color:#fbbf24;">${total.toLocaleString('fr-FR')} 💰</b>
+            </div>
+            <div style="font-size:9px;color:#666;margin-bottom:3px;">
+                Les <b>${data.slots || 0}</b> premières lignes partent dès qu'un créneau se libère ; les suivantes
+                attendent leur tour, dans cet ordre.
             </div>
             ${marketPct !== 100 ? `<div style="font-size:9px;color:#fbbf24;margin-bottom:3px;">
                 ⚠️ Réglages : <b>${marketPct} %</b> de la cote sont appliqués, donc le prix n'est pas la moyenne du marché.
@@ -8227,6 +8300,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const settled = soldItems.length + unsoldItems.length;
         const txRate  = settled > 0 ? Math.round((soldItems.length / settled) * 100) : 0;
 
+        // Les ventes lancées aujourd'hui et pas encore conclues : sans elles, le panneau
+        // affichait « — » toute la journée alors que des enchères tournaient.
+        const pendingRows = pendingItems.length ? `
+            <div style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.05);">
+                <div style="color:#888;font-size:9px;margin-bottom:2px;">⏳ ${pendingItems.length} en vente (lancée(s) aujourd'hui)</div>
+                ${pendingItems.slice(-6).reverse().map(s => {
+                    const rc = RARITY[(s.rarity || '').toUpperCase()] || { color: '#888' };
+                    return `<div style="display:flex;gap:6px;font-size:10px;padding:1px 0;">
+                        <span style="color:${rc.color};font-weight:700;min-width:22px;">${esc((s.rarity || '?').toUpperCase())}</span>
+                        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;">${esc(s.title || '?')}</span>
+                        <span style="color:#fbbf24;white-space:nowrap;">${Number(s.price || 0).toLocaleString('fr-FR')} 💰</span>
+                    </div>`;
+                }).join('')}
+                ${pendingItems.length > 6 ? `<div style="color:#555;font-size:9px;">… et ${pendingItems.length - 6} autre(s)</div>` : ''}
+            </div>` : '';
+
         el.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                 <span style="color:#4ade80;font-weight:700;font-size:12px;">+${totalGained} 💰</span>
@@ -8234,7 +8323,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     ${soldItems.length}✔ / ${unsoldItems.length}✗${pendingItems.length > 0 ? ` / ${pendingItems.length}⏳` : ''} · ${txRate}% vendues
                 </span>
             </div>
-            <div style="line-height:1.8;">${rarityRows || '<span style="color:#444;font-size:10px;">—</span>'}</div>`;
+            <div style="line-height:1.8;">${rarityRows || '<span style="color:#444;font-size:10px;">Rien de vendu pour l\'instant.</span>'}</div>
+            ${pendingRows}`;
     }
 
     /* ===================== UI ===================== */
@@ -9823,7 +9913,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // sans aucune action de l'utilisateur. Une mise en vente est irréversible → la reprise
         // est désormais explicite (réglage « Reprise auto » ou clic sur ▶ START).
         if (sessionStorage.getItem('wm_trashseller_active')) {
-            if (getSetting('sellAutoResume')) {
+            // Navigation forcée par le bot (retour sur /collection après une mise en vente) :
+            // c'est LUI qui a rechargé la page, pas l'utilisateur → on reprend. Marqueur à
+            // usage unique et périmé au bout d'une minute.
+            let selfNav = false;
+            try {
+                const ts = parseInt(sessionStorage.getItem('wm_trashseller_selfnav') || '0', 10);
+                selfNav = Number.isFinite(ts) && (Date.now() - ts) < 60000;
+                sessionStorage.removeItem('wm_trashseller_selfnav');
+            } catch(e) {}
+            if (selfNav) {
+                wmLog('▶ Trash Seller : reprise après le retour automatique sur /collection');
+                startTrashSeller();
+            } else if (getSetting('sellAutoResume')) {
                 wmLog('▶ Trash Seller : reprise automatique après rechargement (réglage activé)');
                 startTrashSeller();
             } else {

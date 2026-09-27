@@ -67,7 +67,10 @@ const PAGE_HTML = `<!doctype html><html><head><title>wm</title></head><body>
       }
       b.onclick = () => {
         window.__launched.push(document.getElementById('modal-title').textContent);
-        b.remove(); // succès côté site : la page navigue, le bouton disparaît
+        // Le site poste lui-même l'enchère. En production, le bouton peut rester monté
+        // plusieurs secondes après : on reproduit CE cas, celui qui faisait déclarer
+        // « modal_still_open » des ventes pourtant bien créées.
+        fetch('/api/marketplace', { method: 'POST', headers: { 'x-fixture': '1' }, body: '{}' });
       };
     }
     armLaunch();
@@ -130,6 +133,12 @@ async function run({ autoResume }) {
     // POST = mise en vente par l'API : on la casse pour forcer le contournement DOM,
     // qui est le chemin où vit le garde-fou qu'on teste.
     if (route.request().method() === 'POST') {
+      // Le POST du SITE (déclenché par la fenêtre) réussit ; celui que le bot tente en
+      // direct échoue, ce qui le force sur le contournement DOM — le chemin testé ici.
+      if (route.request().headers()['x-fixture']) {
+        return route.fulfill({ status: 200, contentType: 'application/json',
+          body: '{"auction_id":"auction-fixture-1"}' });
+      }
       return route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"ko"}' });
     }
     if (/cards\/[^/?]+\/sales/.test(url)) {
@@ -182,6 +191,14 @@ if (on.launched.includes('Carte piégée')) {
 // avait sauté, c'est « Carte sûre » qui serait relancée une 2e fois.
 if (on.launched.filter(t => t === 'Carte sûre').length > 1) {
   problems.push('« Carte sûre » a été mise en vente deux fois — la mauvaise carte a été vendue');
+}
+// La vente créée doit être ENREGISTRÉE : c'est ce qui alimente « Ventes (aujourd'hui) »
+// et le suivi de l'enchère. Une vente réussie mais comptée comme échec est invisible.
+if (!/Mis en vente/.test(on.log)) {
+  problems.push("la vente créée n'est pas enregistrée (« Mis en vente » absent du log) — la fenêtre encore montée la fait passer pour un échec");
+}
+if (/modal_still_open/.test(on.log)) {
+  problems.push('une vente pourtant créée est déclarée en échec (modal_still_open)');
 }
 if (!/Vente annulée/.test(on.log)) {
   problems.push("l'abandon n'est pas journalisé (« Vente annulée » attendu dans le log)");

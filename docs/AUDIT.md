@@ -609,6 +609,49 @@ utilisateur ; en neutralisant le contrôle de la fenêtre, il constate la carte 
 vendue **deux fois** — le symptôme exact remonté. Un témoin positif (la carte visée doit
 bien partir en vente) empêche le test de passer parce que rien ne se vend.
 
+### 36. Des ventes créées étaient comptées comme des échecs
+Logs du 27/09 : `modal_still_open`, puis `no_sell_button`, puis `no_search_input` en
+cascade — alors que le site affichait bien 5 ventes actives et que « Ventes (aujourd'hui) »
+restait vide. Trois défauts qui s'enchaînent.
+
+**1. Le succès était jugé sur le DOM.** Après le clic sur « Lancer l'enchère »,
+`sellCardViaUI()` attendait 900 ms puis concluait : bouton encore présent → échec. Or le
+démontage du composant React prend parfois plus longtemps que la requête. Une vente
+**créée** était donc déclarée en échec : pas de `recordSale()`, donc absente de
+`sellHistory`, donc absente du panneau du jour et jamais réconciliée — et le retry
+immédiat pouvait **la remettre en vente une seconde fois**.
+
+**2. Le site navigue après une mise en vente.** Il part sur `/marketplace/{id}`.
+`ensureOnCollectionPage()` ne connaissait qu'un bouton « Retour au marché » : absent, elle
+rendait `false`, d'où le `no_search_input` sur la carte suivante et la mise en pause du
+module. Constaté par l'utilisateur : « quand une mise en vente est faite ça m'emmène sur
+une autre vue que la page collection ».
+
+**3. L'aperçu ne montrait que la prochaine fournée.** `Math.max(slots, 1)` : créneaux
+pleins → **une seule ligne** pour un pool de 8. La question posée (« lesquelles vont être
+vendues, dans quel ordre ») restait sans réponse.
+
+**✅ Corrigé (1.3.13-fork.20)**
+
+- Le succès se lit sur la **réponse du site** : l'intercepteur remplit
+  `_lastUiListingAuctionId` quand le `POST /api/marketplace` de la fenêtre répond OK. On
+  l'attend jusqu'à 8 s, avec un délai de grâce si la fenêtre se ferme sans identifiant
+  lisible (vente enregistrée, mais signalée comme non suivable).
+- `ensureOnCollectionPage()` essaie dans l'ordre : `history.back()` (la page de l'enchère
+  est empilée par-dessus la collection — navigation SPA, le bot reste en vie), le bouton du
+  site, un lien `/collection`, puis en dernier recours une navigation dure. Celle-ci
+  recharge la page : un marqueur horodaté à usage unique (`wm_trashseller_selfnav`, 60 s)
+  fait reprendre le Trash Seller **uniquement** parce que c'est lui qui a navigué — un F5
+  de l'utilisateur ne relance toujours rien (cf. #35).
+- L'aperçu liste **tout le pool** dans l'ordre de passage (borné à 60 lignes cotées), et
+  surligne celles qui partent immédiatement.
+- « Ventes (aujourd'hui) » affiche aussi les ventes **en cours** lancées le jour même :
+  le panneau ne reste plus vide tant que rien n'est conclu.
+
+`tests/trash-seller-safety.test.mjs` couvre le cas : la fenêtre reste montée après le POST,
+et le test exige que la vente soit enregistrée. Mutation de contrôle (retour à l'attente de
+900 ms) : le test voit l'échec ET la double mise en vente de la même carte.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
