@@ -406,6 +406,32 @@ récupération du bot qui restait bloquée sur un refus antérieur.
 (jamais un faux prix), puis requête du **site** → badge rempli **sans** que le bot
 redemande quoi que ce soit, et mini-carte de modale laissée intacte.
 
+### 28. Détection de modale trop large : plus rien n'était décoré
+Le correctif #27 écartait les mini-cartes des fenêtres modales en regardant si **un**
+ancêtre avait `position: fixed`. Beaucoup trop large : la page Collection enveloppe sa
+grille dans une colonne de contenu en position fixe, donc **toutes** les cartes étaient
+prises pour des cartes de modale et plus rien n'était décoré — l'inverse exact du but.
+
+**✅ Corrigé (1.3.13-fork.13)** — une modale se reconnaît à son fond qui **couvre le
+viewport** (≥ 90 % en largeur ET en hauteur), pas à `position: fixed` seul.
+
+Le test précédent ne pouvait pas l'attraper : son conteneur fixe était un **voisin** des
+cartes, pas un **ancêtre**. Il enveloppe désormais la grille, et porte une contre-épreuve
+explicite — « la grille dans une colonne fixe DOIT être décorée ».
+
+### 29. Le site appelle `/sales?scope=summary`, pas `/sales`
+Onglet Réseau de l'utilisateur, en ouvrant « Mettre aux enchères » :
+`GET /api/marketplace/cards/{id}/sales?scope=summary` → **200 OK**, une seule requête.
+Le bot, lui, appelait `/sales` sans paramètre — et se faisait refuser en 403.
+
+**✅ Corrigé (1.3.13-fork.13)** — le bot emprunte exactement le même chemin que le site.
+Et `storeSalesEntry()` accepte désormais **les deux formes** de réponse : la liste
+complète (`sales[]`) et le **résumé** que renvoie `?scope=summary`. Sans ce second cas, un
+résumé se lisait « aucune vente » — un tableau `sales` absent donnant un compte de zéro,
+ce qui est exactement ce que montrait le badge `💰 —`. Les noms de champs du résumé
+n'étant pas documentés, les plus plausibles sont sondés et les clés reçues tracées une
+fois, pour repérer un renommage futur.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

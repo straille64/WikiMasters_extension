@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.12
+// @version      1.3.13-fork.13
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.12';
+    const WM_VERSION = '1.3.13-fork.13';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -791,6 +791,53 @@
        éventuel sur notre propre appel. */
     function storeSalesEntry(cardId, data) {
         if (!cardId || !data) return null;
+
+        /* Deux formes de réponse cohabitent : la liste complète des ventes, et le
+           RÉSUMÉ que renvoie `?scope=summary` (celui que le site utilise pour afficher
+           sa MOYENNE). Sans ce second cas, un résumé se lisait « aucune vente » — un
+           tableau `sales` vide donne bien un compte de zéro. Les noms de champs du
+           résumé ne sont pas documentés : on sonde les plus plausibles, et on trace
+           une fois les clés reçues pour repérer un renommage futur. */
+        if (!Array.isArray(data.sales)) {
+            const num = (...keys) => {
+                for (const k of keys) {
+                    const v = data[k];
+                    const n = typeof v === 'string' ? Number(v) : v;
+                    if (Number.isFinite(n)) return Math.round(n);
+                }
+                return null;
+            };
+            const avg = num('average', 'avg', 'mean', 'average_price', 'avg_price', 'moyenne');
+            const med = num('median', 'median_price');
+            const cnt = num('count', 'sales_count', 'total', 'nb', 'n');
+            if (avg !== null || med !== null) {
+                if (!storeSalesEntry._shapeLogged) {
+                    storeSalesEntry._shapeLogged = true;
+                    wmLog(`🔬 Cote (résumé) : champs reçus <span style="color:#888;font-size:9px;">${esc(Object.keys(data).join(', '))}</span>`);
+                }
+                const entry = {
+                    // Le résumé ne donne pas de médiane ? On prend la moyenne : c'est ce
+                    // que le site affiche lui-même, et mieux vaut ça que rien.
+                    median: med !== null ? med : avg,
+                    avg: avg !== null ? avg : med,
+                    count: cnt !== null ? cnt : 1, // > 0, sinon l'UI dirait « aucune vente »
+                    last: num('last', 'last_price', 'latest_price'),
+                    min: num('min', 'min_price', 'lowest'),
+                    max: num('max', 'max_price', 'highest'),
+                    summary: true,
+                    fetchedAt: Date.now(),
+                };
+                salesCache[cardId] = entry;
+                saveSalesCache();
+                return entry;
+            }
+            if (!storeSalesEntry._unknownLogged) {
+                storeSalesEntry._unknownLogged = true;
+                wmLog(`🔬 Cote : réponse non reconnue <span style="color:#888;font-size:9px;">${esc(Object.keys(data).join(', ') || '(vide)')}</span> — dis-le-moi si les cotes restent vides.`);
+            }
+            return null;
+        }
+
         const sales = (data.sales || []).filter(s => Number.isFinite(s.final_price));
         const prices = sales.map(s => s.final_price);
         // "recent" est trié du plus récent au plus ancien côté API ; sinon on trie nous-mêmes
@@ -815,8 +862,11 @@
     // Récupère et met en cache l'historique d'une carte (une requête)
     async function fetchCardSales(cardId) {
         try {
+            /* `?scope=summary` : c'est EXACTEMENT ce que le site demande (relevé dans
+               l'onglet Réseau, 200 OK), alors que notre appel sans paramètre se faisait
+               refuser en 403. Autant emprunter le chemin dont on sait qu'il répond. */
             const res = await fetch(
-                `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales`,
+                `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales?scope=summary`,
                 { credentials: "include" }
             );
             if (!res.ok) {
@@ -12951,11 +13001,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!alt) continue;
             // Les fenêtres modales du site (« Mettre aux enchères »…) contiennent une
             // mini-carte de même structure. Les décorer y ajoute un doublon inutile —
-            // le site y affiche déjà sa MOYENNE — et un bouton par-dessus ses propres
-            // commandes. On les reconnaît à leur conteneur en position fixe.
+            /* le site y affiche déjà sa MOYENNE — et un bouton par-dessus ses propres
+               commandes. On reconnaît une modale à son fond qui COUVRE LE VIEWPORT.
+               Tester seulement `position: fixed` était bien trop large : n'importe quel
+               conteneur de mise en page fixe (barre, coquille d'application) suffisait
+               alors à écarter toutes les cartes de la grille — l'inverse du but. */
             let inModal = false;
             for (let a = img.parentElement; a && a !== document.body; a = a.parentElement) {
-                if (getComputedStyle(a).position === 'fixed') { inModal = true; break; }
+                if (getComputedStyle(a).position !== 'fixed') continue;
+                const r = a.getBoundingClientRect();
+                if (r.width >= innerWidth * 0.9 && r.height >= innerHeight * 0.9) { inModal = true; break; }
             }
             if (inModal) continue;
 

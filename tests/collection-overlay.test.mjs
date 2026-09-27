@@ -61,12 +61,21 @@ const FAR = Array.from({ length: 40 }, (_, i) => [`Carte lointaine ${i}`, 'hors 
 const srv = http.createServer((_, res) => {
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
   res.end(`<!doctype html><html><head><title>wm</title></head><body>
-    <div style="display:flex;flex-wrap:wrap;gap:8px">${VISIBLE.map(c => tile(c[0], c[1])).join('')}</div>
+    <!-- La grille est ici ENVELOPPÉE dans un conteneur en position fixe qui ne couvre
+         PAS le viewport (colonne de contenu d'une coquille d'application). C'est le cas
+         qui cassait tout en production : tester seulement « position: fixed » sur les
+         ancêtres faisait passer chaque carte de la grille pour une carte de modale, et
+         plus rien n'était décoré. Un voisin en position fixe ne reproduit pas le bug —
+         il faut bien un ANCÊTRE. -->
+    <div style="position:fixed;left:200px;top:0;width:820px;height:600px;overflow:auto">
+      <div style="display:flex;flex-wrap:wrap;gap:8px">${VISIBLE.map(c => tile(c[0], c[1])).join('')}</div>
+    </div>
+    <div style="height:640px"></div>
     <div style="height:4000px"></div>
     <div style="display:flex;flex-wrap:wrap;gap:8px">${FAR.map(c => tile(c[0], c[1])).join('')}</div>
     <!-- Fenêtre modale « Mettre aux enchères » : même structure de carte, en position
          fixe. Elle ne doit PAS être décorée (le site y affiche déjà sa MOYENNE). -->
-    <div style="position:fixed;inset:0;z-index:60;background:rgba(0,0,0,0.7)">
+    <div id="faux-modal" style="position:fixed;inset:0;z-index:60;background:rgba(0,0,0,0.7)">
       ${tile('Hassidisme', 'mouvement religieux juif')}
     </div>
   </body></html>`);
@@ -109,12 +118,12 @@ await page.route('**/api/my-collection**', r => r.fulfill({ status: 200, content
     card: { id: cardId(t), wikipedia_title: t, rarity: 'SR' } })) }) }));
 let refuseSales = true; // le site refuse d'abord au bot, comme en production
 await page.route('**/api/marketplace/cards/*/sales**', r => {
-  const id = r.request().url().match(/cards\/([^/]+)\/sales/)[1];
-  salesAsked.push(id);
+  salesAsked.push(r.request().url());
   if (refuseSales) return r.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"Forbidden"}' });
+  // Forme RÉSUMÉ, celle que renvoie ?scope=summary et qu'utilise le site : pas de
+  // tableau `sales`, uniquement des agrégats.
   return r.fulfill({ status: 200, contentType: 'application/json',
-    body: JSON.stringify({ sales: [{ final_price: 40, settled_at: new Date().toISOString() },
-                                   { final_price: 48, settled_at: new Date().toISOString() }] }) });
+    body: JSON.stringify({ average: 44, count: 2, min: 40, max: 48 }) });
 });
 // Supabase : état des étiquettes, pose et retrait. On tient un état serveur simulé
 // pour vérifier la BASCULE, et pas seulement qu'une requête part.
@@ -154,7 +163,7 @@ const refusedText = await page.evaluate(() =>
 // sans que le bot ait à redemander quoi que ce soit.
 refuseSales = false;
 const askedBefore = salesAsked.length;
-await page.evaluate(id => fetch(`/api/marketplace/cards/${id}/sales`).catch(() => {}), 'card-0');
+await page.evaluate(id => fetch(`/api/marketplace/cards/${id}/sales?scope=summary`).catch(() => {}), 'card-0');
 await page.waitForTimeout(1500);
 const adoptedText = await page.evaluate(() =>
   (document.querySelector('.wm-coll-price') || {}).textContent || '');
@@ -169,7 +178,9 @@ const state = await page.evaluate(() => {
     buttons: document.querySelectorAll('.wm-coll-trash').length,
     // Le bouton doit avoir rejoint la pile d'icônes du site, à côté de l'étoile.
     nextToFav: !!document.querySelector('button[aria-label="Ajouter aux favoris"] + .wm-coll-trash'),
-    inModal: document.querySelectorAll('div[style*="fixed"] .wm-coll-price').length,
+    inModal: document.querySelectorAll('#faux-modal .wm-coll-price').length,
+    // Contre-épreuve : la grille enveloppée dans un conteneur fixe DOIT être décorée.
+    inFixedColumn: document.querySelectorAll('div[style*="820px"] .wm-coll-price').length,
   };
 });
 
@@ -195,6 +206,14 @@ if (!/≈\s*44/.test(adoptedText)) problems.push(`cote « ${adoptedText} » apr�
 if (askedAfter - askedBefore !== 1) problems.push(`${askedAfter - askedBefore} requête(s) /sales pendant la reprise — une seule, celle du site, est attendue`);
 // La mini-carte de la fenêtre modale ne doit pas être décorée.
 if (state.inModal > 0) problems.push(`${state.inModal} carte(s) décorée(s) dans la fenêtre modale`);
+if (state.inFixedColumn !== VISIBLE.length) {
+  problems.push(`${state.inFixedColumn}/${VISIBLE.length} carte(s) décorée(s) dans la colonne en position fixe — un conteneur fixe qui ne couvre pas l'écran n'est pas une modale`);
+}
+// Le bot doit demander la MÊME url que le site : c'est elle qui répond 200.
+const botCalls = salesAsked.filter(u => !/scope=summary/.test(u));
+if (botCalls.length) {
+  problems.push(`${botCalls.length} appel(s) /sales sans ?scope=summary — le bot doit emprunter le chemin qui répond`);
+}
 // Le contrôle qui compte : seules les cartes VISIBLES sont interrogées.
 if (salesAsked.length === 0) problems.push('aucune cote demandée — le scénario ne prouve rien');
 if (salesAsked.length > VISIBLE.length + 2) {
