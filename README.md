@@ -51,6 +51,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/trash-seller-safety.test.mjs` : vérifie qu'arriver sur `/collection` ne met
   RIEN en vente tout seul, et qu'une carte n'est vendue que si la fenêtre ouverte affiche
   bien son titre. Validé par mutation (rétablir l'ancien comportement fait échouer le test).
+- `tests/snipe-race.test.mjs` : le mode Fourbe tire bien dans sa fenêtre, un blocage par
+  l'interrupteur maître est expliqué dans le log, et une mise refusée parce qu'un autre
+  joueur a misé en même temps repart au nouveau minimum sans dépasser le plafond.
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -134,6 +137,9 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Trash Seller : succès de la mise en vente lu sur la réponse du site (plus de vente
       créée comptée comme échec, ni de double mise en vente), retour automatique sur
       /collection, aperçu de tout le pool (audit #36)
+- [x] Mises : relance automatique au nouveau minimum quand un autre joueur mise en même
+      temps, blocage par l'interrupteur maître rendu visible, Hunter soumis aux mêmes
+      plafonds que les autres chemins (audit #37)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

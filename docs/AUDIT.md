@@ -652,6 +652,49 @@ vendues, dans quel ordre ») restait sans réponse.
 et le test exige que la vente soit enregistrée. Mutation de contrôle (retour à l'attente de
 900 ms) : le test voit l'échec ET la double mise en vente de la même carte.
 
+### 37. Le Fourbe « activé » qui ne misait jamais, et la mise perdue à égalité
+Deux retours du 27/09, deux mécanismes différents.
+
+**1. L'interrupteur maître bloquait en silence.** `autoBidAllowed()` commençait par
+`if (!autoSnipeEnabled) return false;` — sans un mot. Or la carte, elle, affichait
+« 🕵️ Fourbe activé (snipe à ~60s de la fin) ». L'utilisateur voyait l'enchère passer sous
+les 60 s et aucune mise partir, sans la moindre ligne pour relier les deux. Le bandeau
+disait bien « ⏸️ Mises auto EN PAUSE », mais rien ne le rattachait à la carte armée.
+
+**2. À mise simultanée, c'est l'autre qui passait.** Entre le calcul du montant et
+l'arrivée du POST, un autre joueur peut miser : le site refuse alors le nôtre (« montant
+trop bas ») et les cinq chemins de mise se contentaient d'un `wmLog('… échoué')`. Sur le
+snipe, un tick suivant pouvait repasser ; sur le Chasseur, le Hunter ou un mot-clé
+prioritaire — une mise unique à la découverte — **la mise était simplement perdue**.
+
+**3. Angle mort trouvé en vérifiant l'auto-bid.** `runHunterAutoBidPass()` ne passait pas
+par le garde-fou commun : il ne consultait que son propre seuil (`autoSnipePrice`). Ni le
+plafond global ni la limite de mises par heure ne s'y appliquaient — le seul des cinq
+chemins dans ce cas, et justement celui qui avait causé le « il mise sur tout » (#17).
+
+**4. Précision du snipe.** `computeHotLaneInterval()` figeait à **20 s** la fenêtre de
+polling serré (150 ms) et calculait le temps restant sur `Date.now()`. Avec un snipe réglé
+à 60 s, la décision de tir tombait donc sur un tick lent (jusqu'à 2 s de retard), et le
+décalage PC↔serveur (3,0 s mesurés chez l'utilisateur) s'ajoutait à l'erreur.
+
+**✅ Corrigé (1.3.13-fork.21)**
+
+- `warnAutoBidsPaused()` : une ligne de log explicite (1 par minute au plus) quand
+  l'interrupteur bloque, **au moment du tir** comme **au moment de l'armement** (bouton
+  Fourbe, bouton auto-bid, mot-clé, Hunter agressif). Le bandeau affiche en plus le nombre
+  d'enchères armées qui ne miseront pas.
+- `placeBid()` : point de passage unique des cinq chemins. Sur refus, il relit l'enchère,
+  recalcule le minimum, **revérifie tous les plafonds**, et retente (3 essais, ~180 ms).
+  Un refus définitif (terminée, solde) n'est pas retenté. Le log signale la mise rattrapée.
+- Le Hunter passe désormais par `autoBidAllowed()` comme les quatre autres.
+- La fenêtre de polling serré suit le réglage (`snipeSecondsBefore` + 10 s) et le temps
+  restant se calcule sur l'horloge **serveur**.
+
+`tests/snipe-race.test.mjs` : le snipe tire sous la fenêtre, la pause est expliquée, la
+course est rattrapée à la hausse, et le rattrapage respecte le plafond. Mutations de
+contrôle : sans la relance interne, la mise unique du Chasseur ne monte plus (39 → 39) ;
+sans le log, le blocage redevient invisible.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

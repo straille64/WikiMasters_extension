@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.20
+// @version      1.3.13-fork.21
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.20';
+    const WM_VERSION = '1.3.13-fork.21';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3306,9 +3306,25 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     let _lastRateLogTs = 0;
     const _capLogged = new Set();
+    // Un blocage par l'interrupteur maître doit SE VOIR. Sans ça, armer le Fourbe ou
+    // l'auto-bid sur une carte affichait « activé » puis ne misait jamais, sans une ligne
+    // pour dire pourquoi — le symptôme exact remonté (« le mode fourbe ne fonctionne pas »).
+    let _pausedLogTs = 0;
+    function warnAutoBidsPaused(what) {
+        if (autoSnipeEnabled) return false;
+        if (Date.now() - _pausedLogTs < 60000) return true; // pas plus d'1 ligne par minute
+        _pausedLogTs = Date.now();
+        wmLog(`⏸️ <b>Mises auto EN PAUSE</b> — ${esc(what)} ne misera pas. Clique sur le bandeau « ⏸️ Mises auto EN PAUSE » en haut du Market Watcher pour armer.`);
+        return true;
+    }
+
     function autoBidAllowed(auction, plannedAmount, contexte) {
         // 1) Interrupteur maître : les mises auto sont-elles armées ?
-        if (!autoSnipeEnabled) return false;
+        if (!autoSnipeEnabled) {
+            const t = (auction && auction.card && auction.card.wikipedia_title) || contexte || 'la mise auto';
+            warnAutoBidsPaused(t);
+            return false;
+        }
 
         // 2) Plafond de prix global — jamais dépassé, quel que soit le mot-clé.
         const globalCap = getSetting('globalBidCap');
@@ -3334,6 +3350,68 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // 4) Plafond propre à cette enchère (réglé par mot-clé ou à la main).
         return autoBidWithinCap(auction, plannedAmount);
+    }
+
+    /* ── Envoi d'une mise, avec rattrapage de la course ──
+       Entre le calcul du montant et l'arrivée du POST, un autre joueur peut miser : le site
+       refuse alors la nôtre (« montant trop bas ») et, avant, on abandonnait sur un simple
+       log — la mise de l'autre passait, pas la nôtre. On relit donc l'enchère, on recalcule
+       le minimum, on revérifie les plafonds, et on retente. Point de passage unique des cinq
+       chemins de mise (Hunter, Chasseur, prioritaire, snipe fourbe, riposte hot-lane). */
+    const BID_RETRY_MAX = 3;
+    const BID_RETRY_DELAY_MS = 180;
+    // Refus qui veulent dire « le prix a bougé » → relancer a un sens.
+    const BID_STALE_RE = /trop\s*bas|too\s*low|higher|sup[ée]rieur|minimum|montant|amount|outbid|surench/i;
+    // Refus définitifs → insister ne ferait que spammer le serveur.
+    const BID_FATAL_RE = /termin|ended|closed|expir|finished|insufficient|fonds|solde|balance|propre|own|self/i;
+
+    function bidRetryNote(r) {
+        if (!r || !r.attempts || r.attempts < 2) return '';
+        return ` <span style="color:#22d3ee;font-size:9px;">(rattrapée après ${r.attempts} essais — quelqu'un misait en même temps)</span>`;
+    }
+
+    async function placeBid(auction, amount, contexte) {
+        let a = auction, amt = amount, lastErr = null;
+        for (let attempt = 1; attempt <= BID_RETRY_MAX; attempt++) {
+            let res = null, data = {};
+            try {
+                res = await fetch(`${MARKET_API_BASE}/${a.id}/bid`, {
+                    method: 'POST', credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ amount: amt })
+                });
+                data = await res.json().catch(() => ({}));
+            } catch (e) {
+                lastErr = (e && e.message) || 'réseau';
+            }
+            if (res && res.ok) {
+                markAuctionAsMine(a.id, amt, a);
+                return { ok: true, amount: amt, attempts: attempt, data, auction: a };
+            }
+            lastErr = (data && (data.error || data.message)) || (res ? `HTTP ${res.status}` : lastErr) || 'erreur';
+            if (attempt === BID_RETRY_MAX) break;
+            if (BID_FATAL_RE.test(String(lastErr))) break;
+
+            await new Promise(r => setTimeout(r, BID_RETRY_DELAY_MS));
+            let fresh = null;
+            try { fresh = await fetchSingleAuction(a.id); } catch(e) {}
+            if (!fresh || !fresh.id) break;          // enchère illisible → on ne tire pas à l'aveugle
+            a = fresh;
+            if (isAuctionOver(a)) { lastErr = 'enchère terminée'; break; }
+            if (iAmLeading(a)) return { ok: true, amount: amt, attempts: attempt, alreadyLeading: true, auction: a };
+
+            const next = minNextBid(a);
+            if (!Number.isFinite(next) || next <= 0) break;
+            // Le nouveau montant doit repasser TOUS les garde-fous : un rattrapage qui
+            // ignorerait le plafond serait exactement la surenchère sans limite qu'on a
+            // supprimée. Un refus ici est un arrêt normal, pas un échec.
+            if (!autoBidAllowed(a, next, contexte)) {
+                return { ok: false, amount: next, reason: 'plafond ou limite atteint après surenchère', blocked: true, auction: a };
+            }
+            if (next !== amt) lastErr = `${lastErr} → relance à ${next} 💰`;
+            amt = next;
+        }
+        return { ok: false, amount: amt, reason: lastErr || 'erreur', auction: a };
     }
 
     function autoBidWithinCap(auction, plannedAmount) {
@@ -3519,16 +3597,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         autobid: { label: '🤖 Auto-bid', color: '#4ade80', border: 'rgba(74,222,128,0.45)',  bg: 'rgba(74,222,128,0.07)' },
         fourbe:  { label: '🕵️ Fourbe',   color: '#c084fc', border: 'rgba(192,132,252,0.5)',  bg: 'rgba(192,132,252,0.07)' }
     };
+    window.wmWarnAutoBidsPaused = warnAutoBidsPaused; // pour les handlers inline des boutons
     window.wmCycleBidMode = function(id) {
         const title = activeHitsMap.get(id)?.auction?.card?.wikipedia_title || '?';
         const mode = bidModeOf(id);
         if (mode === 'manual') {
             autoBidSet.add(id); saveAutoBidSet();
             wmLog(`🤖 Auto-bid activé (riposte auto en cas de surenchère) : <b>${esc(title)}</b>`);
+            warnAutoBidsPaused(`l'auto-bid sur « ${title} »`);
         } else if (mode === 'autobid') {
             autoBidSet.delete(id); saveAutoBidSet();
             snipeSet.add(id); saveSnipeSet();
             wmLog(`🕵️ Fourbe activé (snipe à ~${getSetting('snipeSecondsBefore')}s de la fin) : <b>${esc(title)}</b>`);
+            warnAutoBidsPaused(`le Fourbe sur « ${title} »`);
         } else {
             snipeSet.delete(id); saveSnipeSet();
             // Si c'est le Hunter agressif qui avait armé cette enchère, il lâche prise et rend
@@ -3650,8 +3731,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        d'œil : est-ce que le bot a le droit de miser, oui ou non. */
     function autoSnipeLabel(enabled) {
         const nb = WATCHLIST.filter(e => e.enabled !== false && e.mode === 'auto').length;
-        return enabled
-            ? `🤖 Mises auto ARMÉES · ${nb} mot${nb > 1 ? 's' : ''}-clé${nb > 1 ? 's' : ''}`
+        if (enabled) return `🤖 Mises auto ARMÉES · ${nb} mot${nb > 1 ? 's' : ''}-clé${nb > 1 ? 's' : ''}`;
+        // En pause, le nombre d'enchères déjà armées (Fourbe / auto-bid) est L'information
+        // utile : « Fourbe activé » sur une carte laissait croire que ça miserait, alors que
+        // l'interrupteur bloquait tout en silence.
+        const armed = new Set([...autoBidSet, ...snipeSet]).size;
+        return armed > 0
+            ? `⏸️ Mises auto EN PAUSE · ${armed} enchère${armed > 1 ? 's' : ''} armée${armed > 1 ? 's' : ''} ne misera${armed > 1 ? 'ont' : ''} PAS`
             : '⏸️ Mises auto EN PAUSE';
     }
 
@@ -3688,25 +3774,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
             if (skipIfAuctionOver(a, 'Hunter')) { bidLockSet.delete(a.id); continue; }
             const bidAmount = minNextBid(a);
+            // Ce chemin ne passait PAS par le garde-fou commun : il ne connaissait que son
+            // propre seuil (autoSnipePrice), donc ni le plafond global ni la limite horaire
+            // ne s'y appliquaient. C'est le seul des cinq chemins qui pouvait les ignorer.
+            if (!autoBidAllowed(a, bidAmount, 'Hunter')) { bidLockSet.delete(a.id); continue; }
             try {
-                const res = await fetch(
-                    `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                    { method: "POST", credentials: "include",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ amount: bidAmount }) }
-                );
-                const data = await res.json().catch(() => ({}));
+                const r = await placeBid(a, bidAmount, 'Hunter');
                 const title = a.card?.wikipedia_title || "?";
                 const rar = (a.card?.rarity || '').toUpperCase();
-                if (res.ok) {
-                    markAuctionAsMine(a.id, bidAmount, a);
+                if (r.ok) {
                     placed++;
                     const reasonStr = decision.reason ? ` <span style="color:#666;font-size:9px;">(${esc(decision.reason)})</span>` : '';
-                    wmLog(`🤖 Hunter : <b>${esc(title)}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>${esc(reasonStr)}`);
-                    sendToDiscord("🤖 Auto-bid place : **" + title + "** a **" + bidAmount + " coins**", 5763719, 'market');
+                    wmLog(`🤖 Hunter : <b>${esc(title)}</b> [${rar}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${esc(reasonStr)}${bidRetryNote(r)}`);
+                    sendToDiscord("🤖 Auto-bid place : **" + title + "** a **" + r.amount + " coins**", 5763719, 'market');
                 } else {
-                    wmLog(`⚠️ Hunter échoué : <b>${esc(title)}</b> [${rar}] · ${esc(data?.error || 'erreur')}`);
-                    sendToDiscord("⚠️ Auto-bid echoue : **" + title + "** - " + (data?.error || "erreur inconnue"), 15548997, 'market');
+                    wmLog(`⚠️ Hunter échoué : <b>${esc(title)}</b> [${rar}] · ${esc(r.reason)}`);
+                    sendToDiscord("⚠️ Auto-bid echoue : **" + title + "** - " + r.reason, 15548997, 'market');
                 }
             } catch(e) {} finally { bidLockSet.delete(a.id); }
             await new Promise(r => setTimeout(r, bidDelayMs(a)));
@@ -3737,6 +3820,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const title = a.card?.wikipedia_title || '?';
             const rar = (a.card?.rarity || '').toUpperCase();
             wmLog(`🕵️ Hunter agressif : <b>${esc(title)}</b> [${rar}] — snipe armé à ~${getSetting('snipeSecondsBefore')}s de la fin, plafond <span style="color:#fbbf24;">${decision.cap} 💰</span>`);
+            warnAutoBidsPaused('le Hunter agressif');
         }
         return armed;
     }
@@ -4300,19 +4384,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
                     if (skipIfAuctionOver(a, 'Chasseur ciblé')) { bidLockSet.delete(a.id); continue; }
                     try {
-                        const res = await fetch(
-                            `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                            { method: "POST", credentials: "include",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ amount: bidAmount }) }
-                        );
-                        const data = await res.json().catch(() => ({}));
-                        if (res.ok) {
-                            markAuctionAsMine(a.id, bidAmount, a);
-                            wmLog(`🎯 Chasseur (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${esc(title)}</b> [${rar}] → mise <span style="color:#fbbf24;">${bidAmount} 💰</span>${h.mode === 'fourbe' ? ' · snipe armé en fin' : ' · riposte activée'}`);
-                            sendToDiscord("🎯 Chasseur : **" + title + "** mise **" + bidAmount + " coins** (mode " + h.mode + ", plafond " + h.cap + ")", 3447003, 'market');
+                        const r = await placeBid(a, bidAmount, 'Chasseur ciblé');
+                        if (r.ok) {
+                            wmLog(`🎯 Chasseur (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${esc(title)}</b> [${rar}] → mise <span style="color:#fbbf24;">${r.amount} 💰</span>${h.mode === 'fourbe' ? ' · snipe armé en fin' : ' · riposte activée'}${bidRetryNote(r)}`);
+                            sendToDiscord("🎯 Chasseur : **" + title + "** mise **" + r.amount + " coins** (mode " + h.mode + ", plafond " + h.cap + ")", 3447003, 'market');
                         } else {
-                            wmLog(`⚠️ Chasseur échoué : <b>${esc(title)}</b> [${rar}] · ${esc(data?.error || 'erreur')}`);
+                            wmLog(`⚠️ Chasseur échoué : <b>${esc(title)}</b> [${rar}] · ${esc(r.reason)}`);
                         }
                     } catch(e) {} finally { bidLockSet.delete(a.id); }
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
@@ -4338,24 +4415,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     if (skipIfAuctionOver(a, 'Bid prioritaire')) { bidLockSet.delete(a.id); continue; }
                     const bidAmount = minNextBid(a);
                     try {
-                        const res = await fetch(
-                            `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                            { method: "POST", credentials: "include",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ amount: bidAmount }) }
-                        );
-                        const data = await res.json().catch(() => ({}));
+                        const r = await placeBid(a, bidAmount, 'Mot-clé prioritaire');
                         const title = a.card?.wikipedia_title || "?";
                         const rar = (a.card?.rarity || '').toUpperCase();
-                        if (res.ok) {
-                            markAuctionAsMine(a.id, bidAmount, a);
-                            wmLog(`⭐ Mot-clé prioritaire : <b>${esc(title)}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                        if (r.ok) {
+                            wmLog(`⭐ Mot-clé prioritaire : <b>${esc(title)}</b> [${rar}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${bidRetryNote(r)}`);
                             sendToDiscord(
-                                "⭐ Auto-bid prioritaire : **" + title + "** à **" + bidAmount + " coins**",
+                                "⭐ Auto-bid prioritaire : **" + title + "** à **" + r.amount + " coins**",
                                 16766720, 'market'
                             );
                         } else {
-                            wmLog(`⚠️ Bid prioritaire échoué : <b>${esc(title)}</b> [${rar}] · ${esc(data?.error || 'erreur')}`);
+                            wmLog(`⚠️ Bid prioritaire échoué : <b>${esc(title)}</b> [${rar}] · ${esc(r.reason)}`);
                         }
                     } catch(e) {} finally { bidLockSet.delete(a.id); }
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
@@ -4377,6 +4447,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     const title = a.card?.wikipedia_title || '?';
                     const rar = (a.card?.rarity || '').toUpperCase();
                     wmLog(`🕵️ Fourbe armé (mot-clé) : <b>${esc(title)}</b> [${rar}] — snipe à ~${getSetting('snipeSecondsBefore')}s de la fin`);
+                    warnAutoBidsPaused('le Fourbe armé par mot-clé');
                 }
                 if (armedFourbe) saveSnipeSet();
 
@@ -4984,6 +5055,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             btn.style.color = '#4ade80';
                             btn.style.borderColor = 'rgba(74,222,128,0.4)';
                             if(window.wmLog) window.wmLog('🤖 Auto-bid activé : <b>' + title + '</b> [' + rar + ']');
+                            if(window.wmWarnAutoBidsPaused) window.wmWarnAutoBidsPaused('l\\'auto-bid sur « ' + title + ' »');
                             // Mutuellement exclusif avec le mode Fourbe
                             if(window.snipeSet && window.snipeSet.has(auctionId)) {
                                 window.snipeSet.delete(auctionId);
@@ -5037,6 +5109,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             btn.style.color = '#c084fc';
                             btn.style.borderColor = 'rgba(192,132,252,0.5)';
                             if(window.wmLog) window.wmLog('🕵️ Fourbe activé (snipe en fin d\\'enchère) : <b>' + title + '</b>');
+                            if(window.wmWarnAutoBidsPaused) window.wmWarnAutoBidsPaused('le Fourbe sur « ' + title + ' »');
                             // Mutuellement exclusif avec l'auto-bid réactif
                             if(window.autoBidSet && window.autoBidSet.has(auctionId)) {
                                 window.autoBidSet.delete(auctionId);
@@ -5131,14 +5204,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         tracked.forEach(id => {
             const hit = activeHitsMap.get(id);
             if (!hit) return;
-            const ms = new Date(hit.endAt).getTime() - Date.now();
+            // Horloge SERVEUR : c'est elle qui décide de la fin de l'enchère. Avec un décalage
+            // PC↔serveur de quelques secondes, se baser sur Date.now() resserrait le polling
+            // trop tard (ou trop tôt) — pile sur la seule fenêtre qui compte.
+            const ms = new Date(hit.endAt).getTime() - serverNow();
             if (ms > 0 && ms < minMs) minMs = ms;
             if (snipeSet.has(id) && ms > 0 && ms < minSnipeMs) minSnipeMs = ms;
         });
 
-        // Snipe imminent : polling très serré (~150ms) pour tirer pile au bon moment
-        // quand une enchère "Fourbe" approche de sa fenêtre de ~10s.
-        if (minSnipeMs < 20_000) return 150;
+        // Snipe imminent : polling très serré (~150ms) pour tirer pile au bon moment. La
+        // fenêtre suit le RÉGLAGE (+10s de marge) : figée à 20s, un snipe réglé à 60s était
+        // décidé par un tick lent, donc jusqu'à 2s en retard sur la cible.
+        const snipeWindowMs = (getSetting('snipeSecondsBefore') + 10) * 1000;
+        if (minSnipeMs < snipeWindowMs) return 150;
 
         // Aucune enchère trackée connue dans activeHitsMap → on poll quand même
         // toutes les 5s pour découvrir leur état initial.
@@ -5200,21 +5278,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const titleSn = a.card?.wikipedia_title || '?';
                         const rarSn = (a.card?.rarity || '').toUpperCase();
                         try {
-                            const res = await fetch(
-                                `${MARKET_API_BASE}/${a.id}/bid`,
-                                { method: "POST", credentials: "include",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ amount: bidAmount }) }
-                            );
-                            if (res.ok) {
-                                markAuctionAsMine(a.id, bidAmount, a);
+                            // Le snipe est LE moment où deux joueurs tirent en même temps :
+                            // placeBid relit l'enchère et repart au nouveau minimum plutôt que
+                            // de laisser passer la mise adverse.
+                            const r = await placeBid(a, bidAmount, 'Snipe fourbe');
+                            if (r.ok) {
                                 const secLeft = Math.round(remaining / 1000);
-                                wmLog(`🕵️ Fourbe (snipe à ${secLeft}s) : <b>${esc(titleSn)}</b> [${rarSn}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                                wmLog(`🕵️ Fourbe (snipe à ${secLeft}s) : <b>${esc(titleSn)}</b> [${rarSn}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${bidRetryNote(r)}`);
                                 fetchBalance().catch(() => {});
-                                sendToDiscord("🕵️ Snipe fourbe : **" + titleSn + "** → **" + bidAmount + " 💰**", 10181046, 'market');
+                                sendToDiscord("🕵️ Snipe fourbe : **" + titleSn + "** → **" + r.amount + " 💰**", 10181046, 'market');
                             } else {
-                                const errData = await res.json().catch(() => ({}));
-                                wmLog(`⚠️ Fourbe échoué : <b>${esc(titleSn)}</b> [${rarSn}] · ${esc(errData?.error || 'erreur')}`);
+                                wmLog(`⚠️ Fourbe échoué : <b>${esc(titleSn)}</b> [${rarSn}] · ${esc(r.reason)}`);
                             }
                         } catch(e) {
                             wmLog(`⚠️ Fourbe exception : <b>${esc(titleSn)}</b> · ${esc(e.message)}`);
@@ -5275,25 +5349,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         bidLockSet.add(a.id);
                         try {
                             // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane)
-                            const res = await fetch(
-                                `${MARKET_API_BASE}/${a.id}/bid`,
-                                { method: "POST", credentials: "include",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ amount: bidAmount }) }
-                            );
-                            if (res.ok) {
-                                markAuctionAsMine(a.id, bidAmount, a);
-                                wmLog(`⚡ Hot-lane bid : <b>${esc(titleOb)}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                            const r = await placeBid(a, bidAmount, 'Riposte hot-lane');
+                            if (r.ok) {
+                                wmLog(`⚡ Hot-lane bid : <b>${esc(titleOb)}</b> [${rarOb}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${bidRetryNote(r)}`);
                                 // Refresh balance en arrière-plan, sans bloquer le tick
                                 fetchBalance().catch(() => {});
                                 sendToDiscord(
-                                    "⚡ Hot-lane bid : **" + titleOb + "** → **" + bidAmount + " 💰**",
+                                    "⚡ Hot-lane bid : **" + titleOb + "** → **" + r.amount + " 💰**",
                                     5763719,
                                     'market'
                                 );
                             } else {
-                                const errData = await res.json().catch(() => ({}));
-                                wmLog(`⚠️ Hot-lane bid échoué : <b>${esc(titleOb)}</b> [${rarOb}] · ${esc(errData?.error || 'erreur')}`);
+                                wmLog(`⚠️ Hot-lane bid échoué : <b>${esc(titleOb)}</b> [${rarOb}] · ${esc(r.reason)}`);
                             }
                         } catch(e) {
                             wmLog(`⚠️ Hot-lane bid exception : <b>${esc(titleOb)}</b> · ${esc(e.message)}`);
