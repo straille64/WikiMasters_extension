@@ -347,6 +347,43 @@ Le bouton de défausse pose l'étiquette de vente sur un exemplaire
 (`ensureTrashTagId` → `findCurrentUserCardId` → `addTagToUserCard`) ; le Trash Seller
 s'occupe de la vente. Rien n'est supprimé.
 
+### 25. Le scan traversait ~217 pages d'enchères mortes
+Capture réseau du 27/09 : **10 820 annonces terminées sur 12 137** relevées, soit 89 %,
+et `⚠️ Scan tronqué au plafond de 300 pages`. Le site laisse en liste ce qu'il n'a pas
+encore soldé, et le scan demande `sort=ending_soon` : ces annonces mortes ont le
+`end_at` le plus ancien et occupent donc **les premières pages**. Le scan les
+téléchargeait toutes — ~217 pages — avant d'atteindre la première annonce vivante, puis
+se tronquait au plafond avant d'avoir tout vu. Double conséquence : des résultats
+manquants, et 207 requêtes par cycle qui provoquaient les 403 en cascade.
+
+**✅ Corrigé (1.3.13-fork.11)** — « est terminée » est **monotone** dans cet ordre de
+tri : dès qu'une page contient du vivant, toutes les suivantes en contiennent. La
+première page vivante se trouve donc par recherche exponentielle puis dichotomie
+(`findFirstLivePage`), soit une dizaine de requêtes au lieu de deux cents. Le scan
+démarre une page avant la frontière, par sécurité — des enchères expirent pendant le
+scan et la frontière bouge. La dichotomie n'est tentée que si la page 1 est *entièrement*
+morte, donc elle ne coûte rien dans le cas normal. La cadence du scan suivant est
+calculée sur les pages **réellement téléchargées**, pas sur le numéro de la dernière
+page : sauter 200 pages ne doit pas être facturé comme si on les avait chargées.
+
+`tests/market-dead-pages.test.mjs` : 40 pages mortes puis 3 vivantes → les 150 annonces
+vivantes sont trouvées en ne téléchargeant que 14 pages sur 43. Sur le build d'avant,
+le test en télécharge 43 sur 43.
+
+### 26. Défausse à sens unique
+L'étiquette de vente posée depuis la page Collection ne pouvait plus être retirée par le
+même bouton : un second clic la reposait. Or défausser est une décision qu'on révise.
+
+**✅ Corrigé (1.3.13-fork.11)** — `toggleTrashTag()` relit l'état réel côté serveur puis
+pose ou retire, et le bouton **montre** cet état (🗑️ libre / ♻️ étiquetée) au lieu de
+laisser deviner ce qu'un clic va faire. L'état initial de toute la collection vient
+d'**une seule** requête (`loadTrashTaggedCardIds`), pas d'une par carte. Un retrait
+accepté mais sans ligne touchée (règle RLS) est signalé comme un échec, et non comme un
+succès silencieux.
+
+`tests/collection-overlay.test.mjs` simule l'état serveur et vérifie la bascule dans les
+deux sens : pose → ♻️, retrait → 🗑️, avec exactement un POST et un DELETE.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.10
+// @version      1.3.13-fork.11
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.10';
+    const WM_VERSION = '1.3.13-fork.11';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -2776,6 +2776,50 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return null;
     }
 
+    /* ── Sauter les pages d'enchères mortes ──
+       Le site laisse en liste les enchères qu'il n'a pas encore soldées, et le scan
+       demande `sort=ending_soon` : elles ont donc le end_at le plus ancien et occupent
+       les premières pages. Sur ce marché, 10 820 annonces mortes pour 12 137 relevées
+       (89 %) — soit ~217 pages de cadavres à traverser avant la première annonce
+       vivante, et un scan qui se tronquait au plafond avant d'avoir tout vu.
+
+       « Est terminée » est MONOTONE dans cet ordre de tri : une fois qu'une page
+       contient du vivant, toutes les suivantes en contiennent. On cherche donc la
+       première page vivante par recherche exponentielle puis dichotomie — une dizaine
+       de requêtes au lieu de deux cents. */
+    async function findFirstLivePage(cap) {
+        const probe = async (p) => {
+            try {
+                const d = await fetchMarketPage(p);
+                const list = (d && d.auctions) || [];
+                return { empty: list.length === 0, live: list.some(a => !isAuctionOver(a)) };
+            } catch (e) {
+                return null; // page refusée : on ne conclut rien, la dichotomie l'ignore
+            }
+        };
+        // 1) Borne haute : on double jusqu'à toucher du vivant (ou le bout de la liste).
+        let lo = 1, hi = 0;
+        for (let p = 2; p <= cap; p = Math.min(p * 2, cap)) {
+            const r = await probe(p);
+            await new Promise(r2 => setTimeout(r2, MARKET_BATCH_PAUSE_MS));
+            if (!r) { hi = p; break; }          // refus → on s'arrête là, prudence
+            if (r.live || r.empty) { hi = p; break; }
+            lo = p;                              // page entièrement morte
+            if (p === cap) { hi = cap; break; }
+        }
+        if (!hi) return 1;
+        // 2) Dichotomie sur (lo, hi] : première page contenant du vivant.
+        while (lo + 1 < hi) {
+            const mid = Math.floor((lo + hi) / 2);
+            const r = await probe(mid);
+            await new Promise(r2 => setTimeout(r2, MARKET_BATCH_PAUSE_MS));
+            if (!r) break;
+            if (r.live || r.empty) hi = mid; else lo = mid;
+        }
+        // Une page de marge : des enchères expirent pendant le scan, la frontière bouge.
+        return Math.max(1, hi - 1);
+    }
+
     // Fetch TOUTES les pages et retourne tous les auctions
     async function fetchAllMarketAuctions(onProgress) {
         // Déduplication à l'absorption : les enchères sont triées par fin proche et le
@@ -2819,10 +2863,23 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // `hasMore` quand l'API le donne, sinon repli sur « la page était pleine ».
         const firstMore = hasMoreOf(first);
         let more = firstMore !== null ? firstMore : firstList.length >= MARKET_PAGE_LIMIT;
+
+        /* Page 1 pleine et 100 % morte → toutes les pages de tête le sont aussi. On
+           saute directement à la première page vivante au lieu de les télécharger une
+           à une : c'est ce qui faisait tronquer le scan au plafond. */
+        let startPage = 2;
+        if (more && firstList.length > 0 && firstList.every(a => isAuctionOver(a))) {
+            const firstLive = await findFirstLivePage(expectedPages || MARKET_MAX_PAGES);
+            if (firstLive > 2) {
+                startPage = firstLive;
+                wmLog(`⏭️ ${firstLive - 1} page(s) d'enchères déjà terminées sautées — le scan démarre à la page ${firstLive}.`);
+            }
+        }
         // Pages refusées (403/429) : elles étaient silencieusement abandonnées, soit ~50
         // annonces perdues chacune — d'où des résultats manquants sans le moindre signal.
         const failedPages = [];
-        for (let start = 2; more && start <= MARKET_MAX_PAGES; start += MARKET_PAGE_CONCURRENCY) {
+        let pagesFetched = 1;
+        for (let start = startPage; more && start <= MARKET_MAX_PAGES; start += MARKET_PAGE_CONCURRENCY) {
             const batch = [];
             for (let p = start; p < start + MARKET_PAGE_CONCURRENCY && p <= MARKET_MAX_PAGES; p++) {
                 if (expectedPages && p > expectedPages) break;
@@ -2844,6 +2901,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 else if (r.list.length < MARKET_PAGE_LIMIT) more = false;
             }
             lastPage = batch[batch.length - 1];
+            pagesFetched += batch.length;
             if (onProgress) onProgress(lastPage, expectedPages || lastPage, auctions.length);
 
             // Garde-fou : un lot entier sans aucune nouveauté = l'API ignore le paramètre
@@ -2882,7 +2940,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // Le total affiché doit refléter ce qu'on a réellement vu : quand l'API annonce
         // 0 (le bug d'origine), le panneau affichait « 0 annonces » en plein scan.
-        lastScanPageCount = lastPage;
+        // Cadence du scan suivant : proportionnelle aux pages RÉELLEMENT téléchargées,
+        // pas au numéro de la dernière page — sauter 200 pages mortes ne doit pas être
+        // facturé comme si on les avait chargées.
+        lastScanPageCount = pagesFetched;
         return { auctions, total: Math.max(reportedTotal || 0, auctions.length), totalPages: expectedPages || lastPage };
     }
 
@@ -12744,6 +12805,98 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return added;
     }
 
+    /* ── Étiquette de vente : poser ET retirer ──
+       Le bouton était à sens unique. Or défausser est une décision qu'on révise : il
+       doit pouvoir enlever l'étiquette aussi bien que la poser, et surtout MONTRER
+       l'état courant — sans ça on ne sait pas ce qu'un clic va faire. */
+    const trashTaggedCardIds = new Set();
+    let trashTaggedLoadedAt = 0;
+
+    function supabaseAuthHeaders() {
+        const { token } = getSupabaseAccessToken();
+        return {
+            'apikey': SUPABASE_KEY,
+            'Authorization': `Bearer ${token || SUPABASE_KEY}`,
+            'Accept': 'application/json',
+        };
+    }
+
+    /* Une seule requête donne toutes les cartes déjà étiquetées du compte — bien mieux
+       qu'une interrogation par carte sur une collection de plusieurs centaines. */
+    async function loadTrashTaggedCardIds(force) {
+        if (!force && Date.now() - trashTaggedLoadedAt < 60000) return trashTaggedCardIds;
+        const tagId = await ensureTrashTagId();
+        if (!tagId) return trashTaggedCardIds;
+        try {
+            const res = await fetch(
+                `${SUPABASE_URL}/user_card_tags?tag_id=eq.${tagId}&select=user_cards(card_id)&limit=1000`,
+                { credentials: 'omit', headers: supabaseAuthHeaders() });
+            if (!res.ok) return trashTaggedCardIds;
+            const rows = await res.json();
+            trashTaggedCardIds.clear();
+            for (const r of (rows || [])) {
+                const id = r && r.user_cards && r.user_cards.card_id;
+                if (id) trashTaggedCardIds.add(id);
+            }
+            trashTaggedLoadedAt = Date.now();
+        } catch (e) {}
+        return trashTaggedCardIds;
+    }
+
+    /* Bascule l'étiquette de vente sur une carte. Relit l'état réel côté serveur avant
+       d'agir : l'état affiché peut dater, et poser deux fois ou retirer une étiquette
+       absente produirait un faux succès. */
+    async function toggleTrashTag(cardId, title) {
+        const tagId = await ensureTrashTagId();
+        if (!tagId) {
+            return { ok: false, error: `étiquette « ${getSellTagName()} » introuvable sur ton compte — crée-la sur le site` };
+        }
+        const { token } = getSupabaseAccessToken();
+        const claims = decodeJWT(token);
+        const userId = claims && claims.sub;
+        if (!userId || !token) return { ok: false, error: 'session Supabase absente — recharge la page' };
+
+        let items = [];
+        try {
+            const res = await fetch(
+                `${SUPABASE_URL}/user_cards?card_id=eq.${cardId}&user_id=eq.${userId}&select=id,user_card_tags(tag_id)&limit=20`,
+                { credentials: 'omit', headers: supabaseAuthHeaders() });
+            if (!res.ok) return { ok: false, error: `HTTP ${res.status} à la lecture des exemplaires` };
+            items = await res.json();
+        } catch (e) {
+            return { ok: false, error: (e && e.message) || 'lecture des exemplaires impossible' };
+        }
+        if (!Array.isArray(items) || !items.length) {
+            return { ok: false, error: 'aucun exemplaire de cette carte dans ta collection' };
+        }
+
+        const tagged = items.find(i => (i.user_card_tags || []).some(t => t.tag_id === tagId));
+        if (tagged) {
+            try {
+                const del = await fetch(
+                    `${SUPABASE_URL}/user_card_tags?tag_id=eq.${tagId}&user_card_id=eq.${tagged.id}`,
+                    { method: 'DELETE', credentials: 'omit',
+                      headers: Object.assign({}, supabaseAuthHeaders(), { 'Prefer': 'return=representation' }) });
+                if (!del.ok) return { ok: false, error: `HTTP ${del.status} au retrait` };
+                const arr = await del.json().catch(() => []);
+                // Requête acceptée mais 0 ligne touchée = règle RLS côté serveur.
+                if (Array.isArray(arr) && arr.length === 0) {
+                    return { ok: false, error: 'le serveur a refusé le retrait (droits)' };
+                }
+                trashTaggedCardIds.delete(cardId);
+                return { ok: true, action: 'removed' };
+            } catch (e) {
+                return { ok: false, error: (e && e.message) || 'retrait impossible' };
+            }
+        }
+
+        const free = items.find(i => !(i.user_card_tags || []).some(t => t.tag_id === tagId)) || items[0];
+        const r = await addTagToUserCard(free.id, tagId);
+        if (!r.ok) return { ok: false, error: r.error || `HTTP ${r.status}` };
+        trashTaggedCardIds.add(cardId);
+        return { ok: true, action: 'added' };
+    }
+
     const COLLECTION_BADGE_CLASS = 'wm-coll-price';
     const COLLECTION_BTN_CLASS = 'wm-coll-trash';
 
@@ -12815,57 +12968,54 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
     }
 
+    function paintTrashButton(btn, tagged) {
+        btn.dataset.wmTagged = tagged ? '1' : '0';
+        btn.textContent = tagged ? '♻️' : '🗑️';
+        btn.style.borderColor = tagged ? 'rgba(74,222,128,0.75)' : 'rgba(255,255,255,0.25)';
+        btn.style.background = tagged ? 'rgba(22,101,52,0.55)' : 'rgba(0,0,0,0.45)';
+        const t = btn.dataset.wmTitle || 'cette carte';
+        btn.title = tagged
+            ? `« ${t} » porte l'étiquette « ${getSellTagName()} » — cliquer pour la RETIRER.`
+            : `Défausser « ${t} » : pose l'étiquette « ${getSellTagName()} », le Trash Seller la vendra.`
+              + " Rien n'est supprimé, et un second clic retire l'étiquette.";
+    }
+
     function makeTrashButton(cardId, title) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = COLLECTION_BTN_CLASS;
-        btn.textContent = '🗑️';
-        btn.title = `Défausser « ${title} » : pose l'étiquette « ${getSellTagName()} » sur un exemplaire.`
-            + ' Le Trash Seller la mettra en vente. Rien n\'est supprimé, et le tag se retire depuis le site.';
-        btn.style.cssText = 'cursor:pointer;background:rgba(0,0,0,0.45);border:1px solid rgba(255,255,255,0.25);'
+        btn.dataset.wmCardId = cardId;
+        btn.dataset.wmTitle = title;
+        btn.style.cssText = 'cursor:pointer;border:1px solid rgba(255,255,255,0.25);'
             + 'border-radius:6px;padding:1px 4px;font-size:13px;line-height:1.1;color:#fff;backdrop-filter:blur(2px);';
+        paintTrashButton(btn, trashTaggedCardIds.has(cardId));
         btn.onclick = async (ev) => {
-            // Sans ça, le clic ouvre la fiche de la carte : le bouton est POSÉ sur la tuile,
-            // qui est elle-même cliquable.
+            // Sans ça, le clic ouvre la fiche de la carte : le bouton est POSÉ sur la
+            // tuile, qui est elle-même cliquable.
             ev.preventDefault();
             ev.stopPropagation();
             if (btn.disabled) return;
             btn.disabled = true;
-            const before = btn.textContent;
+            const wasTagged = btn.dataset.wmTagged === '1';
             btn.textContent = '⏳';
             try {
-                const tagId = await ensureTrashTagId();
-                if (!tagId) {
-                    btn.textContent = '⚠️';
-                    btn.title = `Étiquette « ${getSellTagName()} » introuvable sur ton compte — crée-la sur wiki-masters, puis réessaie.`;
-                    wmLog(`⚠️ Défausse impossible : l'étiquette <b>${esc(getSellTagName())}</b> n'existe pas sur ton compte. Crée-la sur le site (une seule fois), puis réessaie.`);
-                    return;
-                }
-                const userCardId = await findCurrentUserCardId(cardId, title);
-                if (!userCardId) {
-                    btn.textContent = '⚠️';
-                    btn.title = "Aucun exemplaire disponible trouvé pour cette carte (déjà étiqueté, ou en vente).";
-                    wmLog(`⚠️ Défausse : aucun exemplaire libre pour <b>${esc(title)}</b>.`);
-                    return;
-                }
-                const r = await addTagToUserCard(userCardId, tagId);
+                const r = await toggleTrashTag(cardId, title);
                 if (r.ok) {
-                    btn.textContent = '✅';
-                    btn.style.borderColor = 'rgba(74,222,128,0.7)';
-                    btn.title = `« ${title} » est étiquetée « ${getSellTagName()} » — le Trash Seller la vendra.`;
-                    wmLog(`🗑️ Défaussée : <b>${esc(title)}</b> → étiquette <b>${esc(getSellTagName())}</b>.`);
+                    paintTrashButton(btn, r.action === 'added');
+                    wmLog(r.action === 'added'
+                        ? `🗑️ Défaussée : <b>${esc(title)}</b> → étiquette <b>${esc(getSellTagName())}</b>.`
+                        : `♻️ Étiquette retirée : <b>${esc(title)}</b> n'est plus à vendre.`);
                 } else {
+                    paintTrashButton(btn, wasTagged); // ne jamais mentir sur l'état réel
                     btn.textContent = '⚠️';
-                    btn.title = `Échec : ${r.error || ('HTTP ' + r.status)}`;
-                    wmLog(`⚠️ Défausse échouée : <b>${esc(title)}</b> · ${esc(r.error || ('HTTP ' + r.status))}`);
+                    btn.title = `Échec : ${r.error}`;
+                    wmLog(`⚠️ Étiquette <b>${esc(title)}</b> : ${esc(r.error)}`);
                 }
             } catch (e) {
+                paintTrashButton(btn, wasTagged);
                 btn.textContent = '⚠️';
                 btn.title = String((e && e.message) || e);
-                wmLog(`⚠️ Défausse échouée : <b>${esc(title)}</b> · ${esc((e && e.message) || 'erreur')}`);
             } finally {
-                // Laisse l'état visible : ✅ et ⚠️ sont des informations, pas des transitoires.
-                if (btn.textContent === '⏳') btn.textContent = before;
                 btn.disabled = false;
             }
         };
@@ -12923,6 +13073,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             tile.appendChild(probe);
             if (collectionVisibilityObserver) collectionVisibilityObserver.observe(probe);
             else queueSalesFetch(cardId); // pas d'IntersectionObserver → repli simple
+        }
+
+        // État initial des étiquettes : une seule requête pour toute la collection,
+        // puis on repeint les boutons déjà posés.
+        if (decorated && Date.now() - trashTaggedLoadedAt > 60000) {
+            loadTrashTaggedCardIds().then((set) => {
+                for (const b of document.querySelectorAll('.' + COLLECTION_BTN_CLASS)) {
+                    if (b.disabled || b.textContent === '⏳') continue;
+                    paintTrashButton(b, set.has(b.dataset.wmCardId));
+                }
+            }).catch(() => {});
         }
 
         if (decorated && !collectionMatchLogged) {

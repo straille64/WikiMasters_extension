@@ -109,12 +109,28 @@ await page.route('**/api/marketplace/cards/*/sales**', r => {
     body: JSON.stringify({ sales: [{ final_price: 40, settled_at: new Date().toISOString() },
                                    { final_price: 48, settled_at: new Date().toISOString() }] }) });
 });
-// Pose du tag (Supabase REST).
+// Supabase : état des étiquettes, pose et retrait. On tient un état serveur simulé
+// pour vérifier la BASCULE, et pas seulement qu'une requête part.
+let taggedOnServer = false;
+const tagDeletes = [];
 await page.route('**/rest/v1/user_cards**', r => r.fulfill({ status: 200, contentType: 'application/json',
-  body: JSON.stringify([{ id: 'uc-1', user_card_tags: [] }]) }));
+  body: JSON.stringify([{ id: 'uc-1', user_card_tags: taggedOnServer ? [{ tag_id: 'tag-trash-1' }] : [] }]) }));
 await page.route('**/rest/v1/user_card_tags**', r => {
-  tagPosts.push(r.request().postData() || '');
-  return r.fulfill({ status: 201, contentType: 'application/json', body: '[]' });
+  const m = r.request().method();
+  if (m === 'DELETE') {
+    tagDeletes.push(r.request().url());
+    taggedOnServer = false;
+    // `return=representation` : le serveur renvoie les lignes supprimées.
+    return r.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([{ id: 'link-1' }]) });
+  }
+  if (m === 'POST') {
+    tagPosts.push(r.request().postData() || '');
+    taggedOnServer = true;
+    return r.fulfill({ status: 201, contentType: 'application/json', body: '[]' });
+  }
+  // GET : liste des cartes étiquetées du compte (état initial des boutons).
+  return r.fulfill({ status: 200, contentType: 'application/json',
+    body: JSON.stringify(taggedOnServer ? [{ user_cards: { card_id: 'card-0' } }] : []) });
 });
 
 await page.evaluate(script).catch(e => errors.push(String(e)));
@@ -134,10 +150,14 @@ const state = await page.evaluate(() => {
   };
 });
 
-// Clic sur la défausse de la première carte.
+// 1er clic : pose l'étiquette. 2e clic : la retire. C'est la bascule qui est testée,
+// pas seulement le fait qu'une requête parte.
 await page.evaluate(() => document.querySelector('.wm-coll-trash').click());
 await page.waitForTimeout(2500);
 const btnAfter = await page.evaluate(() => document.querySelector('.wm-coll-trash').textContent);
+await page.evaluate(() => document.querySelector('.wm-coll-trash').click());
+await page.waitForTimeout(2500);
+const btnAfter2 = await page.evaluate(() => document.querySelector('.wm-coll-trash').textContent);
 
 await browser.close();
 srv.close();
@@ -152,8 +172,10 @@ if (salesAsked.length === 0) problems.push('aucune cote demandée — le scénar
 if (salesAsked.length > VISIBLE.length + 2) {
   problems.push(`${salesAsked.length} cotes demandées pour ${VISIBLE.length} cartes visibles — les cartes hors écran ne doivent pas être interrogées`);
 }
-if (btnAfter !== '✅') problems.push(`bouton en « ${btnAfter} » après clic — attendu ✅`);
+if (btnAfter !== '♻️') problems.push(`bouton en « ${btnAfter} » après la pose — attendu ♻️ (étiquetée)`);
+if (btnAfter2 !== '🗑️') problems.push(`bouton en « ${btnAfter2} » après le retrait — attendu 🗑️ (non étiquetée)`);
 if (tagPosts.length !== 1) problems.push(`${tagPosts.length} pose(s) de tag au lieu de 1`);
+if (tagDeletes.length !== 1) problems.push(`${tagDeletes.length} retrait(s) de tag au lieu de 1 — la bascule ne retire pas l'étiquette`);
 for (const e of errors) problems.push('erreur page : ' + e);
 
 if (problems.length) {
@@ -161,4 +183,4 @@ if (problems.length) {
   for (const p of problems) console.error('  · ' + p);
   process.exit(1);
 }
-console.log(`✅ ${state.badges} cartes décorées · cote ${state.firstText.trim()} · ${salesAsked.length} cote(s) demandée(s) (visibles seulement) · défausse OK`);
+console.log(`✅ ${state.badges} cartes décorées · cote ${state.firstText.trim()} · ${salesAsked.length} cote(s) demandée(s) (visibles seulement) · bascule étiquette : pose + retrait OK`);

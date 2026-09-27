@@ -45,6 +45,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
   `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
   sur le code réellement livré, pas sur une copie.
+- `tests/market-dead-pages.test.mjs` : 40 pages d'enchères terminées puis 3 vivantes —
+  vérifie que les vivantes sont trouvées sans télécharger les mortes.
 - `tests/collection-overlay.test.mjs` : reproduit la grille Collection du site (classes
   et structure réelles) et vérifie que la cote s'affiche, que le bouton de défausse pose
   bien le tag, et que seules les cartes visibles déclenchent une requête de cote.
@@ -104,7 +106,9 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Scan résilient aux refus 403 : pages rejouées, historique des ventes plus
       redemandé en boucle (audit #21, #22, #23)
 - [x] Surcouche Collection : cote du marché sur chaque carte + bouton de défausse
-      (audit #24)
+      réversible (audit #24, #26)
+- [x] Scan : saut par dichotomie des pages d'enchères déjà terminées — 89 % du marché
+      sur ce site (audit #25)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
       d'injection couverts, verrouillé par un test (audit #4)
 - [ ] Découpage du monolithe en modules
