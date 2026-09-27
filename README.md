@@ -60,6 +60,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/market-search-probe.test.mjs` : une recherche serveur qui filtre sur un champ
   absent de la réponse ne doit pas être déclarée cassée, le verdict « cassée » doit
   expirer, et les annonces ramenées par `q=` doivent remonter dans les résultats.
+- `tests/bid-mode-ui.test.mjs` : le bouton Manuel/Auto-bid/Fourbe doit se mettre à jour
+  même quand le re-render de la liste est suspendu, nommer la bonne carte, et la mise
+  manuelle doit rattraper une surenchère simultanée comme les mises automatiques.
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -150,6 +153,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       barre de recherche attendue, coupe-circuit sur échecs en rafale (audit #38)
 - [x] Market Watcher : sonde de la recherche serveur fiable et réversible, résultats du
       serveur honorés tels quels — fini le balayage de 277 pages en boucle (audit #39)
+- [x] Boutons de mode : état visible immédiatement, carte correctement nommée, et mise
+      manuelle passée par le même chemin que les mises auto (audit #40)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

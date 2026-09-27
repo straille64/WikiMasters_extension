@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.23';
+    const WM_VERSION = '1.3.13-fork.24';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3391,7 +3391,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return ` <span style="color:#22d3ee;font-size:9px;">(rattrapée après ${r.attempts} essais — quelqu'un misait en même temps)</span>`;
     }
 
-    async function placeBid(auction, amount, contexte) {
+    // Garde-fou d'une mise MANUELLE : l'utilisateur a cliqué, donc ni l'interrupteur des
+    // mises auto ni la limite horaire ne s'appliquent. Le plafond global reste, lui, une
+    // protection contre la faute de frappe et l'emballement.
+    function manualBidAllowed(auction, amount) {
+        const cap = getSetting('globalBidCap');
+        if (cap > 0 && amount > cap) {
+            const t = (auction && auction.card && auction.card.wikipedia_title) || '?';
+            wmLog(`🛑 Relance annulée (plafond global <b>${cap.toLocaleString('fr-FR')} 💰</b>) : <b>${esc(t)}</b> — il aurait fallu ${amount.toLocaleString('fr-FR')} 💰`);
+            return false;
+        }
+        return true;
+    }
+
+    async function placeBid(auction, amount, contexte, opts) {
+        const manual = !!(opts && opts.manual);
         let a = auction, amt = amount, lastErr = null;
         for (let attempt = 1; attempt <= BID_RETRY_MAX; attempt++) {
             let res = null, data = {};
@@ -3426,7 +3440,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Le nouveau montant doit repasser TOUS les garde-fous : un rattrapage qui
             // ignorerait le plafond serait exactement la surenchère sans limite qu'on a
             // supprimée. Un refus ici est un arrêt normal, pas un échec.
-            if (!autoBidAllowed(a, next, contexte)) {
+            const allowed = manual ? manualBidAllowed(a, next) : autoBidAllowed(a, next, contexte);
+            if (!allowed) {
                 return { ok: false, amount: next, reason: 'plafond ou limite atteint après surenchère', blocked: true, auction: a };
             }
             if (next !== amt) lastErr = `${lastErr} → relance à ${next} 💰`;
@@ -3619,8 +3634,68 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         fourbe:  { label: '🕵️ Fourbe',   color: '#c084fc', border: 'rgba(192,132,252,0.5)',  bg: 'rgba(192,132,252,0.07)' }
     };
     window.wmWarnAutoBidsPaused = warnAutoBidsPaused; // pour les handlers inline des boutons
-    window.wmCycleBidMode = function(id) {
-        const title = activeHitsMap.get(id)?.auction?.card?.wikipedia_title || '?';
+
+
+    // Le titre venait UNIQUEMENT d'activeHitsMap. Cette map est vidée à chaque
+    // (re)démarrage du Market Watcher alors que les cartes restent affichées : les logs
+    // se remplissaient alors de « Fourbe activé : ? ». Le cache de rendu contient les
+    // mêmes annonces — on interroge les deux.
+    function auctionTitleById(id) {
+        const fromMap = activeHitsMap.get(id)?.auction?.card?.wikipedia_title;
+        if (fromMap) return fromMap;
+        const row = Array.isArray(lastHitsCache) ? lastHitsCache.find(h => h && h.id === id) : null;
+        return (row && row.card && row.card.wikipedia_title) || '?';
+    }
+
+    /* Repeint le bouton de mode SUR PLACE.
+
+       Avant, le clic se contentait de demander un re-render complet de la liste — or ce
+       re-render est volontairement ignoré tant qu'un champ du panneau a le focus (sinon
+       le champ « plafond », juste à côté, perdrait la frappe en cours). Résultat : le
+       mode changeait bien en mémoire, mais le bouton gardait son ancien libellé.
+       L'utilisateur recliquait, et le mode repartait pour un tour — d'où les cycles
+       Manuel → Auto-bid → Fourbe en rafale dans les logs. */
+    function paintBidModeButton(btn, mode) {
+        const ui = BID_MODE_UI[mode] || BID_MODE_UI.manual;
+        if (!btn) return;
+        btn.innerText = ui.label;
+        btn.style.color = ui.color;
+        btn.style.borderColor = ui.border;
+        btn.style.background = ui.bg;
+    }
+
+    /* Mise manuelle (bouton « 🔨 Miser N 💰 ») — passait par un fetch écrit à la main dans
+       l'attribut onclick : aucun rattrapage si un autre joueur misait dans le même instant,
+       juste un « ✗ Échec ». Elle emprunte maintenant le même chemin que les mises
+       automatiques (relecture de l'enchère, nouveau minimum, relance). */
+    window.wmManualBid = async function(id, amount, btn) {
+        const a = (Array.isArray(lastHitsCache) ? lastHitsCache.find(h => h && h.id === id) : null)
+            || (activeHitsMap.get(id) || {}).auction
+            || { id };
+        const title = auctionTitleById(id);
+        if (!manualBidAllowed(a, amount)) {
+            if (btn) { btn.innerText = '✗ Plafond'; btn.style.color = '#ef4444'; }
+            return;
+        }
+        if (btn) { btn.disabled = true; btn.innerText = '⏳'; }
+        const r = await placeBid(a, amount, 'Mise manuelle', { manual: true });
+        if (r.ok) {
+            wmLog(`🔨 Mise manuelle : <b>${esc(title)}</b> → <span style="color:#fbbf24;">${r.amount} 💰</span>${bidRetryNote(r)}`);
+        } else {
+            wmLog(`⚠️ Mise manuelle échouée : <b>${esc(title)}</b> · ${esc(r.reason)}`);
+        }
+        if (btn) {
+            btn.innerText = r.ok ? `✔ Misé ${r.amount} 💰` : '✗ Échec';
+            btn.style.color = r.ok ? '#4ade80' : '#ef4444';
+            const base = `🔨 Miser ${Number(amount).toLocaleString('fr-FR')} 💰`;
+            setTimeout(() => { btn.disabled = false; btn.innerText = base; btn.style.color = '#06b6d4'; }, 1800);
+        }
+    };
+
+    window.wmAuctionTitle = auctionTitleById; // pour les handlers inline des vues héritées
+
+    window.wmCycleBidMode = function(id, btn) {
+        const title = auctionTitleById(id);
         const mode = bidModeOf(id);
         if (mode === 'manual') {
             autoBidSet.add(id); saveAutoBidSet();
@@ -3638,6 +3713,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (disarmHunterFourbe(id)) saveHunterFourbe();
             wmLog(`⚪ Mise manuelle : <b>${esc(title)}</b> — plus d'automatisme sur cette enchère.`);
         }
+        // D'abord le bouton cliqué (toujours), ensuite la liste (peut être sautée).
+        paintBidModeButton(btn || document.querySelector(`[data-wm-mode-btn="${id}"]`), bidModeOf(id));
         const el = document.getElementById('wm-market-alert');
         if (el && lastHitsCache.length > 0) renderMarketHits(el, lastHitsCache, []);
     };
@@ -4917,19 +4994,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                                 const base='🔨 Miser ' + amount.toLocaleString('fr-FR') + ' 💰';
                                 if(btn.dataset.jumped === '1' && btn.dataset.confirm !== '1'){ btn.dataset.confirm='1'; btn.innerText='⚠ Confirmer ?'; btn.style.color='#fbbf24'; clearTimeout(btn._ct); btn._ct=setTimeout(()=>{btn.dataset.confirm='';btn.innerText=base;btn.style.color='#06b6d4';},3000); return; }
                                 btn.dataset.confirm=''; clearTimeout(btn._ct);
-                                btn.disabled=true; btn.innerText='⏳';
-                                try { const res=await fetch('https://www.wiki-masters.com/api/marketplace/${a.id}/bid',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount})});
-                                    btn.innerText=res.ok?'✔ Misé':'✗ Échec'; btn.style.color=res.ok?'#4ade80':'#ef4444';
-                                    if(res.ok){ if(window.wmMarkAuctionMine) window.wmMarkAuctionMine('${a.id}', amount); else if(window.wmTrackMyBid) window.wmTrackMyBid('${a.id}'); }
-                                } catch(e){ btn.innerText='✗ Échec'; btn.style.color='#ef4444'; }
-                                setTimeout(()=>{btn.disabled=false;btn.innerText=base;btn.style.color='#06b6d4';},1500);
+                                await window.wmManualBid('${a.id}', amount, btn);
                             })()"
                             style="width:100%;margin-top:6px;height:24px;font-size:10px;font-weight:700;
                             border:1px solid rgba(6,182,212,0.4);border-radius:4px;background:rgba(6,182,212,0.06);
                             color:#06b6d4;cursor:pointer;">🔨 Miser ${nextBid.toLocaleString('fr-FR')} 💰</button>
                         <!-- Automatismes : un seul bouton à 3 états + son plafond -->
                         <div style="display:flex;gap:4px;margin-top:4px;">
-                            <button onclick="window.wmCycleBidMode('${a.id}')"
+                            <button data-wm-mode-btn="${a.id}" onclick="window.wmCycleBidMode('${a.id}', this)"
                                 title="Mode de mise automatique — clic pour passer au suivant : ⚪ Manuel → 🤖 Auto-bid (riposte à chaque surenchère) → 🕵️ Fourbe (une seule mise, à ~${getSetting('snipeSecondsBefore')}s de la fin) → ⚪ Manuel. Les deux automatismes respectent le plafond ci-contre."
                                 style="flex:1;min-width:0;height:22px;font-size:9px;font-weight:700;cursor:pointer;
                                 border:1px solid ${modeUi.border};border-radius:4px;background:${modeUi.bg};color:${modeUi.color};
@@ -4961,11 +5033,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             if(btn.dataset.jumped === '1' && btn.dataset.confirm !== '1'){ btn.dataset.confirm='1'; btn.innerText='⚠'; btn.style.color='#fbbf24'; clearTimeout(btn._ct); btn._ct=setTimeout(()=>{btn.dataset.confirm='';btn.innerText='🔨';btn.style.color='#06b6d4';},3000); return; }
                             btn.dataset.confirm=''; clearTimeout(btn._ct);
                             btn.disabled=true; btn.innerText='⏳';
-                            try { const res=await fetch('https://www.wiki-masters.com/api/marketplace/${a.id}/bid',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount})});
-                                btn.innerText=res.ok?'✔':'✗'; btn.style.color=res.ok?'#4ade80':'#ef4444';
-                                if(res.ok){ if(window.wmMarkAuctionMine) window.wmMarkAuctionMine('${a.id}', amount); else if(window.wmTrackMyBid) window.wmTrackMyBid('${a.id}'); }
-                            } catch(e){ btn.innerText='✗'; }
-                            setTimeout(()=>{btn.disabled=false;btn.innerText='🔨';btn.style.color='#06b6d4';},1500);
+                            await window.wmManualBid('${a.id}', amount, btn);
+                            btn.innerText='🔨';
                         })()"
                         style="flex-shrink:0;font-size:11px;line-height:1;height:20px;padding:0 6px;border:1px solid rgba(6,182,212,0.35);border-radius:3px;background:none;color:#06b6d4;cursor:pointer;">🔨</button>
                 </div>`;
@@ -5046,22 +5115,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             return;
                         }
                         btn.dataset.confirm=''; clearTimeout(btn._ct);
-                        btn.disabled=true; btn.innerText='⏳';
-                        try {
-                            const res = await fetch('https://www.wiki-masters.com/api/marketplace/${a.id}/bid',{
-                                method:'POST',credentials:'include',
-                                headers:{'Content-Type':'application/json'},
-                                body:JSON.stringify({amount})
-                            });
-                            const data = await res.json();
-                            btn.innerText = res.ok ? '✔ Misé' : '✗ Erreur';
-                            btn.style.color = res.ok ? '#4ade80' : '#ef4444';
-                            if(res.ok) {
-                                if(window.wmMarkAuctionMine) window.wmMarkAuctionMine('${a.id}', amount);
-                                else if(window.wmTrackMyBid) window.wmTrackMyBid('${a.id}');
-                            }
-                        } catch(e){ btn.innerText='✗'; }
-                        setTimeout(()=>{btn.disabled=false;btn.innerText='🔨 Miser';btn.style.color='#06b6d4';btn.style.borderColor='rgba(6,182,212,0.3)';},2000);
+                        await window.wmManualBid('${a.id}', amount, btn);
+                        setTimeout(()=>{btn.innerText='🔨 Miser';btn.style.borderColor='rgba(6,182,212,0.3)';},2000);
                     })()" style="
                         font-size:10px;color:#06b6d4;cursor:pointer;
                         height:24px;box-sizing:border-box;padding:0 8px;border:1px solid rgba(6,182,212,0.3);
@@ -5073,7 +5128,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const btn = document.getElementById('wm-autobid-' + auctionId);
                         const hit = window.activeHitsMap && window.activeHitsMap.get(auctionId);
                         const card = hit && hit.auction && hit.auction.card;
-                        const title = (card && card.wikipedia_title) || '?';
+                        // Repli sur le cache de rendu : activeHitsMap est vidée à chaque
+                        // redémarrage du Market Watcher, les cartes restent affichées.
+                        const title = (card && card.wikipedia_title)
+                            || (window.wmAuctionTitle ? window.wmAuctionTitle(auctionId) : '?');
                         const rar = ((card && card.rarity) || '').toUpperCase();
                         if(window.autoBidSet.has(auctionId)) {
                             window.autoBidSet.delete(auctionId);
@@ -5125,7 +5183,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const abtn = document.getElementById('wm-autobid-' + auctionId);
                         const hit = window.activeHitsMap && window.activeHitsMap.get(auctionId);
                         const card = hit && hit.auction && hit.auction.card;
-                        const title = (card && card.wikipedia_title) || '?';
+                        // Repli sur le cache de rendu : activeHitsMap est vidée à chaque
+                        // redémarrage du Market Watcher, les cartes restent affichées.
+                        const title = (card && card.wikipedia_title)
+                            || (window.wmAuctionTitle ? window.wmAuctionTitle(auctionId) : '?');
                         if(window.snipeSet.has(auctionId)) {
                             window.snipeSet.delete(auctionId);
                             // Si c'est le Hunter agressif qui avait armé : il lâche prise et

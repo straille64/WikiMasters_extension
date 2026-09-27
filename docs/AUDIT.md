@@ -775,6 +775,50 @@ n'apparaît dans aucun champ renvoyé. Trois mutations de contrôle échouent co
 verdict faussé (« déclarée cassée », 14 requêtes non filtrées), verrou définitif (« plus
 aucune tentative »), et verdict serveur ignoré (« aucune annonce ne remonte »).
 
+### 40. Le bouton de mode changeait l'état sans jamais le montrer
+Logs du 27/09, en rafale sur la même carte :
+
+```
+17:44:40 🤖 Auto-bid activé : ?
+17:44:39 ⚪ Mise manuelle : ?
+17:44:38 🕵️ Fourbe activé : ?
+```
+
+Trois cycles complets Manuel → Auto-bid → Fourbe en quarante secondes : le mode avançait
+bien d'un cran à chaque clic, mais **rien ne bougeait à l'écran**, alors l'utilisateur
+recliquait. Deux causes.
+
+**1. La mise à jour du bouton reposait sur un re-render qui est fait pour être sauté.**
+`wmCycleBidMode()` se contentait de redemander un rendu complet de la liste. Or
+`renderMarketHits()` s'interrompt volontairement tant qu'un champ du panneau a le focus —
+sinon le champ « plafond », placé juste à côté du bouton, perdrait la frappe en cours.
+Le bouton gardait donc son ancien libellé.
+
+**2. Le titre ne venait que d'`activeHitsMap`.** Cette map est vidée à chaque (re)démarrage
+du Market Watcher, alors que les cartes restent affichées : d'où les « ? ».
+
+**3. Et la mise manuelle court-circuitait tout.** Le bouton « 🔨 Miser » exécutait un
+`fetch` écrit à la main dans son attribut `onclick` — les trois vues en avaient chacune
+une copie. Aucune ne bénéficiait du rattrapage de course ajouté en fork.21 : une mise
+refusée parce qu'un autre joueur venait de miser affichait « ✗ Échec », point.
+
+**✅ Corrigé (1.3.13-fork.24)**
+
+- `paintBidModeButton()` repeint le bouton cliqué **sur place**, avant de demander le
+  re-render complet. Ce qui s'affiche ne dépend plus d'un rendu qui peut être ignoré.
+- `auctionTitleById()` interroge `activeHitsMap` **puis** le cache de rendu. Exposé en
+  `window.wmAuctionTitle` pour les handlers des vues héritées, qui avaient le même défaut.
+- `window.wmManualBid()` : point d'entrée unique des trois vues, qui passe par `placeBid`
+  (relecture de l'enchère, nouveau minimum, relance). Une mise manuelle n'est soumise ni à
+  l'interrupteur des mises auto ni à la limite horaire — l'utilisateur a cliqué — mais
+  reste tenue par le plafond global (`manualBidAllowed`).
+
+`tests/bid-mode-ui.test.mjs` clique les boutons **avec le focus dans le champ plafond** et
+`activeHitsMap` vidée — les deux conditions réunies du bug. Trois mutations de contrôle
+échouent : sans la repeinture, le bouton affiche « ⚪ Manuel » alors que le Fourbe est armé
+(le symptôme exact) ; sans le repli de titre, le log dit « ? » ; sans `placeBid`, la mise
+manuelle s'arrête au premier refus.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
