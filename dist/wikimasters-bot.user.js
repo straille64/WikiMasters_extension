@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.18
+// @version      1.3.13-fork.19
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.18';
+    const WM_VERSION = '1.3.13-fork.19';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1103,6 +1103,7 @@
         sellMarketPricePct:    'wm_sell_market_pct',
         sellMarketFloor:       'wm_sell_market_floor',
         sellOnlyIfSoleTag:     'wm_sell_only_if_sole_tag',
+        sellAutoResume:        'wm_sell_auto_resume',
         sellDegressive:        'wm_sell_degressive',
         sellUndercutMarket:    'wm_sell_undercut_market',
         autoTagPacksFromPresets: 'wm_autotag_packs_presets',
@@ -1158,6 +1159,7 @@
         sellMarketPricePct:    100,       // % appliqué au prix moyen du marché
         sellMarketFloor:       true,      // prix marché : jamais sous le prix du tableau (plancher)
         sellOnlyIfSoleTag:     true,      // filet de sécurité : ne vendre que si le tag de vente est le SEUL tag
+        sellAutoResume:        false,     // NE relance PAS le Trash Seller tout seul après un rechargement de page
         sellDegressive:        true,      // Trash Seller : -15% de prix par tranche de 10 remises en vente (invendus)
         sellUndercutMarket:    true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
         autoTagPacksFromPresets: false,   // étiquette auto les cartes packées selon les recherches enregistrées
@@ -1192,6 +1194,18 @@
     try {
         localStorage.removeItem('wm_pack_zero_ts');
         localStorage.removeItem('wm_observed_pack_cooldown_ms');
+    } catch(e) {}
+
+    // Migration : le pourcentage du prix marché valait 110% dans les versions héritées de
+    // l'amont. Le défaut est maintenant 100% (vendre AU prix du marché, pas au-dessus) : on
+    // efface la valeur stockée si — et seulement si — c'est exactement cet ancien 110, pour
+    // ne pas écraser un réglage choisi volontairement. Une seule fois (flag).
+    try {
+        if (!localStorage.getItem('wm_sell_market_pct_100_v1')) {
+            const rawPct = localStorage.getItem('wm_sell_market_pct');
+            if (rawPct !== null && parseFloat(rawPct) === 110) localStorage.removeItem('wm_sell_market_pct');
+            localStorage.setItem('wm_sell_market_pct_100_v1', '1');
+        }
     } catch(e) {}
 
     // Migration : l'ancien réglage unique "Sons d'alerte" est éclaté en 2 (apparition /
@@ -6070,14 +6084,57 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         setter.call(el, value);
         el.dispatchEvent(new Event('input', { bubbles: true }));
     }
+    // Le dashboard du bot affiche lui aussi des titres de cartes (aperçu de vente, résultats
+    // du Market Watcher, logs…) : si findLeafByExactText tombait sur un de CES noeuds, on
+    // remonterait ensuite jusqu'à un ancêtre .cursor-pointer du panneau et on cliquerait dans
+    // notre propre interface au lieu de la tuile du site. Tout ce que le script injecte vit
+    // sous un id/classe préfixé wm- → on l'exclut systématiquement de la recherche DOM.
+    function isBotOwnNode(el) {
+        return !!(el && el.closest && el.closest('[id^="wm-"], [class*="wm-"]'));
+    }
     function findLeafByExactText(text) {
         for (const el of document.querySelectorAll('*')) {
-            if (el.children.length === 0 && el.textContent.trim() === text) return el;
+            if (el.children.length === 0 && el.textContent.trim() === text && !isBotOwnNode(el)) return el;
         }
         return null;
     }
+
+    // Conteneur de la modale qui porte `el` : on remonte jusqu'au premier ancêtre positionné
+    // en fixed ou marqué role="dialog". Sert à VÉRIFIER le contenu de la modale sans se faire
+    // piéger par le reste de la page (remonter jusqu'à <body> reviendrait à chercher le titre
+    // dans la grille affichée derrière, qui le contient forcément).
+    function findModalRoot(el) {
+        let node = el;
+        while (node && node !== document.body) {
+            if (node.getAttribute && node.getAttribute('role') === 'dialog') return node;
+            try {
+                if (getComputedStyle(node).position === 'fixed') return node;
+            } catch(e) {}
+            node = node.parentElement;
+        }
+        return null;
+    }
+
+    // Titre de la carte affiché dans la modale de mise en vente
+    // (<p class="font-semibold text-sm truncate">Chauchat</p>).
+    function modalCardTitle(modal) {
+        const el = modal.querySelector('p.font-semibold.text-sm.truncate');
+        const t = el && el.textContent.trim();
+        return t || null;
+    }
+
+    // Ferme une modale ouverte par erreur pour ne pas bloquer la carte suivante.
+    function dismissModal(modal) {
+        const cancel = modal && [...modal.querySelectorAll('button')]
+            .find(b => /^(Annuler|Fermer)$/i.test(b.textContent.trim()));
+        if (cancel) { cancel.click(); return; }
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    }
+    // Exclut aussi le DOM du bot : le dashboard porte des libellés qui peuvent coïncider avec
+    // ceux du site (durées « 1 h », « 30 min »…) — on ne veut cliquer QUE dans l'UI du site.
     function findButtonByText(text) {
-        return [...document.querySelectorAll('button')].find(b => b.textContent.trim() === text) || null;
+        return [...document.querySelectorAll('button')]
+            .find(b => b.textContent.trim() === text && !isBotOwnNode(b)) || null;
     }
 
     // Sondage périodique de l'API directe : le contournement DOM est lent et dépend d'une
@@ -6145,6 +6202,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (candidate) tile = candidate;
         }
         if (!tile) return { ok: false, reason: 'card_not_found' };
+        // Double contrôle avant le clic : la tuile résolue doit bien porter le titre attendu
+        // (un re-render React entre la recherche du titre et la remontée vers .cursor-pointer
+        // peut nous laisser un ancêtre appartenant à une AUTRE carte).
+        if (!tile.textContent.includes(title)) {
+            wmLog(`🛡️ Vente annulée : la tuile trouvée ne correspond pas à <b>${esc(title)}</b>`);
+            return { ok: false, reason: 'tile_mismatch' };
+        }
         tile.click();
         await new Promise(r => setTimeout(r, 600));
 
@@ -6164,6 +6228,20 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         const launchBtn = findButtonByText("Lancer l'enchère");
         if (!launchBtn) return { ok: false, reason: 'no_launch_button' };
+
+        // 🛡️ DERNIER filet avant le clic irréversible : la modale ouverte doit afficher la carte
+        // qu'on a l'intention de vendre. Sans ce contrôle, n'importe quel décalage (grille encore
+        // en cours de filtrage, tuile recyclée par React, recherche non appliquée) se traduisait
+        // par la mise en vente d'une carte qu'on ne voulait PAS vendre — irrécupérable.
+        const modal = findModalRoot(launchBtn);
+        const shownTitle = modal && modalCardTitle(modal);
+        if (shownTitle ? shownTitle !== title : !(modal && modal.textContent.includes(title))) {
+            wmLog(`🛡️ Vente annulée : la fenêtre affiche <b>${esc(shownTitle || '?')}</b> au lieu de <b>${esc(title)}</b>`);
+            if (modal) dismissModal(modal);
+            await new Promise(r => setTimeout(r, 300));
+            return { ok: false, reason: 'wrong_card_in_modal' };
+        }
+
         _lastUiListingAuctionId = null;
         launchBtn.click();
         await new Promise(r => setTimeout(r, 900)); // laisse la requête + navigation vers la page de l'enchère se faire
@@ -9309,6 +9387,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <span>🛡️ Ne vendre que si le tag de vente est le SEUL tag</span>
                     </label>
                     <div class="wm-set-sub" style="margin-top:2px;">Filet de sécurité : une carte n'est mise en vente que si elle porte <b>uniquement</b> le tag de vente. Si elle a aussi un autre tag, le tag de vente est probablement une erreur → la carte est <b>ignorée</b> et conservée.</div>
+                    <label class="wm-toggle" style="margin-top:10px;">
+                        <input type="checkbox" id="wm-set-sell-auto-resume">
+                        <span>🔄 Reprendre le Trash Seller après un rechargement de page</span>
+                    </label>
+                    <div class="wm-set-sub" style="margin-top:2px;">Désactivé (défaut) : après un F5 ou un rechargement, le Trash Seller reste <b>à l'arrêt</b> et attend un clic sur ▶ START. Activé : il repart tout seul et recommence à mettre des cartes en vente dès le chargement de la page.</div>
                     <div class="wm-set-sub" style="margin-top:10px;">Trash Seller : prix et durée par rareté <span style="color:#666;">(repli si prix marché indisponible · sert aussi de plancher)</span></div>
                     <table id="wm-sell-table" style="width:100%;border-collapse:separate;border-spacing:0 4px;font-size:10px;">
                         <thead>
@@ -9733,9 +9816,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
         };
 
-        // Auto-restart après F5 si le Trash Seller tournait avant
+        // Reprise après un rechargement de page. PAR DÉFAUT : on ne redémarre PAS.
+        // Avant, le drapeau sessionStorage relançait le Trash Seller à chaque chargement du
+        // script : il suffisait d'arriver sur /collection (F5 ou navigation qui recharge la
+        // page) pour que le bot se remette à cliquer sur les cartes et à les mettre en vente
+        // sans aucune action de l'utilisateur. Une mise en vente est irréversible → la reprise
+        // est désormais explicite (réglage « Reprise auto » ou clic sur ▶ START).
         if (sessionStorage.getItem('wm_trashseller_active')) {
-            startTrashSeller();
+            if (getSetting('sellAutoResume')) {
+                wmLog('▶ Trash Seller : reprise automatique après rechargement (réglage activé)');
+                startTrashSeller();
+            } else {
+                sessionStorage.removeItem('wm_trashseller_active');
+                trashStatus.innerHTML = '<span style="color:#fbbf24;">⏸️ Arrêté par le rechargement de la page — ▶ START pour reprendre.</span>';
+                wmLog('⏸️ Trash Seller non repris après le rechargement de la page (reprise auto désactivée)');
+            }
         }
 
         /* ════════ HEADER CONTROLS ════════ */
@@ -10061,6 +10156,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             setSetting('sellMarketPricePct', v);
             wmLog(`💹 Trash Seller : prix au marché réglé à <b>${v}%</b> de la moyenne`);
         };
+
+        // Reprise auto du Trash Seller après un rechargement de page (off par défaut)
+        const sellAutoResumeChk = document.getElementById('wm-set-sell-auto-resume');
+        if (sellAutoResumeChk) {
+            sellAutoResumeChk.checked = getSetting('sellAutoResume');
+            sellAutoResumeChk.onchange = () => {
+                setSetting('sellAutoResume', sellAutoResumeChk.checked);
+                wmLog(sellAutoResumeChk.checked
+                    ? '🔄 Trash Seller : reprise automatique après rechargement ACTIVÉE'
+                    : '🔄 Trash Seller : reprise automatique après rechargement désactivée (▶ START requis)');
+            };
+        }
 
         // Plancher : prix marché jamais sous le tableau
         const sellMarketFloorChk = document.getElementById('wm-set-sell-market-floor');

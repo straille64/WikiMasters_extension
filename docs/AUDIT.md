@@ -560,6 +560,55 @@ refermés.
 `tests/trash-seller-preview.test.mjs` rejoue le cas exact remonté (cote 7 en R, minimum 20)
 et exige que l'aperçu affiche « marché 7 → min 20 » — pas seulement le bon prix final.
 
+### 35. Arriver sur /collection suffisait à mettre des cartes en vente
+Retour utilisateur : « quand je vais dans collection, sans que je touche à quoi que ce
+soit, ça clique sur des cartes et ça les met en vente automatiquement ». Ce n'était pas
+une impression : le comportement était **écrit dans le code**, et deux mécanismes s'y
+ajoutaient.
+
+**1. Reprise silencieuse.** `startTrashSeller()` posait `sessionStorage.wm_trashseller_active`,
+et le script, à **chaque** chargement, relançait le Trash Seller si ce drapeau était là.
+Un F5, une navigation qui recharge la page, un onglet restauré : le bot repartait, cliquait
+sur les tuiles et listait des cartes sans qu'on ait rien demandé. Une mise en vente est
+irréversible — c'est précisément le genre d'action qui ne doit jamais démarrer seule.
+
+**2. Aucune vérification de la carte ouverte.** `sellCardViaUI()` cherchait le titre dans
+le DOM, remontait jusqu'à un ancêtre `.cursor-pointer`, cliquait, puis cliquait
+« Mettre aux enchères » et enfin **« Lancer l'enchère » sans jamais regarder quelle carte
+la fenêtre affichait**. Tout décalage (grille encore en cours de filtrage, tuile recyclée
+par React, recherche non appliquée) vendait donc une carte qu'on ne visait pas — y compris
+une carte sans le tag de vente, puisque le filtre par tag agit en amont, sur le pool, pas
+sur ce qui est réellement cliqué.
+
+**3. Le bot pouvait se cliquer lui-même.** `findLeafByExactText()` balayait tout le
+document ; or le dashboard affiche aussi des titres de cartes (aperçu de vente, résultats
+du Market Watcher, logs). Un match dans notre propre panneau, et la remontée vers
+`.cursor-pointer` désignait un élément de l'interface du bot. Même remarque pour
+`findButtonByText()` sur les libellés de durée (« 1 h », « 30 min »), présents des deux côtés.
+
+**✅ Corrigé (1.3.13-fork.19)**
+
+- La reprise après rechargement est **opt-in** : nouveau réglage `sellAutoResume`, **désactivé
+  par défaut**. Sans lui, le drapeau est effacé et le panneau affiche « Arrêté par le
+  rechargement de la page — ▶ START pour reprendre ».
+- Filet de sécurité avant le clic irréversible : la fenêtre ouverte doit afficher le titre
+  visé (`p.font-semibold.text-sm.truncate`, replis sur le texte de la modale). Sinon la vente
+  est abandonnée, la fenêtre refermée, et le log dit quelle carte était affichée à la place.
+- Contrôle intermédiaire : la tuile résolue doit contenir le titre attendu avant le clic.
+- `findLeafByExactText()` et `findButtonByText()` ignorent le DOM du bot (`isBotOwnNode`,
+  tout ce qui est sous un `id`/`class` préfixé `wm-`). `findModalRoot()` borne la recherche
+  au conteneur de la modale : remonter jusqu'à `<body>` aurait validé n'importe quoi, la
+  grille derrière contenant forcément le titre.
+- `sellMarketPricePct` : le 110 % hérité de l'amont est ramené au défaut **100 %** (une
+  seule fois, drapeau `wm_sell_market_pct_100_v1`, et uniquement si la valeur stockée est
+  exactement 110 — un réglage choisi volontairement n'est pas écrasé).
+
+`tests/trash-seller-safety.test.mjs` couvre les deux volets et a été validé par mutation :
+en rétablissant la reprise inconditionnelle, le test constate une carte vendue sans action
+utilisateur ; en neutralisant le contrôle de la fenêtre, il constate la carte affichée
+vendue **deux fois** — le symptôme exact remonté. Un témoin positif (la carte visée doit
+bien partir en vente) empêche le test de passer parce que rien ne se vend.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

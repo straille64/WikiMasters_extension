@@ -48,6 +48,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/trash-seller-preview.test.mjs` : vérifie que le prix de vente suit la moyenne
   de la BONNE rareté, retombe sur le prix par défaut sans cote, et que l'aperçu annonce
   l'ordre, les prix et leur origine.
+- `tests/trash-seller-safety.test.mjs` : vérifie qu'arriver sur `/collection` ne met
+  RIEN en vente tout seul, et qu'une carte n'est vendue que si la fenêtre ouverte affiche
+  bien son titre. Validé par mutation (rétablir l'ancien comportement fait échouer le test).
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -126,6 +129,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       chargement en parallèle (~1,5 s pour 40 cartes) (audit #27, #29, #30, #31)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
       d'injection couverts, verrouillé par un test (audit #4)
+- [x] Trash Seller : plus de reprise silencieuse après un rechargement, et refus de
+      vendre si la fenêtre ouverte n'affiche pas la carte visée (audit #35)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 
