@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.16';
+    const WM_VERSION = '1.3.13-fork.17';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1133,7 +1133,7 @@
         scheduleTrashEnabled:  false,     // horaire propre au Trash Seller
         scheduleTrashStart:    '09:00',
         scheduleTrashEnd:      '23:00',
-        sellUseMarketPrice:    false,     // Trash Seller : prix = moyenne des ventes × % (repli tableau)
+        sellUseMarketPrice:    true,      // Trash Seller : prix = moyenne du marché (repli : tableau par rareté)
         sellMarketPricePct:    100,       // % appliqué au prix moyen du marché
         sellMarketFloor:       true,      // prix marché : jamais sous le prix du tableau (plancher)
         sellOnlyIfSoleTag:     true,      // filet de sécurité : ne vendre que si le tag de vente est le SEUL tag
@@ -5966,13 +5966,20 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         } else {
             let entry = getCachedSales(cardId);
             if (!entry) entry = await fetchCardSales(cardId); // récupère l'historique si pas en cache
-            if (entry && entry.count > 0 && Number.isFinite(entry.avg) && entry.avg > 0) {
+            /* La cote du site est donnée PAR RARETÉ ({"SR":{"average":668}}) : une carte ne
+               vaut pas la même chose selon la sienne. Prendre `entry.avg` (la première
+               rareté rencontrée) reviendrait à vendre une SR au prix d'une commune. */
+            const rar = (rarity || '').toUpperCase();
+            const marketAvg = (entry && entry.byRarity && Number.isFinite(entry.byRarity[rar]))
+                ? entry.byRarity[rar]
+                : (entry && !entry.byRarity ? entry.avg : null);
+            if (entry && entry.count > 0 && Number.isFinite(marketAvg) && marketAvg > 0) {
                 const pct = getSetting('sellMarketPricePct');
-                let price = Math.max(1, Math.round(entry.avg * (pct / 100)));
+                let price = Math.max(1, Math.round(marketAvg * (pct / 100)));
                 // Plancher : le prix marché ne descend jamais sous le prix du tableau par rareté.
                 let floored = false;
                 if (getSetting('sellMarketFloor') && price < manual) { price = manual; floored = true; }
-                result = { price, source: 'market', avg: entry.avg, count: entry.count, pct, floored, floor: manual };
+                result = { price, source: 'market', avg: marketAvg, count: entry.count, pct, floored, floor: manual };
             } else {
                 result = { price: manual, source: 'table' };
             }
@@ -6544,6 +6551,86 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         // strategy === 'random' → mélange conservé
         return shuffled.slice(0, Math.max(0, slots));
+    }
+
+    /* ═══════ APERÇU DE L'ORDRE DE VENTE ═══════
+       Montre, SANS rien vendre, ce que le Trash Seller ferait s'il partait maintenant :
+       quelles cartes, dans quel ordre, à quel prix et pour combien de temps.
+
+       Réutilise `selectTrashBatch()` et `resolveSellBasePrice()` — les fonctions du vrai
+       parcours de vente, pas une réimplémentation. Un aperçu qui calculerait le prix
+       autrement que la vente elle-même serait pire qu'aucun aperçu : il donnerait
+       confiance dans un chiffre faux. Seule différence assumée : rien n'est envoyé. */
+    async function buildSalePreview() {
+        const pool = await getTrashPool();
+        if (!Array.isArray(pool) || pool.length === 0) return { rows: [], poolSize: 0, slots: 0 };
+
+        // Mêmes créneaux que la vente réelle : plafond de ventes simultanées moins
+        // celles déjà en cours.
+        const maxActive = Math.max(1, Number(getSetting('maxActiveSales')) || 1);
+        const active = Array.isArray(lastActiveSales) ? lastActiveSales.length : 0;
+        const slots = Math.max(0, maxActive - active);
+
+        const batch = await selectTrashBatch(pool, Math.max(slots, 1));
+        const rows = [];
+        for (const item of batch) {
+            const cardId = item.card_id || item.card?.id;
+            const title = item.card?.wikipedia_title || item.title || '?';
+            const rarity = (item.card?.rarity || item.rarity || 'C').toUpperCase();
+            const info = await resolveSellBasePrice(rarity, cardId);
+            rows.push({ title, rarity, price: info.price, info, duration: getSellDuration(rarity) });
+        }
+        return { rows, poolSize: pool.length, slots, active, maxActive };
+    }
+
+    function renderSalePreview(data) {
+        const el = document.getElementById('wm-sale-preview');
+        if (!el) return;
+        if (!data || !data.rows.length) {
+            el.innerHTML = `<div style="color:#555;font-size:10px;font-style:italic;padding:3px 0;">
+                Aucune carte à vendre : le pool est vide (aucune carte étiquetée « ${esc(getSellTagName())} »).</div>`;
+            return;
+        }
+        const fmtDur = (m) => m >= 60 ? `${Math.round(m / 60)} h` : `${m} min`;
+        const rows = data.rows.map((r, i) => {
+            const rc = RARITY[r.rarity] || { color: '#888' };
+            // D'où vient le prix : c'est l'information la plus utile de l'aperçu.
+            const src = r.info.source === 'market'
+                ? (r.info.floored
+                    ? `<span style="color:#fbbf24;" title="Moyenne du marché ${r.info.avg} 💰, relevée sous ton prix de tableau : le plancher s'applique.">🛡️ plancher</span>`
+                    : `<span style="color:#4ade80;" title="Moyenne du marché en ${r.rarity} : ${r.info.avg} 💰, sur ${r.info.count} vente(s)${r.info.pct !== 100 ? ` · ${r.info.pct} % appliqués` : ''}">💹 marché</span>`)
+                : `<span style="color:#888;" title="Aucune cote connue pour cette carte dans cette rareté — prix par défaut du tableau par rareté.">📋 défaut</span>`;
+            const degr = r.info.degressive
+                ? ` <span style="color:#f97316;" title="Invendue ${r.info.degressive.retag} fois : -${r.info.degressive.discountPct} % (avant ${r.info.degressive.before} 💰)">📉</span>`
+                : '';
+            return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;">
+                <span style="color:#555;min-width:14px;text-align:right;font-family:'JetBrains Mono',monospace;">${i + 1}</span>
+                <span style="color:${rc.color};font-weight:700;min-width:22px;">${r.rarity}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;" title="${esc(r.title)}">${esc(r.title)}</span>
+                <span style="font-size:9px;white-space:nowrap;">${src}${degr}</span>
+                <span style="color:#fbbf24;font-weight:700;white-space:nowrap;min-width:46px;text-align:right;">${r.price.toLocaleString('fr-FR')} 💰</span>
+                <span style="color:#888;white-space:nowrap;min-width:38px;text-align:right;">${fmtDur(r.duration)}</span>
+            </div>`;
+        }).join('');
+        const total = data.rows.reduce((s, r) => s + r.price, 0);
+        el.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;color:#5dade2;
+                text-transform:uppercase;letter-spacing:1px;margin:2px 0 3px;">
+                <span>👁️ Ordre de vente — aperçu</span>
+                <button id="wm-preview-close" title="Fermer l'aperçu"
+                    style="background:none;border:none;color:#666;cursor:pointer;font-size:12px;line-height:1;padding:0 2px;">×</button>
+            </div>
+            <div style="font-size:9px;color:#666;margin-bottom:3px;">
+                ${data.rows.length} carte(s) sur les <b>${data.slots}</b> créneau(x) libres
+                (${data.active}/${data.maxActive} ventes en cours) · pool de ${data.poolSize} ·
+                stratégie « ${esc(getSetting('trashSellStrategy'))} » · total <b style="color:#fbbf24;">${total.toLocaleString('fr-FR')} 💰</b>
+            </div>
+            ${rows}
+            <div style="font-size:9px;color:#555;font-style:italic;margin-top:3px;">
+                Rien n'a été vendu. Les prix marché peuvent bouger d'ici la mise en vente réelle.
+            </div>`;
+        const close = document.getElementById('wm-preview-close');
+        if (close) close.onclick = () => { el.innerHTML = ''; };
     }
 
     // Annule une vente SANS mise dans le cadre d'un "Refresh ventes" : DELETE l'enchère,
@@ -8907,11 +8994,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px;">
                         <div class="wm-lbl" style="margin:0;">Ventes actives</div>
                         <div style="display:flex;align-items:center;gap:6px;">
+                            <button id="wm-preview-sales-btn" title="Montre, SANS rien vendre, les prochaines cartes qui partiraient : dans quel ordre, à quel prix, et pour combien de temps."
+                                style="font-size:9px;color:#5dade2;background:rgba(52,152,219,0.08);border:1px solid rgba(52,152,219,0.35);border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">👁️ Aperçu</button>
                             <button id="wm-refresh-sales-btn" title="Annule les ventes sans mise et remet en vente les meilleures cartes selon ta stratégie (Paramètres)"
                                 style="font-size:9px;color:#c084fc;background:rgba(192,132,252,0.08);border:1px solid rgba(192,132,252,0.35);border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">🔄 Refresh ventes</button>
                             <span id="wm-active-sales-count" style="font-size:9px;color:#888;font-family:'JetBrains Mono',monospace;">0/5</span>
                         </div>
                     </div>
+                    <div id="wm-sale-preview" style="margin-bottom:8px;"></div>
                     <div id="wm-active-sales" style="margin-bottom:8px;"></div>
                     <div class="wm-sep"></div>
                     <div class="wm-lbl">Ventes (aujourd'hui)</div>
@@ -9556,6 +9646,27 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const trashStatus = document.getElementById("wm-trash-status");
 
         // Bouton "Refresh ventes" : annule les ventes sans mise et re-liste selon la stratégie
+        /* Aperçu de l'ordre de vente. Peut demander des cotes manquantes au marché,
+           d'où l'état d'attente sur le bouton — sans lui on ne saurait pas si le clic
+           a été pris en compte. */
+        const previewBtn = document.getElementById('wm-preview-sales-btn');
+        if (previewBtn) previewBtn.onclick = async () => {
+            if (previewBtn.disabled) return;
+            previewBtn.disabled = true;
+            const prev = previewBtn.innerText;
+            previewBtn.innerText = '⏳ …';
+            try {
+                renderSalePreview(await buildSalePreview());
+            } catch (e) {
+                const el = document.getElementById('wm-sale-preview');
+                if (el) el.innerHTML = `<div style="color:#ef4444;font-size:10px;">Aperçu impossible : ${esc((e && e.message) || e)}</div>`;
+                wmLog(`⚠️ Aperçu de vente : ${esc((e && e.message) || e)}`);
+            } finally {
+                previewBtn.disabled = false;
+                previewBtn.innerText = prev || '👁️ Aperçu';
+            }
+        };
+
         const refreshSalesBtn = document.getElementById('wm-refresh-sales-btn');
         if (refreshSalesBtn) {
             refreshSalesBtn.onclick = () => {

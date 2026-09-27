@@ -45,6 +45,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
   `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
   sur le code réellement livré, pas sur une copie.
+- `tests/trash-seller-preview.test.mjs` : vérifie que le prix de vente suit la moyenne
+  de la BONNE rareté, retombe sur le prix par défaut sans cote, et que l'aperçu annonce
+  l'ordre, les prix et leur origine.
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -115,6 +118,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       recherche du site, quelques requêtes au lieu de ~300 pages (audit #32)
 - [x] Filtres d'affichage du marché : pastilles de rareté, liste déroulante par
       mot-clé, bouton de vidage de la liste
+- [x] Trash Seller : prix = moyenne du marché de la bonne rareté (repli sur le prix
+      par défaut), et aperçu de l'ordre de vente (audit #33)
 - [x] Scan : saut par dichotomie des pages d'enchères déjà terminées, en repli
       (audit #25)
 - [x] Cotes : même endpoint que le site (`?scope=summary`), moyenne lue par rareté,

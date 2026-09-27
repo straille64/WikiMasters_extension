@@ -505,6 +505,33 @@ Trois précautions :
 poignée de requêtes — et le repli déclenché quand l'API ignore `q` (scénario où le bruit
 arrive en tête, sinon une page 1 accidentellement filtrée ne prouverait rien).
 
+### 33. Trash Seller : prix au marché, et aperçu de l'ordre de vente
+Demande utilisateur. Deux points, liés : l'aperçu n'a de valeur que s'il annonce **le**
+prix réellement pratiqué.
+
+**Prix = moyenne du marché, repli sur le tableau.** `resolveSellBasePrice()` savait déjà
+le faire, mais l'option était **désactivée par défaut** — elle passe à activée. Surtout,
+un défaut de correction : depuis que la cote vient de `?scope=summary`, elle est donnée
+**par rareté** (`{"SR":{"average":668},"C":{"average":7}}`). Lire `entry.avg` (la première
+rareté rencontrée) revenait à vendre une SR au prix moyen d'une commune — une perte
+sèche. La moyenne de la rareté demandée est désormais choisie explicitement, et
+`entry.avg` n'est utilisé que pour les entrées de cache à l'ancien format.
+
+**Aperçu de l'ordre de vente.** Bouton 👁️ Aperçu dans le panneau : liste, sans rien
+vendre, les prochaines cartes qui partiraient — rang, rareté, titre, **origine du prix**
+(💹 marché / 📋 défaut / 🛡️ plancher / 📉 dégressif), prix et durée, avec le total et la
+stratégie en cours.
+
+Il réutilise `selectTrashBatch()` et `resolveSellBasePrice()` — les fonctions du vrai
+parcours de vente, pas une réimplémentation. Un aperçu qui calculerait le prix autrement
+que la vente elle-même serait pire qu'aucun aperçu : il donnerait confiance dans un
+chiffre faux. Seule différence assumée : rien n'est envoyé.
+
+`tests/trash-seller-preview.test.mjs` monte trois cartes — une SR cotée, une C cotée
+(même carte, cotes 668 et 7) et une SR sans cote — et vérifie que la SR part à 668, que
+7 n'apparaît jamais, que la carte sans cote retombe sur les 123 du tableau, que l'origine
+de chaque prix est affichée et que l'ordre suit la stratégie choisie.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
