@@ -64,6 +64,11 @@ const srv = http.createServer((_, res) => {
     <div style="display:flex;flex-wrap:wrap;gap:8px">${VISIBLE.map(c => tile(c[0], c[1])).join('')}</div>
     <div style="height:4000px"></div>
     <div style="display:flex;flex-wrap:wrap;gap:8px">${FAR.map(c => tile(c[0], c[1])).join('')}</div>
+    <!-- Fenêtre modale « Mettre aux enchères » : même structure de carte, en position
+         fixe. Elle ne doit PAS être décorée (le site y affiche déjà sa MOYENNE). -->
+    <div style="position:fixed;inset:0;z-index:60;background:rgba(0,0,0,0.7)">
+      ${tile('Hassidisme', 'mouvement religieux juif')}
+    </div>
   </body></html>`);
 });
 await new Promise(r => srv.listen(0, '127.0.0.1', r));
@@ -102,9 +107,11 @@ await page.route(new RegExp('^(?!' + origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&
 await page.route('**/api/my-collection**', r => r.fulfill({ status: 200, contentType: 'application/json',
   body: JSON.stringify({ collection: ALL.map(([t]) => ({ card_id: cardId(t), count: 1,
     card: { id: cardId(t), wikipedia_title: t, rarity: 'SR' } })) }) }));
+let refuseSales = true; // le site refuse d'abord au bot, comme en production
 await page.route('**/api/marketplace/cards/*/sales**', r => {
   const id = r.request().url().match(/cards\/([^/]+)\/sales/)[1];
   salesAsked.push(id);
+  if (refuseSales) return r.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"Forbidden"}' });
   return r.fulfill({ status: 200, contentType: 'application/json',
     body: JSON.stringify({ sales: [{ final_price: 40, settled_at: new Date().toISOString() },
                                    { final_price: 48, settled_at: new Date().toISOString() }] }) });
@@ -138,6 +145,21 @@ await page.evaluate(script).catch(e => errors.push(String(e)));
 await page.evaluate(() => fetch('/api/my-collection?page=0&limit=200').catch(() => {}));
 await page.waitForTimeout(9000);
 
+// Le bot s'est fait refuser la cote : le badge doit dire « ? », pas un faux prix.
+const refusedText = await page.evaluate(() =>
+  (document.querySelector('.wm-coll-price') || {}).textContent || '');
+
+// Maintenant le SITE récupère lui-même la cote (c'est ce qu'il fait en ouvrant
+// « Mettre aux enchères »). L'intercepteur doit la capter et remplir le badge,
+// sans que le bot ait à redemander quoi que ce soit.
+refuseSales = false;
+const askedBefore = salesAsked.length;
+await page.evaluate(id => fetch(`/api/marketplace/cards/${id}/sales`).catch(() => {}), 'card-0');
+await page.waitForTimeout(1500);
+const adoptedText = await page.evaluate(() =>
+  (document.querySelector('.wm-coll-price') || {}).textContent || '');
+const askedAfter = salesAsked.length;
+
 const state = await page.evaluate(() => {
   const badges = [...document.querySelectorAll('.wm-coll-price')];
   const first = badges[0];
@@ -147,6 +169,7 @@ const state = await page.evaluate(() => {
     buttons: document.querySelectorAll('.wm-coll-trash').length,
     // Le bouton doit avoir rejoint la pile d'icônes du site, à côté de l'étoile.
     nextToFav: !!document.querySelector('button[aria-label="Ajouter aux favoris"] + .wm-coll-trash'),
+    inModal: document.querySelectorAll('div[style*="fixed"] .wm-coll-price').length,
   };
 });
 
@@ -166,7 +189,12 @@ const problems = [];
 if (state.badges !== ALL.length) problems.push(`${state.badges} badges de prix au lieu de ${ALL.length}`);
 if (state.buttons !== ALL.length) problems.push(`${state.buttons} boutons de défausse au lieu de ${ALL.length}`);
 if (!state.nextToFav) problems.push("le bouton n'est pas placé à côté de l'étoile favoris du site");
-if (!/≈\s*44/.test(state.firstText)) problems.push(`cote affichée « ${state.firstText} » — attendu la médiane ≈ 44`);
+if (!/\?/.test(refusedText)) problems.push(`cote « ${refusedText} » après refus — attendu « ? », jamais un faux prix`);
+if (!/≈\s*44/.test(adoptedText)) problems.push(`cote « ${adoptedText} » après la requête du SITE — la réponse du site n'a pas été captée`);
+// Le bot ne doit pas avoir redemandé : c'est la requête du site qui a servi.
+if (askedAfter - askedBefore !== 1) problems.push(`${askedAfter - askedBefore} requête(s) /sales pendant la reprise — une seule, celle du site, est attendue`);
+// La mini-carte de la fenêtre modale ne doit pas être décorée.
+if (state.inModal > 0) problems.push(`${state.inModal} carte(s) décorée(s) dans la fenêtre modale`);
 // Le contrôle qui compte : seules les cartes VISIBLES sont interrogées.
 if (salesAsked.length === 0) problems.push('aucune cote demandée — le scénario ne prouve rien');
 if (salesAsked.length > VISIBLE.length + 2) {
@@ -183,4 +211,4 @@ if (problems.length) {
   for (const p of problems) console.error('  · ' + p);
   process.exit(1);
 }
-console.log(`✅ ${state.badges} cartes décorées · cote ${state.firstText.trim()} · ${salesAsked.length} cote(s) demandée(s) (visibles seulement) · bascule étiquette : pose + retrait OK`);
+console.log(`✅ ${state.badges} cartes décorées (modale ignorée) · cote reprise du site après refus · cote ${state.firstText.trim()} · ${salesAsked.length} cote(s) demandée(s) (visibles seulement) · bascule étiquette : pose + retrait OK`);

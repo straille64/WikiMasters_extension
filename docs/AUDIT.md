@@ -384,6 +384,28 @@ succès silencieux.
 `tests/collection-overlay.test.mjs` simule l'état serveur et vérifie la bascule dans les
 deux sens : pose → ♻️, retrait → 🗑️, avec exactement un POST et un DELETE.
 
+### 27. La cote restait « ? » alors que le site l'affichait
+Capture utilisateur : dans « Mettre aux enchères », le site affiche **MOYENNE 82** et,
+juste à côté, le badge du bot affiche **?**. La donnée était donc accessible — c'est la
+récupération du bot qui restait bloquée sur un refus antérieur.
+
+**✅ Corrigé (1.3.13-fork.12)** — trois changements :
+
+- **On capte la cote que le site récupère lui-même.** Le parsing de `/sales` est extrait
+  dans `storeSalesEntry()`, que l'intercepteur réseau appelle aussi. Ouvrir « Mettre aux
+  enchères » (ou n'importe quelle vue du site qui demande l'historique) remplit donc le
+  cache du bot — zéro requête ajoutée, et ça contourne un refus sur notre propre appel.
+- **Le blocage après refus devient progressif** : 1 min, 2, 4… plafonné à 30 min, au lieu
+  d'un forfait plat de 10 min qui laissait un « ? » affiché bien après que le site eut
+  recommencé à répondre.
+- **Les fenêtres modales ne sont plus décorées.** Elles contiennent une mini-carte de
+  même structure : le bot y ajoutait un badge en doublon de la MOYENNE du site, et un
+  bouton par-dessus ses commandes. Reconnues à leur conteneur en position fixe.
+
+`tests/collection-overlay.test.mjs` couvre la séquence complète : refus → badge « ? »
+(jamais un faux prix), puis requête du **site** → badge rempli **sans** que le bot
+redemande quoi que ce soit, et mini-carte de modale laissée intacte.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

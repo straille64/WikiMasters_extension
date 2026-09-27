@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.11
+// @version      1.3.13-fork.12
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.11';
+    const WM_VERSION = '1.3.13-fork.12';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -753,13 +753,21 @@
        chaque scan, pour chaque carte refusée. C'est ce qui saturait l'API et faisait
        tomber /api/packs/open en 403 par ricochet, sans rapport avec le Pack Opener.
        On ne bloque que 10 min : un refus est transitoire, on retente plus tard. */
-    const SALES_FAIL_TTL = 10 * 60 * 1000;
+    /* Blocage PROGRESSIF après un refus : 1 min, puis 2, 4… plafonné à 30 min. Un
+       blocage plat de 10 min laissait un « ? » affiché bien après que le site eut
+       recommencé à répondre. */
+    const SALES_FAIL_BASE_MS = 60 * 1000;
+    const SALES_FAIL_MAX_MS = 30 * 60 * 1000;
+    function salesFailTtl(entry) {
+        const n = Math.max(1, (entry && entry.failCount) || 1);
+        return Math.min(SALES_FAIL_BASE_MS * Math.pow(2, n - 1), SALES_FAIL_MAX_MS);
+    }
     let salesEndpointCooldownUntil = 0;
     let _salesCooldownLogged = 0;
 
     function salesFetchBlocked(cardId) {
         const e = salesCache[cardId];
-        return !!(e && e.failed && Date.now() - e.fetchedAt < SALES_FAIL_TTL);
+        return !!(e && e.failed && Date.now() - e.fetchedAt < salesFailTtl(e));
     }
 
     // File d'attente des cartes à fetcher (étalée pour ne pas flooder l'API)
@@ -776,6 +784,34 @@
         return Math.round(m);
     }
 
+    /* Transforme une réponse /sales en entrée de cache. Extrait de fetchCardSales pour
+       que l'INTERCEPTEUR puisse en faire autant : quand le site récupère lui-même la cote
+       d'une carte (c'est ce qu'il fait en ouvrant « Mettre aux enchères », où il affiche
+       MOYENNE), le bot la capte au passage. Zéro requête, et ça contourne un refus
+       éventuel sur notre propre appel. */
+    function storeSalesEntry(cardId, data) {
+        if (!cardId || !data) return null;
+        const sales = (data.sales || []).filter(s => Number.isFinite(s.final_price));
+        const prices = sales.map(s => s.final_price);
+        // "recent" est trié du plus récent au plus ancien côté API ; sinon on trie nous-mêmes
+        const recent = (data.recent && data.recent.length ? data.recent : sales)
+            .filter(s => Number.isFinite(s.final_price))
+            .slice()
+            .sort((a, b) => new Date(b.settled_at) - new Date(a.settled_at));
+        const entry = {
+            median: median(prices),
+            count: prices.length,
+            last: recent.length ? recent[0].final_price : null,
+            avg: prices.length ? Math.round(prices.reduce((s, p) => s + p, 0) / prices.length) : null,
+            min: prices.length ? Math.min(...prices) : null,
+            max: prices.length ? Math.max(...prices) : null,
+            fetchedAt: Date.now()
+        };
+        salesCache[cardId] = entry; // écrase une éventuelle entrée d'échec
+        saveSalesCache();
+        return entry;
+    }
+
     // Récupère et met en cache l'historique d'une carte (une requête)
     async function fetchCardSales(cardId) {
         try {
@@ -787,8 +823,10 @@
                 // Trace l'échec dans le cache (cf. SALES_FAIL_TTL) pour ne pas redemander
                 // cette carte à chaque scan. `failed` la rend invisible à getCachedSales,
                 // donc l'affichage reste « en cours de chargement », pas une fausse donnée.
+                const prevFails = (salesCache[cardId] && salesCache[cardId].failCount) || 0;
                 salesCache[cardId] = { median: 0, count: 0, last: null, avg: null,
                                        min: null, max: null, failed: true,
+                                       failCount: prevFails + 1,
                                        status: res.status, fetchedAt: Date.now() };
                 saveSalesCache();
                 if (res.status === 403 || res.status === 429) {
@@ -800,25 +838,7 @@
                 }
                 return null;
             }
-            const data = await res.json();
-            const sales = (data.sales || []).filter(s => Number.isFinite(s.final_price));
-            const prices = sales.map(s => s.final_price);
-            // "recent" est trié du plus récent au plus ancien côté API ; sinon on trie nous-mêmes
-            const recent = (data.recent && data.recent.length ? data.recent : sales)
-                .filter(s => Number.isFinite(s.final_price))
-                .slice()
-                .sort((a, b) => new Date(b.settled_at) - new Date(a.settled_at));
-            const entry = {
-                median: median(prices),
-                count: prices.length,
-                last: recent.length ? recent[0].final_price : null,
-                avg: prices.length ? Math.round(prices.reduce((s, p) => s + p, 0) / prices.length) : null,
-                min: prices.length ? Math.min(...prices) : null,
-                max: prices.length ? Math.max(...prices) : null,
-                fetchedAt: Date.now()
-            };
-            salesCache[cardId] = entry;
-            saveSalesCache();
+            return storeSalesEntry(cardId, await res.json());
             return entry;
         } catch(e) { return null; }
     }
@@ -11895,6 +11915,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // accessible après le try — url/method y sont en `const`, portée bloc uniquement.
             let isMarketplaceCreate = false;
             let isCollectionFetch = false;
+            let siteSalesCardId = null;
             try {
                 const req = args[0];
                 const url = (typeof req === 'string') ? req : (req && req.url) || '';
@@ -11912,6 +11933,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // site ne portant aucun identifiant, c'est ce qui permet de relier une
                 // tuile à sa carte — et ça ne coûte aucune requête supplémentaire.
                 isCollectionFetch = method === 'GET' && /\/api\/my-collection/.test(url);
+                // Le site récupère lui-même l'historique d'une carte (c'est ce qu'il fait
+                // en ouvrant « Mettre aux enchères », où il affiche MOYENNE). On le capte
+                // au passage : aucune requête ajoutée, et ça donne la cote même quand
+                // NOTRE propre appel se fait refuser.
+                const salesMatch = method === 'GET' && url.match(/\/marketplace\/cards\/([^/?#]+)\/sales/);
+                siteSalesCardId = salesMatch ? salesMatch[1] : null;
                 // Capture le payload d'un POST /rest/v1/... pour le rejouer/exploiter côté bot.
                 const capture = () => {
                     if (args[1] && typeof args[1].body === 'string') return { body: args[1].body };
@@ -11948,6 +11975,15 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             if (d && d.auction_id) _lastUiListingAuctionId = d.auction_id;
                         }).catch(() => {});
                     }
+                }).catch(() => {});
+            }
+
+            if (siteSalesCardId) {
+                p.then(res => {
+                    if (!res || !res.ok) return;
+                    res.clone().json().then(d => {
+                        if (storeSalesEntry(siteSalesCardId, d)) refreshCollectionBadges();
+                    }).catch(() => {});
                 }).catch(() => {});
             }
 
@@ -12913,6 +12949,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         for (const img of document.querySelectorAll('img[alt]')) {
             const alt = (img.getAttribute('alt') || '').trim();
             if (!alt) continue;
+            // Les fenêtres modales du site (« Mettre aux enchères »…) contiennent une
+            // mini-carte de même structure. Les décorer y ajoute un doublon inutile —
+            // le site y affiche déjà sa MOYENNE — et un bouton par-dessus ses propres
+            // commandes. On les reconnaît à leur conteneur en position fixe.
+            let inModal = false;
+            for (let a = img.parentElement; a && a !== document.body; a = a.parentElement) {
+                if (getComputedStyle(a).position === 'fixed') { inModal = true; break; }
+            }
+            if (inModal) continue;
+
             let el = img.parentElement;
             for (let depth = 0; el && depth < 6; el = el.parentElement, depth++) {
                 const h3 = el.querySelector('h3');
