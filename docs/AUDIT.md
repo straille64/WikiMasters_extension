@@ -532,6 +532,34 @@ chiffre faux. Seule différence assumée : rien n'est envoyé.
 7 n'apparaît jamais, que la carte sans cote retombe sur les 123 du tableau, que l'origine
 de chaque prix est affichée et que l'ordre suit la stratégie choisie.
 
+### 34. « Plancher » se lisait comme « prix par défaut »
+Retour utilisateur : « pour le prix moyen de vente ce n'est pas bon, ça met le prix par
+défaut de la rareté ». Vérification faite sur ses propres chiffres, **le calcul était
+juste** : cote R à 7, minimum de tableau à 20 → 7 < 20 → on vend à 20. C'est exactement
+la règle demandée (prix du marché, relevé au minimum s'il passe dessous).
+
+Le défaut était l'**affichage**. L'aperçu écrivait `🛡️ plancher · 20 💰` sans jamais
+montrer la cote trouvée : impossible de distinguer « cote de 7 relevée à 20 » de « aucune
+cote, prix par défaut ». Les deux aboutissent au même nombre, et on ne peut pas faire
+confiance à un prix dont on ne voit pas la provenance.
+
+Deuxième angle mort : le réglage `sellMarketPricePct` valait **110 %** chez l'utilisateur
+(valeur d'origine en amont, conservée puisque déjà en localStorage). À 110 %, le prix
+n'est plus « la moyenne du marché » — et rien ne le rappelait une fois les Paramètres
+refermés.
+
+**✅ Corrigé (1.3.13-fork.18)** — aucun changement de règle, seulement de lisibilité :
+
+- `resolveSellBasePrice()` conserve `marketPrice`, le prix issu de la règle marché **avant**
+  plancher. Sans cette valeur, expliquer le résultat était impossible.
+- L'aperçu affiche les deux chiffres : `🛡️ marché 7 → min 20`, `💹 marché 668`, ou
+  `📋 pas de cote → min`. L'infobulle donne la cote, le nombre de ventes et le minimum.
+- Un bandeau apparaît quand le pourcentage n'est pas 100 %, avec la valeur appliquée.
+- Une ligne rappelle la règle en toutes lettres, au-dessus de la liste.
+
+`tests/trash-seller-preview.test.mjs` rejoue le cas exact remonté (cote 7 en R, minimum 20)
+et exige que l'aperçu affiche « marché 7 → min 20 » — pas seulement le bon prix final.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

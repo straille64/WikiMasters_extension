@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.17
+// @version      1.3.13-fork.18
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.17';
+    const WM_VERSION = '1.3.13-fork.18';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -5997,10 +5997,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (entry && entry.count > 0 && Number.isFinite(marketAvg) && marketAvg > 0) {
                 const pct = getSetting('sellMarketPricePct');
                 let price = Math.max(1, Math.round(marketAvg * (pct / 100)));
+                const marketPrice = price; // ce que la règle marché donne AVANT plancher
                 // Plancher : le prix marché ne descend jamais sous le prix du tableau par rareté.
                 let floored = false;
                 if (getSetting('sellMarketFloor') && price < manual) { price = manual; floored = true; }
-                result = { price, source: 'market', avg: marketAvg, count: entry.count, pct, floored, floor: manual };
+                result = { price, source: 'market', avg: marketAvg, marketPrice,
+                           count: entry.count, pct, floored, floor: manual };
             } else {
                 result = { price: manual, source: 'table' };
             }
@@ -6616,11 +6618,15 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const rows = data.rows.map((r, i) => {
             const rc = RARITY[r.rarity] || { color: '#888' };
             // D'où vient le prix : c'est l'information la plus utile de l'aperçu.
+            const pctNote = r.info.pct !== undefined && r.info.pct !== 100
+                ? ` × ${r.info.pct} % → ${r.info.marketPrice} 💰` : '';
             const src = r.info.source === 'market'
                 ? (r.info.floored
-                    ? `<span style="color:#fbbf24;" title="Moyenne du marché ${r.info.avg} 💰, relevée sous ton prix de tableau : le plancher s'applique.">🛡️ plancher</span>`
-                    : `<span style="color:#4ade80;" title="Moyenne du marché en ${r.rarity} : ${r.info.avg} 💰, sur ${r.info.count} vente(s)${r.info.pct !== 100 ? ` · ${r.info.pct} % appliqués` : ''}">💹 marché</span>`)
-                : `<span style="color:#888;" title="Aucune cote connue pour cette carte dans cette rareté — prix par défaut du tableau par rareté.">📋 défaut</span>`;
+                    // On affiche les DEUX chiffres : la cote trouvée, et le minimum qui la
+                    // remplace. Sans ça « plancher » se lit comme « aucune cote trouvée ».
+                    ? `<span style="color:#fbbf24;" title="Cote du marché en ${r.rarity} : ${r.info.avg} 💰 (sur ${r.info.count} vente(s))${pctNote}. C'est sous ton minimum de ${r.info.floor} 💰 pour cette rareté → on vend au minimum.">🛡️ marché ${r.info.marketPrice} → min ${r.info.floor}</span>`
+                    : `<span style="color:#4ade80;" title="Cote du marché en ${r.rarity} : ${r.info.avg} 💰, sur ${r.info.count} vente(s)${pctNote}. Au-dessus de ton minimum de ${r.info.floor} 💰 → on vend au prix du marché.">💹 marché ${r.info.avg}</span>`)
+                : `<span style="color:#888;" title="Aucune cote connue pour cette carte en ${r.rarity} — on applique le minimum du tableau par rareté.">📋 pas de cote → min</span>`;
             const degr = r.info.degressive
                 ? ` <span style="color:#f97316;" title="Invendue ${r.info.degressive.retag} fois : -${r.info.degressive.discountPct} % (avant ${r.info.degressive.before} 💰)">📉</span>`
                 : '';
@@ -6634,6 +6640,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             </div>`;
         }).join('');
         const total = data.rows.reduce((s, r) => s + r.price, 0);
+        const marketPct = getSetting('sellMarketPricePct');
         el.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;color:#5dade2;
                 text-transform:uppercase;letter-spacing:1px;margin:2px 0 3px;">
@@ -6645,6 +6652,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 ${data.rows.length} carte(s) sur les <b>${data.slots}</b> créneau(x) libres
                 (${data.active}/${data.maxActive} ventes en cours) · pool de ${data.poolSize} ·
                 stratégie « ${esc(getSetting('trashSellStrategy'))} » · total <b style="color:#fbbf24;">${total.toLocaleString('fr-FR')} 💰</b>
+            </div>
+            ${marketPct !== 100 ? `<div style="font-size:9px;color:#fbbf24;margin-bottom:3px;">
+                ⚠️ Réglages : <b>${marketPct} %</b> de la cote sont appliqués, donc le prix n'est pas la moyenne du marché.
+                Mets ce pourcentage à <b>100</b> dans Paramètres pour vendre exactement au prix moyen.
+            </div>` : ''}
+            <div style="font-size:9px;color:#666;margin-bottom:4px;">
+                Règle : prix du marché, relevé à ton <b>minimum par rareté</b> s'il passe dessous ;
+                minimum aussi quand aucune cote n'est connue.
             </div>
             ${rows}
             <div style="font-size:9px;color:#555;font-style:italic;margin-top:3px;">

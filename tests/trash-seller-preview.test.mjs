@@ -48,11 +48,16 @@ const POOL = [
   { cardId: 'sr-cote', title: 'Carte SR cotée', rarity: 'SR' },
   { cardId: 'c-cote', title: 'Carte C cotée', rarity: 'C' },
   { cardId: 'sr-sans', title: 'Carte SR sans cote', rarity: 'SR' },
+  // Cas réel remonté en production : cote de 7 en R, minimum du tableau à 20.
+  // Le prix doit remonter au minimum — et l'aperçu doit MONTRER les deux chiffres,
+  // sinon « plancher » se lit comme « aucune cote trouvée ».
+  { cardId: 'r-sous-min', title: 'Carte R sous le minimum', rarity: 'R' },
 ];
 // La même carte vaut 668 en SR et 7 en C : c'est ce qui piège une lecture naïve.
 const SUMMARY = {
   'sr-cote': { SR: { average: 668 }, C: { average: 7 } },
   'c-cote': { SR: { average: 668 }, C: { average: 7 } },
+  'r-sous-min': { R: { average: 7 } },
 };
 
 await page.goto(origin + '/collection');
@@ -65,7 +70,7 @@ await page.evaluate(pool => {
   // Prix par défaut du tableau : c'est le repli attendu pour la carte sans cote.
   localStorage.setItem('wm_sell_config', JSON.stringify({
     L: { price: 900, duration: 720 }, UR: { price: 500, duration: 720 },
-    SR: { price: 123, duration: 360 }, R: { price: 40, duration: 60 },
+    SR: { price: 123, duration: 360 }, R: { price: 20, duration: 60 },
     PC: { price: 20, duration: 60 }, C: { price: 11, duration: 30 },
   }));
 }, POOL);
@@ -132,8 +137,18 @@ for (const t of ['Carte SR cotée', 'Carte C cotée', 'Carte SR sans cote']) {
   if (!preview.includes(t)) problems.push(`« ${t} » absente de l'aperçu`);
 }
 // L'aperçu doit dire d'où vient chaque prix, sinon il n'apprend rien.
-if (!/marché/.test(preview) || !/défaut|plancher/.test(preview)) {
-  problems.push("l'aperçu n'indique pas l'origine des prix (marché / défaut / plancher)");
+if (!/marché/.test(preview) || !/pas de cote/.test(preview)) {
+  problems.push("l'aperçu n'indique pas l'origine des prix (marché / pas de cote)");
+}
+/* Le cœur de la correction : quand la cote passe sous le minimum, l'aperçu doit
+   afficher LES DEUX chiffres (cote trouvée et minimum appliqué). Sans ça, l'utilisateur
+   lit « plancher 20 » comme « aucune cote, prix par défaut » — c'est exactement la
+   confusion remontée. */
+if (!/marché\s*7\s*→\s*min\s*20/.test(preview)) {
+  problems.push("l'aperçu n'explique pas le passage au minimum (attendu « marché 7 → min 20 »)");
+}
+if (!preview.includes('Carte R sous le minimum')) {
+  problems.push('la carte R sous le minimum est absente');
 }
 // Ordre : stratégie « rareté » → les SR avant la C.
 const iC = preview.indexOf('Carte C cotée');
