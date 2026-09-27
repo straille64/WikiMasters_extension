@@ -45,6 +45,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
   `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
   sur le code réellement livré, pas sur une copie.
+- `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
+  cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
   pagination, et retombe sur le balayage complet si l'API cesse d'honorer le paramètre.
 - `tests/market-dead-pages.test.mjs` : 40 pages d'enchères terminées puis 3 vivantes —
@@ -111,6 +113,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       réversible (audit #24, #26)
 - [x] Scan : recherche côté serveur (`q=`) par mot-clé — mêmes résultats que la
       recherche du site, quelques requêtes au lieu de ~300 pages (audit #32)
+- [x] Filtres d'affichage du marché : pastilles de rareté, liste déroulante par
+      mot-clé, bouton de vidage de la liste
 - [x] Scan : saut par dichotomie des pages d'enchères déjà terminées, en repli
       (audit #25)
 - [x] Cotes : même endpoint que le site (`?scope=summary`), moyenne lue par rareté,

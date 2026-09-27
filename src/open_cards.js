@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.15';
+    const WM_VERSION = '1.3.13-fork.16';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -659,6 +659,19 @@
     // Filtre de recherche live du Market Watcher (transitoire, non persisté)
     let marketSearchQuery = '';
     // Masquer les enchères dont je possède déjà la carte (persisté)
+    /* Filtres d'affichage des résultats. Persistés : on ne veut pas les reposer à chaque
+       rechargement de page, comme le tri et la vue. `marketRarityFilter` vide = toutes
+       les raretés ; `marketKeywordFilter` vide = tous les mots-clés. */
+    const MARKET_RARITY_FILTER_KEY = 'wm_market_rarity_filter';
+    const MARKET_KEYWORD_FILTER_KEY = 'wm_market_keyword_filter';
+    let marketRarityFilter = new Set();
+    let marketKeywordFilter = '';
+    try {
+        const raw = localStorage.getItem(MARKET_RARITY_FILTER_KEY);
+        if (raw) marketRarityFilter = new Set(JSON.parse(raw));
+    } catch(e) {}
+    try { marketKeywordFilter = localStorage.getItem(MARKET_KEYWORD_FILTER_KEY) || ''; } catch(e) {}
+
     const MARKET_HIDE_OWNED_KEY = 'wm_market_hide_owned';
     let marketHideOwned = false;
     try { marketHideOwned = localStorage.getItem(MARKET_HIDE_OWNED_KEY) === '1'; } catch(e) {}
@@ -1443,6 +1456,11 @@
     }
 
     function saveWatchlist() {
+        // La liste déroulante « mot-clé » du panneau marché se reconstruit depuis
+        // WATCHLIST : sans ça, un mot ajouté ou retiré n'y apparaîtrait qu'après un F5.
+        if (typeof window.wmRefreshKeywordFilter === 'function') {
+            try { setTimeout(window.wmRefreshKeywordFilter, 0); } catch(e) {}
+        }
         try { localStorage.setItem(WATCHLIST_KEY, JSON.stringify(WATCHLIST)); }
         catch(e) { wmLog(`⚠️ Sauvegarde des mots-clés ÉCHOUÉE : <b>${esc(e.name || 'Erreur')}</b> — ${esc(e.message || 'inconnue')}`); }
         compileWatchlist();
@@ -4492,9 +4510,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // + masquage des cartes déjà possédées.
         const totalBeforeFilter = hits.length;
         const sq = marketSearchNorm(marketSearchQuery.trim());
-        const filterActive = sq || marketHideOwned;
+        const filterActive = sq || marketHideOwned || marketRarityFilter.size > 0 || marketKeywordFilter;
         if (filterActive) {
             hits = hits.filter(a => {
+                if (marketRarityFilter.size > 0
+                    && !marketRarityFilter.has((a.card?.rarity || '').toUpperCase())) return false;
+                if (marketKeywordFilter) {
+                    // Quel mot-clé a fait remonter cette annonce ? Même règle que
+                    // l'affichage du badge, donc ce que l'utilisateur lit sur la ligne.
+                    const k = matchedKeyword(a.card);
+                    if (!k || k.toLowerCase() !== marketKeywordFilter.toLowerCase()) return false;
+                }
                 // Masque les cartes déjà possédées DANS LA MÊME RARETÉ. Une carte possédée en
                 // SR mais listée en UR (revalorisée par le site) n'est PAS un doublon → visible.
                 if (marketHideOwned && isOwnedDuplicate(a.card?.id ?? a.card_id, a.card?.rarity)) return false;
@@ -8844,6 +8870,23 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             <option value="cards">🖼 Cadres</option>
                         </select>
                     </div>
+                    <!-- Filtres d'affichage : ils ne touchent PAS au scan, seulement à ce
+                         qui est montré. Les raretés sont des bascules indépendantes (on
+                         veut souvent « UR + L » et rien d'autre) ; le mot-clé est une liste
+                         déroulante, puisqu'on regarde les résultats d'un mot à la fois. -->
+                    <div style="display:flex;align-items:center;gap:4px;margin-bottom:6px;flex-wrap:wrap;">
+                        <span class="wm-lbl" style="margin:0;white-space:nowrap;">Rareté</span>
+                        <div id="wm-rarity-filter" style="display:flex;gap:3px;flex-wrap:wrap;"></div>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+                        <span class="wm-lbl" style="margin:0;white-space:nowrap;">Mot-clé</span>
+                        <select id="wm-keyword-filter" title="N'afficher que les annonces trouvées par ce mot-clé"
+                            style="flex:1;min-width:0;padding:3px 6px;border-radius:4px;border:1px solid rgba(255,255,255,0.1);background:#0f0f13;color:#fff;font-size:11px;outline:none;cursor:pointer;">
+                            <option value="">Tous les mots-clés</option>
+                        </select>
+                        <button id="wm-clear-hits" title="Vider la liste affichée. Le scan continue : les annonces encore en vente reviendront au prochain passage, et celles qui reviennent compteront comme nouvelles."
+                            style="padding:3px 8px;border-radius:4px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.08);color:#ef4444;font-size:11px;cursor:pointer;white-space:nowrap;">🧹 Vider</button>
+                    </div>
                     <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:11px;color:#bbb;cursor:pointer;user-select:none;">
                         <input type="checkbox" id="wm-hide-owned" style="width:14px;height:14px;accent-color:#4ade80;cursor:pointer;margin:0;flex-shrink:0;">
                         <span>Masquer les cartes déjà possédées</span>
@@ -9368,6 +9411,72 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 }
             };
         }
+
+        /* Filtre par rareté : une pastille par code, allumée ou éteinte. Re-render à
+           chaque clic, sans attendre le prochain scan — le cache des hits suffit. */
+        function renderRarityFilter() {
+            const box = document.getElementById('wm-rarity-filter');
+            if (!box) return;
+            box.innerHTML = ['L', 'UR', 'SR', 'R', 'PC', 'C'].map(code => {
+                const on = marketRarityFilter.has(code);
+                const c = (RARITY[code] || {}).color || '#888';
+                return `<button data-rar="${code}" title="${on ? 'Afficher aussi les autres raretés' : 'N\'afficher que cette rareté'}"
+                    style="padding:1px 6px;border-radius:4px;cursor:pointer;font-size:10px;font-weight:700;
+                    border:1px solid ${on ? c : 'rgba(255,255,255,0.12)'};
+                    background:${on ? c + '22' : 'transparent'};color:${on ? c : '#666'};">${code}</button>`;
+            }).join('');
+            box.querySelectorAll('button[data-rar]').forEach(b => {
+                b.onclick = () => {
+                    const code = b.dataset.rar;
+                    if (marketRarityFilter.has(code)) marketRarityFilter.delete(code);
+                    else marketRarityFilter.add(code);
+                    try { localStorage.setItem(MARKET_RARITY_FILTER_KEY, JSON.stringify([...marketRarityFilter])); } catch(e) {}
+                    renderRarityFilter();
+                    if (lastHitsCache.length > 0) renderMarketHits(marketAlertEl, lastHitsCache, []);
+                };
+            });
+        }
+        renderRarityFilter();
+
+        /* Liste des mots-clés : reconstruite depuis la liste de surveillance, pour qu'un
+           mot ajouté ou retiré s'y reflète sans recharger la page. */
+        function renderKeywordFilter() {
+            const sel = document.getElementById('wm-keyword-filter');
+            if (!sel) return;
+            const kws = [...new Set(WATCHLIST.filter(e => e.enabled !== false).map(e => e.kw))];
+            // Un mot-clé retiré de la liste ne doit pas rester en filtre actif invisible.
+            if (marketKeywordFilter && !kws.some(k => k.toLowerCase() === marketKeywordFilter.toLowerCase())) {
+                marketKeywordFilter = '';
+                try { localStorage.removeItem(MARKET_KEYWORD_FILTER_KEY); } catch(e) {}
+            }
+            sel.innerHTML = '<option value="">Tous les mots-clés</option>'
+                + kws.map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('');
+            sel.value = marketKeywordFilter;
+            sel.onchange = () => {
+                marketKeywordFilter = sel.value;
+                try { localStorage.setItem(MARKET_KEYWORD_FILTER_KEY, marketKeywordFilter); } catch(e) {}
+                if (lastHitsCache.length > 0) renderMarketHits(marketAlertEl, lastHitsCache, []);
+            };
+        }
+        renderKeywordFilter();
+        window.wmRefreshKeywordFilter = renderKeywordFilter;
+
+        /* Vider la liste. On efface l'affichage ET la mémoire des annonces déjà vues,
+           pour que ce qui revient au prochain scan soit signalé comme nouveau — sinon
+           le bouton ne servirait qu'à masquer une seconde. Le scan lui-même continue. */
+        const clearBtn = document.getElementById('wm-clear-hits');
+        if (clearBtn) clearBtn.onclick = () => {
+            const n = lastHitsCache.length;
+            lastHitsCache = [];
+            activeHitsMap.clear();
+            lastMarketHits.clear();
+            firstSeenMap.clear();
+            outbidSet.clear();
+            try { sessionStorage.removeItem('wm_hits_cache'); } catch(e) {}
+            marketAlertEl.innerHTML = `<div style="color:#555;font-size:11px;text-align:center;padding:4px 0;">
+                Liste vidée — les annonces encore en vente reviendront au prochain scan.</div>`;
+            wmLog(`🧹 Liste des annonces vidée (${n} affichée${n > 1 ? 's' : ''}). Le scan continue.`);
+        };
 
         // Case "masquer les cartes déjà possédées" (persistée)
         const hideOwnedChk = document.getElementById('wm-hide-owned');
@@ -12806,7 +12915,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
               text: "Ouvre tes packs en boucle, tout seul. Il repère les cartes qui matchent tes mots-clés (alerte + son), tient les stats (raretés, drops, sessions) et respecte le cooldown de ton compte. Le bouton <b>▶ START</b> le lance." },
             { el: () => document.getElementById('wm-market-btn') && document.getElementById('wm-market-btn').closest('.wm-panel'),
               title: '🛒 Market Watcher',
-              text: "Surveille le marché en continu. Tu ajoutes des <b>mots-clés</b> dans une seule liste, et chacun porte son mode : <b>👁️ MANUEL</b> (l'annonce s'affiche, tu cliques Miser toi-même) ou <b>🤖 AUTO</b> (le bot mise seul, sans jamais dépasser le <b>plafond</b> du mot-clé). Un clic sur le badge du mode le bascule. Deux limites bornent la dépense, en haut du panneau : un <b>prix maximum par mise</b> et un <b>nombre maximum de mises par heure</b>. Le bouton <b>🤖 Mises auto</b> est l'interrupteur maître : en pause, rien ne mise, tout reste affiché. Le badge <b>🔎</b> de chaque mot-clé bascule entre recherche <b>étendue</b> (cherche aussi dans la description de la carte, comme la recherche du site) et <b>stricte</b> (titre + catégorie seuls). La liste <b>🚫 Jamais</b> masque toute annonce contenant la phrase. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce) et <b>🖼 Cadres</b> (grille avec l'image et un bouton Miser sous chacune). Le <b>tri</b> permet notamment de regrouper par <b>mot-clé</b> ou de classer par <b>rareté</b>. Le bouton <b>🔭</b> sur chaque annonce compare les vues Wikipédia réelles au cache du site — utile pour repérer une carte dont la rareté va changer." },
+              text: "Surveille le marché en continu. Tu ajoutes des <b>mots-clés</b> dans une seule liste, et chacun porte son mode : <b>👁️ MANUEL</b> (l'annonce s'affiche, tu cliques Miser toi-même) ou <b>🤖 AUTO</b> (le bot mise seul, sans jamais dépasser le <b>plafond</b> du mot-clé). Un clic sur le badge du mode le bascule. Deux limites bornent la dépense, en haut du panneau : un <b>prix maximum par mise</b> et un <b>nombre maximum de mises par heure</b>. Le bouton <b>🤖 Mises auto</b> est l'interrupteur maître : en pause, rien ne mise, tout reste affiché. Le badge <b>🔎</b> de chaque mot-clé bascule entre recherche <b>étendue</b> (cherche aussi dans la description de la carte, comme la recherche du site) et <b>stricte</b> (titre + catégorie seuls). La liste <b>🚫 Jamais</b> masque toute annonce contenant la phrase. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce) et <b>🖼 Cadres</b> (grille avec l'image et un bouton Miser sous chacune). Sous le tri, trois filtres d'affichage qui ne touchent pas au scan : les pastilles de <b>rareté</b> (cliquables, cumulables), la liste <b>mot-clé</b> pour ne voir que les résultats d'un mot, et <b>🧹 Vider</b> qui efface la liste — ce qui revient au scan suivant recompte alors comme nouveau. Le <b>tri</b> permet aussi de regrouper par <b>mot-clé</b> ou de classer par <b>rareté</b>. Le bouton <b>🔭</b> sur chaque annonce compare les vues Wikipédia réelles au cache du site — utile pour repérer une carte dont la rareté va changer." },
             { el: () => document.getElementById('wm-trash-btn') && document.getElementById('wm-trash-btn').closest('.wm-panel'),
               title: '🏷️ Trash Seller',
               text: "Met en vente automatiquement toutes les cartes que tu as taguées (« Trash » par défaut). Tu choisis le prix (par rareté ou au prix moyen du marché) et quelles cartes prioriser. Le bouton <b>🔄 Refresh ventes</b> renouvelle les annonces." },
