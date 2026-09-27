@@ -54,6 +54,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/snipe-race.test.mjs` : le mode Fourbe tire bien dans sa fenêtre, un blocage par
   l'interrupteur maître est expliqué dans le log, et une mise refusée parce qu'un autre
   joueur a misé en même temps repart au nouveau minimum sans dépasser le plafond.
+- `tests/selling-count-unknown.test.mjs` : quand le site ne renvoie plus son compteur de
+  ventes actives (`sellingCount: null`), le bot doit le recompter en base et ne rien
+  tenter si le plafond est déjà atteint.
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -140,6 +143,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Mises : relance automatique au nouveau minimum quand un autre joueur mise en même
       temps, blocage par l'interrupteur maître rendu visible, Hunter soumis aux mêmes
       plafonds que les autres chemins (audit #37)
+- [x] Trash Seller : compteur de ventes actives recompté quand le site ne le donne plus,
+      barre de recherche attendue, coupe-circuit sur échecs en rafale (audit #38)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.21';
+    const WM_VERSION = '1.3.13-fork.22';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -5777,6 +5777,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Le compteur serveur prime sur la longueur de liste : il est exact même quand
             // le détail n'est pas fourni.
             count: Number.isFinite(count) ? count : list.length,
+            // …mais il arrive qu'il vaille `null` ({"sellingCount":null}). Sans ce drapeau,
+            // « je ne sais pas » se lisait « 0 vente active » : le bot se croyait tous ses
+            // créneaux libres et listait en boucle dans un plafond déjà plein, chaque essai
+            // étant refusé par le site.
+            countKnown: Number.isFinite(count),
             max: Number.isFinite(max) ? max : null,
             detailed: list.length > 0 || !Number.isFinite(count)
         };
@@ -5884,10 +5889,35 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return list;
     }
 
+    /* Compte les ventes actives quand /mine ne donne plus son compteur. La BASE fait
+       autorité : elle voit aussi les ventes créées à la main sur le site, que sellHistory
+       ignore. Repli sur nos propres identifiants d'enchères si la base est illisible. */
+    async function countActiveSalesFallback(maxExpected) {
+        const fromDb = await fetchActiveSalesFromDb();
+        if (Array.isArray(fromDb)) return { count: fromDb.length, list: fromDb, source: 'base' };
+        const rebuilt = (await rebuildActiveSalesFromHistory(maxExpected)) || [];
+        return { count: rebuilt.length, list: rebuilt, source: 'historique du bot' };
+    }
+
+    let _unknownCountLogTs = 0;
+
     async function fetchSellingState() {
         const data = await fetchMine();
         if (!data) return null;
         const st = mineSellingState(data);
+
+        // Compteur absent → on le reconstruit AVANT tout calcul de créneaux libres.
+        if (!st.countKnown) {
+            const fb = await countActiveSalesFallback(effectiveMaxActive(st.max));
+            st.count = fb.count;
+            st.list = fb.list;
+            st.estimated = true;
+            st.detailed = fb.list.length > 0;
+            if (Date.now() - _unknownCountLogTs > 180000) {
+                _unknownCountLogTs = Date.now();
+                wmLog(`🔬 Le site ne renvoie plus le nombre de ventes actives (<code>sellingCount: null</code>) — recompté via ${esc(fb.source)} : <b>${fb.count}</b>.`);
+            }
+        }
         // Le détail est complété ICI, dans l'accesseur, et non chez l'appelant : il y a sept
         // points d'appel, et n'en équiper qu'un faisait clignoter l'affichage — chaque tick du
         // Trash Seller réécrivait la liste avec le [] de /mine, effacé puis restauré 30 s plus
@@ -6265,10 +6295,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return onCollectionPage();
     }
 
+    // La barre de recherche de /collection n'est rendue qu'une fois les données chargées :
+    // après un retour de navigation, elle met une à deux secondes à apparaître. La chercher
+    // une seule fois produisait le `no_search_input` en rafale des logs — on l'attend.
+    const COLLECTION_SEARCH_SELECTOR = 'input[placeholder="Rechercher par titre ou catégorie..."]';
+    function findCollectionSearchInput() {
+        const exact = document.querySelector(COLLECTION_SEARCH_SELECTOR);
+        if (exact) return exact;
+        // Repli tolérant : le libellé exact du site peut changer d'une version à l'autre.
+        return [...document.querySelectorAll('input[placeholder]')]
+            .find(i => /recherch/i.test(i.getAttribute('placeholder') || '') && !isBotOwnNode(i)) || null;
+    }
+    async function waitForCollectionSearchInput(ms) {
+        const deadline = Date.now() + ms;
+        for (;;) {
+            const el = findCollectionSearchInput();
+            if (el) return el;
+            if (Date.now() >= deadline) return null;
+            await new Promise(r => setTimeout(r, 150));
+        }
+    }
+
     async function sellCardViaUI(cardId, title, rarity, price, duration) {
         if (!(await ensureOnCollectionPage())) return { ok: false, reason: 'wrong_page' };
 
-        const searchInput = document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]');
+        const searchInput = await waitForCollectionSearchInput(6000);
         if (!searchInput) return { ok: false, reason: 'no_search_input' };
         setReactInputValue(searchInput, title);
 
@@ -6346,7 +6397,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 else if (Date.now() - modalGoneAt > 2000) break;
             }
         }
-        if (!listedId && !modalGoneAt) return { ok: false, reason: 'modal_still_open' };
+        if (!listedId && !modalGoneAt) {
+            // La fenêtre reste ouverte : le site affiche presque toujours POURQUOI. Le lire
+            // vaut mieux que de rendre un « modal_still_open » qui n'apprend rien — et si
+            // c'est le plafond de ventes simultanées, inutile d'enchaîner les cartes suivantes.
+            const modalTxt = (modal && modal.innerText) || '';
+            const line = (modalTxt.match(/[^\n]*(limite|maximum|simultan|atteint|impossible|erreur|insuffis)[^\n]*/i) || [])[0];
+            const capReached = /limite|maximum|simultan|atteint/i.test(line || '');
+            if (modal) dismissModal(modal);
+            await new Promise(r => setTimeout(r, 300));
+            return { ok: false, limitReached: capReached,
+                     reason: line ? line.trim().slice(0, 120) : 'modal_still_open' };
+        }
         if (!listedId) wmLog(`⚠️ <b>${esc(title)}</b> mise en vente sans identifiant d'enchère lisible — elle ne pourra pas être suivie automatiquement.`);
 
         // Revient sur /collection (sinon la carte suivante ne retrouverait plus la barre de
@@ -6354,14 +6416,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // ensureOnCollectionPage() avant de conclure à un vrai blocage.
         await ensureOnCollectionPage();
 
-        const nextSearchInput = document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]');
+        const nextSearchInput = findCollectionSearchInput();
         if (nextSearchInput) setReactInputValue(nextSearchInput, ''); // nettoie pour la prochaine carte
 
         return { ok: true, auctionId: listedId };
     }
 
+    // Au-delà de ce nombre d'échecs D'AFFILÉE, on arrête le lot : les logs du 27/09 montrent
+    // 50 minutes d'échecs en rafale (le site refusait tout, plafond déjà plein). Enchaîner
+    // n'aidait pas et alimentait la protection anti-bot du site.
+    const SELL_MAX_CONSECUTIVE_FAILURES = 3;
+
     async function sellBatch(cards, statusEl) {
         let sold = 0, skipped = 0, deferred = 0;
+        let consecutiveFailures = 0;
+        let aborted = false;      // lot coupé sur échecs en rafale → pause avant de réessayer
         let limitReached = false; // 409 « plafond serveur atteint » → inutile d'insister
         for (const item of cards) {
             if (limitReached) { skipped++; continue; }
@@ -6424,6 +6493,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 while (attempt <= MAX_ATTEMPTS) {
                     result = await sellCardViaUI(cardId, title, rarity, price, duration);
                     if (result.ok) { success = true; break; }
+                    if (result.limitReached) break;   // plafond côté site : insister ne sert à rien
                     if (result.reason === 'wrong_page' || attempt === MAX_ATTEMPTS) break;
                     wmLog(`⚠️ Mise en vente <b>${esc(title)}</b> échouée (${esc(result.reason)}), retry ${attempt}/${MAX_ATTEMPTS-1}…`);
                     await new Promise(r => setTimeout(r, 1500));
@@ -6431,7 +6501,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 }
             }
 
+            if (result && result.limitReached) {
+                // Le site dit lui-même que le plafond est atteint : on arrête le lot ici.
+                // Le décompte des créneaux repartira au prochain passage.
+                limitReached = true;
+                skipped++;
+                wmLog(`🛑 Plafond de ventes atteint côté site (<span style="color:#888;font-size:9px;">${esc(result.reason)}</span>) — lot interrompu, reprise au prochain créneau libre.`);
+                continue;
+            }
+
             if (success) {
+                consecutiveFailures = 0;
                 sold++;
                 incrementListedCount(cardId); // couverture équitable du pool Trash
                 removeFromTrashPoolCache(cardId); // vendue → sort du pool incrémental
@@ -6457,10 +6537,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 break; // toutes les cartes suivantes échoueraient pour la même raison
             } else {
                 skipped++;
+                consecutiveFailures++;
                 wmLog(`❌ Échec mise en vente : <b>${esc(title)}</b> [${rarity}] · <span style="color:#888;font-size:9px;">${esc(result ? result.reason : '?')}</span>`);
+                if (consecutiveFailures >= SELL_MAX_CONSECUTIVE_FAILURES) {
+                    aborted = true;
+                    wmLog(`⏸️ <b>${consecutiveFailures} échecs d'affilée</b> — lot interrompu. Le Trash Seller recomptera les ventes actives avant de réessayer.`);
+                    break;
+                }
             }
         }
-        return { sold, skipped, deferred, limitReached };
+        return { sold, skipped, deferred, limitReached, aborted };
     }
 
     /* ══════════ TEST : ciblage d'exemplaire précis à la mise en vente ══════════
@@ -7054,7 +7140,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const batch = buffer.slice(0, slots);
                 statusEl.innerHTML = `<span style="color:#06b6d4;">🛒 Mise en vente de ${batch.length} carte(s) (${activeCount} actives)…</span>`;
 
-                const { sold, skipped, deferred, limitReached } = await sellBatch(batch, statusEl);
+                const { sold, skipped, deferred, limitReached, aborted } = await sellBatch(batch, statusEl);
                 const newActive = activeCount + sold;
 
                 statusEl.innerHTML =
@@ -7073,6 +7159,15 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (limitReached && trashSellerRunning) {
                     statusEl.innerHTML = `<span style="color:#fbbf24;">🛑 Plafond serveur atteint — pause de 2 min avant nouvelle tentative…</span>`;
                     await new Promise(r => setTimeout(r, 120000));
+                    continue;
+                }
+
+                // 4a-bis) Échecs en rafale sans que le site annonce un plafond : on souffle une
+                //     minute plutôt que de relancer aussitôt le même mur (et d'alimenter la
+                //     protection anti-bot). Le décompte des ventes actives est refait ensuite.
+                if (aborted && !limitReached && trashSellerRunning) {
+                    statusEl.innerHTML = `<span style="color:#fbbf24;">⏸️ Échecs en rafale — pause d'1 min, puis nouveau décompte des ventes actives…</span>`;
+                    await new Promise(r => setTimeout(r, 60000));
                     continue;
                 }
 

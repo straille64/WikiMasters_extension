@@ -695,6 +695,48 @@ course est rattrapée à la hausse, et le rattrapage respecte le plafond. Mutati
 contrôle : sans la relance interne, la mise unique du Chasseur ne monte plus (39 → 39) ;
 sans le log, le blocage redevient invisible.
 
+### 38. « Compteur inconnu » lu comme « aucune vente en cours »
+Logs du 27/09, répétés toutes les 8 minutes :
+
+```
+🔬 Aperçu brut : {"sellingCount":null,"maxConcurrentAuctions":5}
+🔬 /mine : 0 vente active retenue.
+```
+
+Le site a cessé de renvoyer son compteur : `sellingCount` vaut **`null`**, pas un nombre.
+`mineSellingState()` faisait alors `firstFinite(null, …)` → rien de fini → repli sur
+`list.length`, une liste que /mine ne fournit plus non plus, donc **0**. Le bot en
+concluait « 0 vente active, 5 créneaux libres » et repartait lister — dans un plafond déjà
+plein. D'où les 50 minutes d'échecs en rafale du log, et le diagnostic de l'utilisateur,
+exact : « il a du mal à détecter qu'on est déjà à 5 ventes et il essaye quand même ».
+
+Deux aggravants dans la même boucle :
+
+- **La barre de recherche était cherchée une seule fois.** Sur /collection elle n'est
+  rendue qu'une fois les données chargées ; juste après un retour de navigation, elle
+  n'existe pas encore. D'où les `no_search_input` en rafale — un défaut de patience, pas
+  de page.
+- **Une fenêtre bloquée ne disait rien.** `modal_still_open` était rendu tel quel alors que
+  le site affiche presque toujours le motif du refus dans la fenêtre.
+
+**✅ Corrigé (1.3.13-fork.22)**
+
+- `mineSellingState()` distingue « compteur absent » de « zéro » (`countKnown`).
+  Quand il est absent, `fetchSellingState()` **recompte avant tout calcul de créneaux** :
+  d'abord la base (`auctions` filtrée `seller_id` + `status=active` + `end_at>now`, qui voit
+  aussi les ventes créées à la main sur le site), sinon les identifiants d'enchères du bot.
+- La barre de recherche est **attendue** (jusqu'à 6 s), avec un repli sur tout champ dont le
+  placeholder parle de recherche.
+- Une fenêtre bloquée est lue : le message du site part dans le log, la fenêtre est refermée,
+  et s'il parle de limite/maximum/simultané, le lot s'arrête (pause ferme de 2 min existante).
+- Coupe-circuit : **3 échecs d'affilée** interrompent le lot et déclenchent une pause d'1 min
+  avant un nouveau décompte. Enchaîner n'aidait pas et nourrissait l'anti-bot du site.
+
+`tests/selling-count-unknown.test.mjs` rejoue la réponse exacte du site : avec 5 ventes
+actives en base et un plafond de 5, aucune mise ne doit partir ; avec 4, une mise doit
+partir (témoin positif). Mutation de contrôle : en rétablissant l'ancienne lecture, le test
+retrouve le symptôme mot pour mot — « Mise en vente de 2 carte(s) (0 actives) ».
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
