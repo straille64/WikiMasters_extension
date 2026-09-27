@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.13';
+    const WM_VERSION = '1.3.13-fork.14';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -768,7 +768,7 @@
        d'une carte (c'est ce qu'il fait en ouvrant « Mettre aux enchères », où il affiche
        MOYENNE), le bot la capte au passage. Zéro requête, et ça contourne un refus
        éventuel sur notre propre appel. */
-    function storeSalesEntry(cardId, data) {
+    function storeSalesEntry(cardId, data, rarityHint) {
         if (!cardId || !data) return null;
 
         /* Deux formes de réponse cohabitent : la liste complète des ventes, et le
@@ -777,42 +777,38 @@
            tableau `sales` vide donne bien un compte de zéro. Les noms de champs du
            résumé ne sont pas documentés : on sonde les plus plausibles, et on trace
            une fois les clés reçues pour repérer un renommage futur. */
-        if (!Array.isArray(data.sales)) {
-            const num = (...keys) => {
-                for (const k of keys) {
-                    const v = data[k];
-                    const n = typeof v === 'string' ? Number(v) : v;
-                    if (Number.isFinite(n)) return Math.round(n);
-                }
-                return null;
-            };
-            const avg = num('average', 'avg', 'mean', 'average_price', 'avg_price', 'moyenne');
-            const med = num('median', 'median_price');
-            const cnt = num('count', 'sales_count', 'total', 'nb', 'n');
-            if (avg !== null || med !== null) {
-                if (!storeSalesEntry._shapeLogged) {
-                    storeSalesEntry._shapeLogged = true;
-                    wmLog(`🔬 Cote (résumé) : champs reçus <span style="color:#888;font-size:9px;">${esc(Object.keys(data).join(', '))}</span>`);
-                }
-                const entry = {
-                    // Le résumé ne donne pas de médiane ? On prend la moyenne : c'est ce
-                    // que le site affiche lui-même, et mieux vaut ça que rien.
-                    median: med !== null ? med : avg,
-                    avg: avg !== null ? avg : med,
-                    count: cnt !== null ? cnt : 1, // > 0, sinon l'UI dirait « aucune vente »
-                    last: num('last', 'last_price', 'latest_price'),
-                    min: num('min', 'min_price', 'lowest'),
-                    max: num('max', 'max_price', 'highest'),
-                    summary: true,
-                    fetchedAt: Date.now(),
-                };
-                salesCache[cardId] = entry;
-                saveSalesCache();
-                return entry;
+        /* Forme RÉSUMÉ, celle que renvoie `?scope=summary` et qu'utilise le site :
+             {"wikipedia_title":"Game Boy Advance","summary":{"SR":{"average":668}},"isPro":false}
+           La moyenne est imbriquée SOUS LA RARETÉ, pas à la racine — une même carte a
+           une cote différente selon sa rareté. On garde donc toutes les raretés, et
+           c'est l'affichage qui choisit celle de l'exemplaire concerné. */
+        if (data.summary && typeof data.summary === 'object' && !Array.isArray(data.sales)) {
+            const byRarity = {};
+            for (const [rar, v] of Object.entries(data.summary)) {
+                const n = v && (v.average != null ? v.average : v.avg != null ? v.avg : v.median);
+                const num = typeof n === 'string' ? Number(n) : n;
+                if (Number.isFinite(num)) byRarity[String(rar).toUpperCase()] = Math.round(num);
             }
+            const values = Object.values(byRarity);
+            if (!values.length) return null;
+            const fallback = rarityHint && byRarity[String(rarityHint).toUpperCase()] != null
+                ? byRarity[String(rarityHint).toUpperCase()]
+                : values[0];
+            const entry = {
+                median: fallback, avg: fallback,
+                count: 1,            // > 0, sinon l'affichage dirait « aucune vente »
+                last: null, min: null, max: null,
+                byRarity, summary: true, fetchedAt: Date.now(),
+            };
+            salesCache[cardId] = entry;
+            saveSalesCache();
+            return entry;
+        }
+
+        if (!Array.isArray(data.sales)) {
             if (!storeSalesEntry._unknownLogged) {
                 storeSalesEntry._unknownLogged = true;
-                wmLog(`🔬 Cote : réponse non reconnue <span style="color:#888;font-size:9px;">${esc(Object.keys(data).join(', ') || '(vide)')}</span> — dis-le-moi si les cotes restent vides.`);
+                wmLog(`🔬 Cote : réponse non reconnue <span style="color:#888;font-size:9px;">${esc(Object.keys(data).join(', ') || '(vide)')}</span>`);
             }
             return null;
         }
@@ -872,28 +868,41 @@
         } catch(e) { return null; }
     }
 
-    // Traite la file d'attente, une carte à la fois avec délai aléatoire (anti-flood)
+    /* Traite la file par petits LOTS PARALLÈLES. C'était une carte toutes les 2 à 4 s :
+       sur une page de collection, remplir 40 cotes demandait plusieurs minutes, ce qui
+       rendait l'affichage inutilisable. Le site lui-même en tire des dizaines en
+       parallèle au chargement de la page — ce rythme est donc celui qu'il tolère. Le
+       garde-fou reste `salesEndpointCooldownUntil` : au premier refus, tout s'arrête. */
+    const SALES_BATCH = 5;
+    const SALES_BATCH_PAUSE_MS = 200;
+
     async function processSalesQueue(onUpdate) {
         if (salesFetchRunning) return;
         salesFetchRunning = true;
-        while (salesFetchQueue.length > 0) {
-            const cardId = salesFetchQueue.shift();
-            salesFetchQueued.delete(cardId);
-            if (getCachedSales(cardId)) continue; // déjà en cache valide entre-temps
-            if (salesFetchBlocked(cardId)) continue;
-            // Le site refuse l'endpoint en ce moment : on vide la file sans requêter,
-            // plutôt que de continuer à taper toutes les 2 s pour rien.
-            if (Date.now() < salesEndpointCooldownUntil) {
-                salesFetchQueue.length = 0;
-                salesFetchQueued.clear();
-                break;
+        try {
+            while (salesFetchQueue.length > 0) {
+                // Le site refuse l'endpoint en ce moment : on vide la file sans requêter,
+                // plutôt que de continuer à taper pour rien.
+                if (Date.now() < salesEndpointCooldownUntil) {
+                    salesFetchQueue.length = 0;
+                    salesFetchQueued.clear();
+                    break;
+                }
+                const batch = [];
+                while (batch.length < SALES_BATCH && salesFetchQueue.length > 0) {
+                    const cardId = salesFetchQueue.shift();
+                    salesFetchQueued.delete(cardId);
+                    if (getCachedSales(cardId) || salesFetchBlocked(cardId)) continue;
+                    batch.push(cardId);
+                }
+                if (!batch.length) continue;
+                await Promise.all(batch.map(id => fetchCardSales(id).catch(() => null)));
+                if (onUpdate) onUpdate();
+                await new Promise(r => setTimeout(r, SALES_BATCH_PAUSE_MS));
             }
-            await fetchCardSales(cardId);
-            if (onUpdate) onUpdate();
-            // Délai aléatoire 2-4s entre chaque requête pour étaler la charge
-            await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
+        } finally {
+            salesFetchRunning = false;
         }
-        salesFetchRunning = false;
     }
 
     function queueSalesFetch(cardId) {
@@ -12997,7 +13006,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             for (let depth = 0; el && depth < 6; el = el.parentElement, depth++) {
                 const h3 = el.querySelector('h3');
                 if (h3 && (h3.textContent || '').trim() === alt) {
-                    tiles.push({ tile: el, title: alt });
+                    tiles.push({ tile: el, title: alt, rarity: tileRarity(el) });
                     break;
                 }
             }
@@ -13005,7 +13014,20 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return tiles;
     }
 
-    function collectionPriceText(cardId) {
+    /* Rareté affichée sur la tuile. Le site la met dans un petit badge dont le texte
+       est exactement le code (« SR »). On cherche donc le premier élément de la tuile
+       dont le texte est l'un des six codes — plus robuste qu'un nom de classe, et ça
+       compte : une carte n'a pas la même cote selon sa rareté. */
+    const RARITY_CODES = new Set(['L', 'UR', 'SR', 'R', 'PC', 'C']);
+    function tileRarity(tile) {
+        for (const el of tile.querySelectorAll('div,span')) {
+            const t = (el.textContent || '').trim().toUpperCase();
+            if (t.length <= 2 && RARITY_CODES.has(t)) return t;
+        }
+        return '';
+    }
+
+    function collectionPriceText(cardId, rarity) {
         if (!cardId) return { text: '—', title: 'Carte non reconnue dans ta collection (index en cours de chargement).' };
         const entry = getCachedSales(cardId);
         if (!entry) {
@@ -13014,6 +13036,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 : { text: '⋯', title: 'Cote en cours de chargement…' };
         }
         if (!entry.count) return { text: '—', title: 'Aucune vente passée pour cette carte : pas de cote.' };
+        // Une même carte n'a pas la même cote selon sa rareté : on prend celle de
+        // l'exemplaire affiché quand on la connaît.
+        const rar = (rarity || '').toUpperCase();
+        if (entry.byRarity) {
+            const v = entry.byRarity[rar];
+            const all = Object.entries(entry.byRarity)
+                .map(([k, n]) => `${k} ${n.toLocaleString('fr-FR')}`).join(' · ');
+            if (v != null) {
+                return { text: `≈ ${v.toLocaleString('fr-FR')}`,
+                         title: `Moyenne du marché en ${rar} : ${v}. Toutes raretés : ${all}` };
+            }
+            return { text: '—', title: `Aucune vente en ${rar || '?'}. Autres raretés : ${all}` };
+        }
         return {
             text: `≈ ${entry.median.toLocaleString('fr-FR')}`,
             title: `Médiane ${entry.median} · moyenne ${entry.avg} · min ${entry.min} · max ${entry.max}`
@@ -13042,7 +13077,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     function refreshCollectionBadges() {
         for (const el of document.querySelectorAll('.' + COLLECTION_BADGE_CLASS)) {
-            const { text, title } = collectionPriceText(el.dataset.wmCardId);
+            const { text, title } = collectionPriceText(el.dataset.wmCardId, el.dataset.wmRarity);
             el.textContent = '💰 ' + text;
             el.title = title;
         }
@@ -13110,7 +13145,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         ensureVisibilityObserver();
         const tiles = findCollectionTiles();
         let decorated = 0, unknown = 0;
-        for (const { tile, title } of tiles) {
+        for (const { tile, title, rarity } of tiles) {
             if (tile.dataset.wmDecorated === '1') continue;
             const cardId = collectionTitleIndex.get(title.trim().toLowerCase()) || '';
             if (!cardId) { unknown++; continue; } // index pas encore prêt → on retentera
@@ -13124,7 +13159,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const badge = document.createElement('div');
             badge.className = COLLECTION_BADGE_CLASS;
             badge.dataset.wmCardId = cardId;
-            const { text, title: tip } = collectionPriceText(cardId);
+            badge.dataset.wmRarity = rarity || '';
+            const { text, title: tip } = collectionPriceText(cardId, rarity);
             badge.textContent = '💰 ' + text;
             badge.title = tip;
             badge.style.cssText = 'position:absolute;left:4px;bottom:4px;z-index:40;pointer-events:auto;'

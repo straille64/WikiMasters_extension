@@ -109,8 +109,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       réversible (audit #24, #26)
 - [x] Scan : saut par dichotomie des pages d'enchères déjà terminées — 89 % du marché
       sur ce site (audit #25)
-- [x] Cotes : même endpoint que le site (`?scope=summary`), reprise de ce qu'il charge
-      lui-même, blocage progressif après refus (audit #27, #29)
+- [x] Cotes : même endpoint que le site (`?scope=summary`), moyenne lue par rareté,
+      chargement en parallèle (~1,5 s pour 40 cartes) (audit #27, #29, #30, #31)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points
       d'injection couverts, verrouillé par un test (audit #4)
 - [ ] Découpage du monolithe en modules

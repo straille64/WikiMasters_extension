@@ -120,10 +120,14 @@ let refuseSales = true; // le site refuse d'abord au bot, comme en production
 await page.route('**/api/marketplace/cards/*/sales**', r => {
   salesAsked.push(r.request().url());
   if (refuseSales) return r.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"Forbidden"}' });
-  // Forme RÉSUMÉ, celle que renvoie ?scope=summary et qu'utilise le site : pas de
-  // tableau `sales`, uniquement des agrégats.
+  /* Réponse RÉELLE de ?scope=summary, relevée par l'utilisateur :
+       {"wikipedia_title":"Game Boy Advance","summary":{"SR":{"average":668}},"isPro":false}
+     La moyenne est imbriquée SOUS LA RARETÉ. On renvoie deux raretés pour vérifier que
+     l'affichage prend bien celle de l'exemplaire, et pas la première venue. */
   return r.fulfill({ status: 200, contentType: 'application/json',
-    body: JSON.stringify({ average: 44, count: 2, min: 40, max: 48 }) });
+    body: JSON.stringify({ wikipedia_title: 'x',
+                           summary: { C: { average: 7 }, SR: { average: 44 } },
+                           isPro: false }) });
 });
 // Supabase : état des étiquettes, pose et retrait. On tient un état serveur simulé
 // pour vérifier la BASCULE, et pas seulement qu'une requête part.
@@ -201,7 +205,8 @@ if (state.badges !== ALL.length) problems.push(`${state.badges} badges de prix a
 if (state.buttons !== ALL.length) problems.push(`${state.buttons} boutons de défausse au lieu de ${ALL.length}`);
 if (!state.nextToFav) problems.push("le bouton n'est pas placé à côté de l'étoile favoris du site");
 if (!/\?/.test(refusedText)) problems.push(`cote « ${refusedText} » après refus — attendu « ? », jamais un faux prix`);
-if (!/≈\s*44/.test(adoptedText)) problems.push(`cote « ${adoptedText} » après la requête du SITE — la réponse du site n'a pas été captée`);
+// Les tuiles du test sont en SR : la cote attendue est 44, pas le 7 de la rareté C.
+if (!/≈\s*44/.test(adoptedText)) problems.push(`cote « ${adoptedText} » après la requête du SITE — attendu la moyenne SR (44), pas la première rareté venue`);
 // Le bot ne doit pas avoir redemandé : c'est la requête du site qui a servi.
 if (askedAfter - askedBefore !== 1) problems.push(`${askedAfter - askedBefore} requête(s) /sales pendant la reprise — une seule, celle du site, est attendue`);
 // La mini-carte de la fenêtre modale ne doit pas être décorée.

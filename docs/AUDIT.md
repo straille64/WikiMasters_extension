@@ -432,6 +432,40 @@ ce qui est exactement ce que montrait le badge `💰 —`. Les noms de champs du
 n'étant pas documentés, les plus plausibles sont sondés et les clés reçues tracées une
 fois, pour repérer un renommage futur.
 
+### 30. La moyenne est imbriquée sous la rareté
+Réponse réelle relevée par l'utilisateur en ouvrant l'URL directement :
+
+```json
+{"wikipedia_title":"Game Boy Advance","summary":{"SR":{"average":668}},"isPro":false}
+```
+
+Le correctif #29 sondait `average` / `avg` / `median` **à la racine**. Ils n'y sont pas :
+la moyenne vit sous `summary.<RARETÉ>.average`. Le badge affichait donc `—` alors que la
+requête répondait parfaitement — exactement ce que montrait la capture.
+
+Ce n'est pas un détail de nommage : **une même carte n'a pas la même cote selon sa
+rareté** (`{C: 7, SR: 44}`). Afficher la première venue serait faux.
+
+**✅ Corrigé (1.3.13-fork.14)** — toutes les raretés sont conservées dans `byRarity`, et
+l'affichage choisit celle de l'exemplaire. La rareté est lue sur la tuile (`tileRarity`)
+en cherchant le badge dont le texte est exactement l'un des six codes — plus robuste
+qu'un nom de classe Tailwind. L'infobulle liste les autres raretés.
+
+### 31. Les cotes mettaient plusieurs minutes à se remplir
+`processSalesQueue` traitait **une carte toutes les 2 à 4 secondes**. Sur une page de
+collection, remplir 40 cotes demandait plus de deux minutes : inutilisable.
+
+Ce rythme datait d'une époque où le bot tapait le mauvais endpoint et se faisait refuser.
+La capture réseau montre que **le site lui-même** tire des dizaines de
+`sales?scope=summary` en parallèle au chargement de la page — c'est donc le rythme qu'il
+tolère.
+
+**✅ Corrigé (1.3.13-fork.14)** — lots de 5 en parallèle, 200 ms entre deux lots : ~1,5 s
+pour 40 cartes au lieu de ~2 min. Le garde-fou reste `salesEndpointCooldownUntil` : au
+premier refus, toute la file s'arrête. Et comme l'intercepteur capte déjà les requêtes que
+le site émet pour sa propre grille, une bonne part des cotes arrive sans que le bot ait
+quoi que ce soit à demander.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
