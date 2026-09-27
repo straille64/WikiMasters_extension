@@ -301,6 +301,52 @@ doit être récupérée (101 annonces attendues, contre 51 sur le build d'avant 
 exactement les 50 perdues), et l'endpoint `/sales` refusé en boucle ne doit jamais
 recevoir plus d'un appel par carte.
 
+### 23. Correctif #21 appliqué à moitié
+En appliquant le correctif #21, le script de patch s'est arrêté sur une ancre ambiguë
+(`if (!res.ok) return null;`, présent 5 fois) **avant d'écrire le fichier**. Seule la
+partie réappliquée ensuite à la main — l'écriture de l'entrée d'échec dans
+`fetchCardSales` — a survécu. Les trois garde-fous qui l'exploitent
+(`salesFetchBlocked`, le filtre dans `getCachedSales`, la mise en pause de l'endpoint)
+n'étaient **pas** dans le build livré en fork.9.
+
+Le plus gênant : `tests/scan-resilience.test.mjs` **passait quand même**, la mise en
+cache seule suffisant à couper la boucle de requêtes. Le test mesurait le symptôme, pas
+le mécanisme. Conséquences réelles qui subsistaient : un 403 se lisait « aucune vente »
+à l'écran (au lieu de « en chargement ») et restait figé pendant tout le TTL normal.
+
+**✅ Corrigé (1.3.13-fork.10)** — les quatre morceaux sont en place et vérifiés un par
+un après écriture. Le test descend de 4 appels `/sales` à 1, ce qui montre que la mise
+en pause de l'endpoint mord réellement.
+
+**Leçon retenue** : un script de patch qui échoue sur une ancre doit échouer **bruyamment
+et intégralement**. Ceux utilisés ici écrivent le fichier en une seule fois à la fin,
+donc un `sys.exit` en cours de route n'écrit rien — mais rien ne le signalait. La
+vérification systématique, après écriture, que chaque morceau est bien présent est
+désormais la règle.
+
+### 24. Surcouche Collection : cote du marché et défausse sur les cartes
+Demande utilisateur. Le DOM du site (relevé le 27/09) ne contient **aucun identifiant
+de carte** : la tuile est un empilement de classes Tailwind autour d'un `<h3>` et d'une
+image. Deux choix en découlent :
+
+- **Liaison par le titre.** L'image de la carte porte un `alt` identique au texte du
+  `<h3>` : la tuile est le plus petit ancêtre qui contient les deux. C'est un invariant
+  de contenu, bien plus solide qu'un nom de classe utilitaire — le site est en Tailwind,
+  ses classes changent à chaque retouche de style.
+- **Index alimenté gratuitement.** Le site charge lui-même `/api/my-collection` ;
+  l'intercepteur réseau lit cette réponse au passage pour construire l'index
+  titre → `card_id`. Aucune requête ajoutée.
+
+La cote vient de `/api/marketplace/cards/{id}/sales`, l'endpoint qui s'est déjà fait
+refuser en 403 (#21). Une collection de 500 cartes ne doit donc surtout pas déclencher
+500 requêtes : un `IntersectionObserver` ne met en file que les cartes **réellement
+visibles**, et la file reste celle, étalée, du reste du bot. `tests/collection-overlay.test.mjs`
+le vérifie explicitement — 43 cartes décorées, 3 cotes demandées.
+
+Le bouton de défausse pose l'étiquette de vente sur un exemplaire
+(`ensureTrashTagId` → `findCurrentUserCardId` → `addTagToUserCard`) ; le Trash Seller
+s'occupe de la vente. Rien n'est supprimé.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

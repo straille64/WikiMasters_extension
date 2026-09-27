@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.9
+// @version      1.3.13-fork.10
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.9';
+    const WM_VERSION = '1.3.13-fork.10';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -736,6 +736,10 @@
     function getCachedSales(cardId) {
         const entry = salesCache[cardId];
         if (!entry) return null;
+        // Une entrée d'ÉCHEC n'est pas une donnée : invisible ici (l'affichage reste
+        // « en chargement », jamais un faux « aucune vente »), mais bien vue par
+        // queueSalesFetch, qui n'insiste pas.
+        if (entry.failed) return null;
         if (Date.now() - entry.fetchedAt > SALES_CACHE_TTL) return null; // périmé
         // Invalide les entrées de l'ancien format (avant l'ajout de avg/min/max/last)
         if (entry.count > 0 && entry.avg === undefined) return null;
@@ -743,6 +747,21 @@
         if (Number.isFinite(entry.median) && entry.median % 1 !== 0) entry.median = Math.round(entry.median);
         return entry;
     }
+    /* Échec de récupération d'un historique : il DOIT être mémorisé. Sans ça,
+       getCachedSales() reste vide pour cette carte, queueSalesFetch() la remet en file
+       au scan suivant, et une carte refusée en 403 est redemandée indéfiniment — à
+       chaque scan, pour chaque carte refusée. C'est ce qui saturait l'API et faisait
+       tomber /api/packs/open en 403 par ricochet, sans rapport avec le Pack Opener.
+       On ne bloque que 10 min : un refus est transitoire, on retente plus tard. */
+    const SALES_FAIL_TTL = 10 * 60 * 1000;
+    let salesEndpointCooldownUntil = 0;
+    let _salesCooldownLogged = 0;
+
+    function salesFetchBlocked(cardId) {
+        const e = salesCache[cardId];
+        return !!(e && e.failed && Date.now() - e.fetchedAt < SALES_FAIL_TTL);
+    }
+
     // File d'attente des cartes à fetcher (étalée pour ne pas flooder l'API)
     const salesFetchQueue = [];
     const salesFetchQueued = new Set(); // évite les doublons dans la file
@@ -812,6 +831,14 @@
             const cardId = salesFetchQueue.shift();
             salesFetchQueued.delete(cardId);
             if (getCachedSales(cardId)) continue; // déjà en cache valide entre-temps
+            if (salesFetchBlocked(cardId)) continue;
+            // Le site refuse l'endpoint en ce moment : on vide la file sans requêter,
+            // plutôt que de continuer à taper toutes les 2 s pour rien.
+            if (Date.now() < salesEndpointCooldownUntil) {
+                salesFetchQueue.length = 0;
+                salesFetchQueued.clear();
+                break;
+            }
             await fetchCardSales(cardId);
             if (onUpdate) onUpdate();
             // Délai aléatoire 2-4s entre chaque requête pour étaler la charge
@@ -822,6 +849,7 @@
 
     function queueSalesFetch(cardId) {
         if (!cardId || salesFetchQueued.has(cardId) || getCachedSales(cardId)) return;
+        if (salesFetchBlocked(cardId)) return; // refusée il y a peu → on ne réinsiste pas
         salesFetchQueued.add(cardId);
         salesFetchQueue.push(cardId);
     }
@@ -2516,6 +2544,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!res.ok) break;
             const data = await res.json();
             const items = data.collection || [];
+            // Alimente aussi l'index titre → card_id de la surcouche Collection : elle
+            // fonctionne ainsi même si le site n'a pas encore chargé la page Collection.
+            indexCollectionPayload(data);
             if (items.length === 0) break;
 
             let reachedKnown = false;
@@ -11802,6 +11833,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // l'associer à sellHistory. Déclarée ici (comme les variables au-dessus) pour rester
             // accessible après le try — url/method y sont en `const`, portée bloc uniquement.
             let isMarketplaceCreate = false;
+            let isCollectionFetch = false;
             try {
                 const req = args[0];
                 const url = (typeof req === 'string') ? req : (req && req.url) || '';
@@ -11814,6 +11846,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // stricte sur l'URL absolue ne matchait jamais, donc auctionId restait toujours
                 // null (bug du 2026-08-20 : plus de re-tag Trash sur les invendus).
                 isMarketplaceCreate = method === 'POST' && /\/api\/marketplace(\?|$)/.test(url);
+                // Le site charge lui-même sa collection : on lit la réponse au passage pour
+                // alimenter l'index titre → card_id de la surcouche Collection. Le DOM du
+                // site ne portant aucun identifiant, c'est ce qui permet de relier une
+                // tuile à sa carte — et ça ne coûte aucune requête supplémentaire.
+                isCollectionFetch = method === 'GET' && /\/api\/my-collection/.test(url);
                 // Capture le payload d'un POST /rest/v1/... pour le rejouer/exploiter côté bot.
                 const capture = () => {
                     if (args[1] && typeof args[1].body === 'string') return { body: args[1].body };
@@ -11850,6 +11887,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             if (d && d.auction_id) _lastUiListingAuctionId = d.auction_id;
                         }).catch(() => {});
                     }
+                }).catch(() => {});
+            }
+
+            if (isCollectionFetch) {
+                p.then(res => {
+                    if (!res || !res.ok) return;
+                    res.clone().json().then(d => {
+                        const n = indexCollectionPayload(d);
+                        // Des cartes nouvellement connues → les tuiles en attente peuvent
+                        // enfin être décorées.
+                        if (n > 0) scheduleCollectionDecorate();
+                    }).catch(() => {});
                 }).catch(() => {});
             }
 
@@ -12657,6 +12706,266 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
     }
     window.addEventListener('online', handleNetworkChange);
+
+    /* ═══════════ SURCOUCHE COLLECTION ═══════════
+       Sur la page /collection du site, ajoute sur chaque carte :
+         · le prix moyen du marché (médiane des ventes passées) ;
+         · un bouton 🗑️ qui pose le tag de vente, pour défausser sans ouvrir la carte.
+
+       Deux contraintes ont dicté la conception :
+
+       1. Le DOM du site ne contient AUCUN identifiant de carte — seulement un titre.
+          On relie donc chaque tuile à sa carte par son titre, via un index alimenté
+          gratuitement : le site charge lui-même /api/my-collection, et l'intercepteur
+          réseau lit cette réponse au passage. Zéro requête ajoutée pour la liaison.
+
+       2. La cote vient de /api/marketplace/cards/{id}/sales, l'endpoint qui s'est déjà
+          fait refuser en 403 pour cause de sur-sollicitation. Une collection de 500
+          cartes ne doit donc PAS déclencher 500 requêtes : seules les tuiles réellement
+          VISIBLES à l'écran mettent leur carte en file (IntersectionObserver), et la
+          file reste celle, étalée et auto-limitée, du reste du bot. */
+
+    const collectionTitleIndex = new Map(); // titre en minuscules → card_id
+
+    // Alimente l'index depuis n'importe quelle réponse ressemblant à une collection.
+    // Tolérant sur la forme : le site encapsule tantôt la carte dans `card`, tantôt pas.
+    function indexCollectionPayload(data) {
+        const items = (data && (data.collection || data.items || data.cards)) || [];
+        if (!Array.isArray(items)) return 0;
+        let added = 0;
+        for (const item of items) {
+            const card = (item && item.card) || item;
+            const title = card && (card.wikipedia_title || card.title);
+            const id = (item && item.card_id) || (card && card.id);
+            if (!title || !id) continue;
+            const key = String(title).trim().toLowerCase();
+            if (!collectionTitleIndex.has(key)) { collectionTitleIndex.set(key, id); added++; }
+        }
+        return added;
+    }
+
+    const COLLECTION_BADGE_CLASS = 'wm-coll-price';
+    const COLLECTION_BTN_CLASS = 'wm-coll-trash';
+
+    function isCollectionPage() {
+        return /\/collection(\/|$|\?)/.test(location.pathname + location.search);
+    }
+
+    /* Repère les tuiles de cartes sans dépendre d'un nom de classe : le site est en
+       Tailwind, ses classes changent à chaque retouche de style. On s'appuie sur un
+       invariant de contenu — l'image de la carte porte un `alt` identique au titre
+       affiché dans le <h3>. La tuile est le plus petit ancêtre qui contient les deux. */
+    function findCollectionTiles() {
+        const tiles = [];
+        for (const img of document.querySelectorAll('img[alt]')) {
+            const alt = (img.getAttribute('alt') || '').trim();
+            if (!alt) continue;
+            let el = img.parentElement;
+            for (let depth = 0; el && depth < 6; el = el.parentElement, depth++) {
+                const h3 = el.querySelector('h3');
+                if (h3 && (h3.textContent || '').trim() === alt) {
+                    tiles.push({ tile: el, title: alt });
+                    break;
+                }
+            }
+        }
+        return tiles;
+    }
+
+    function collectionPriceText(cardId) {
+        if (!cardId) return { text: '—', title: 'Carte non reconnue dans ta collection (index en cours de chargement).' };
+        const entry = getCachedSales(cardId);
+        if (!entry) {
+            return salesFetchBlocked(cardId)
+                ? { text: '?', title: "Le site a refusé l'historique des ventes de cette carte. Nouvelle tentative dans quelques minutes." }
+                : { text: '⋯', title: 'Cote en cours de chargement…' };
+        }
+        if (!entry.count) return { text: '—', title: 'Aucune vente passée pour cette carte : pas de cote.' };
+        return {
+            text: `≈ ${entry.median.toLocaleString('fr-FR')}`,
+            title: `Médiane ${entry.median} · moyenne ${entry.avg} · min ${entry.min} · max ${entry.max}`
+                 + ` · sur ${entry.count} vente(s)${entry.last != null ? ` · dernière ${entry.last}` : ''}`,
+        };
+    }
+
+    // Une seule observation de visibilité pour toute la page : c'est elle qui décide
+    // quelles cotes sont réellement demandées.
+    let collectionVisibilityObserver = null;
+    function ensureVisibilityObserver() {
+        if (collectionVisibilityObserver || typeof IntersectionObserver !== 'function') return;
+        collectionVisibilityObserver = new IntersectionObserver((entries) => {
+            let queued = 0;
+            for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                const id = e.target.dataset.wmCardId;
+                if (id && !getCachedSales(id)) { queueSalesFetch(id); queued++; }
+                collectionVisibilityObserver.unobserve(e.target); // une fois suffit
+            }
+            if (queued && !salesFetchRunning) {
+                processSalesQueue(() => refreshCollectionBadges());
+            }
+        }, { rootMargin: '200px' });
+    }
+
+    function refreshCollectionBadges() {
+        for (const el of document.querySelectorAll('.' + COLLECTION_BADGE_CLASS)) {
+            const { text, title } = collectionPriceText(el.dataset.wmCardId);
+            el.textContent = '💰 ' + text;
+            el.title = title;
+        }
+    }
+
+    function makeTrashButton(cardId, title) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = COLLECTION_BTN_CLASS;
+        btn.textContent = '🗑️';
+        btn.title = `Défausser « ${title} » : pose l'étiquette « ${getSellTagName()} » sur un exemplaire.`
+            + ' Le Trash Seller la mettra en vente. Rien n\'est supprimé, et le tag se retire depuis le site.';
+        btn.style.cssText = 'cursor:pointer;background:rgba(0,0,0,0.45);border:1px solid rgba(255,255,255,0.25);'
+            + 'border-radius:6px;padding:1px 4px;font-size:13px;line-height:1.1;color:#fff;backdrop-filter:blur(2px);';
+        btn.onclick = async (ev) => {
+            // Sans ça, le clic ouvre la fiche de la carte : le bouton est POSÉ sur la tuile,
+            // qui est elle-même cliquable.
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (btn.disabled) return;
+            btn.disabled = true;
+            const before = btn.textContent;
+            btn.textContent = '⏳';
+            try {
+                const tagId = await ensureTrashTagId();
+                if (!tagId) {
+                    btn.textContent = '⚠️';
+                    btn.title = `Étiquette « ${getSellTagName()} » introuvable sur ton compte — crée-la sur wiki-masters, puis réessaie.`;
+                    wmLog(`⚠️ Défausse impossible : l'étiquette <b>${esc(getSellTagName())}</b> n'existe pas sur ton compte. Crée-la sur le site (une seule fois), puis réessaie.`);
+                    return;
+                }
+                const userCardId = await findCurrentUserCardId(cardId, title);
+                if (!userCardId) {
+                    btn.textContent = '⚠️';
+                    btn.title = "Aucun exemplaire disponible trouvé pour cette carte (déjà étiqueté, ou en vente).";
+                    wmLog(`⚠️ Défausse : aucun exemplaire libre pour <b>${esc(title)}</b>.`);
+                    return;
+                }
+                const r = await addTagToUserCard(userCardId, tagId);
+                if (r.ok) {
+                    btn.textContent = '✅';
+                    btn.style.borderColor = 'rgba(74,222,128,0.7)';
+                    btn.title = `« ${title} » est étiquetée « ${getSellTagName()} » — le Trash Seller la vendra.`;
+                    wmLog(`🗑️ Défaussée : <b>${esc(title)}</b> → étiquette <b>${esc(getSellTagName())}</b>.`);
+                } else {
+                    btn.textContent = '⚠️';
+                    btn.title = `Échec : ${r.error || ('HTTP ' + r.status)}`;
+                    wmLog(`⚠️ Défausse échouée : <b>${esc(title)}</b> · ${esc(r.error || ('HTTP ' + r.status))}`);
+                }
+            } catch (e) {
+                btn.textContent = '⚠️';
+                btn.title = String((e && e.message) || e);
+                wmLog(`⚠️ Défausse échouée : <b>${esc(title)}</b> · ${esc((e && e.message) || 'erreur')}`);
+            } finally {
+                // Laisse l'état visible : ✅ et ⚠️ sont des informations, pas des transitoires.
+                if (btn.textContent === '⏳') btn.textContent = before;
+                btn.disabled = false;
+            }
+        };
+        return btn;
+    }
+
+    let collectionDecorateScheduled = false;
+    let collectionMatchLogged = false;
+
+    function decorateCollectionTiles() {
+        if (!isCollectionPage()) return;
+        ensureVisibilityObserver();
+        const tiles = findCollectionTiles();
+        let decorated = 0, unknown = 0;
+        for (const { tile, title } of tiles) {
+            if (tile.dataset.wmDecorated === '1') continue;
+            const cardId = collectionTitleIndex.get(title.trim().toLowerCase()) || '';
+            if (!cardId) { unknown++; continue; } // index pas encore prêt → on retentera
+            tile.dataset.wmDecorated = '1';
+            decorated++;
+
+            // Le badge se place en bas à gauche de la tuile. `position:absolute` se
+            // rattache à la tuile, qui est déjà `relative` côté site ; on ne force sa
+            // position que si ce n'était pas le cas, pour ne rien casser de sa mise en page.
+            if (getComputedStyle(tile).position === 'static') tile.style.position = 'relative';
+            const badge = document.createElement('div');
+            badge.className = COLLECTION_BADGE_CLASS;
+            badge.dataset.wmCardId = cardId;
+            const { text, title: tip } = collectionPriceText(cardId);
+            badge.textContent = '💰 ' + text;
+            badge.title = tip;
+            badge.style.cssText = 'position:absolute;left:4px;bottom:4px;z-index:40;pointer-events:auto;'
+                + 'font-size:10px;font-weight:700;padding:1px 5px;border-radius:6px;'
+                + 'background:rgba(0,0,0,0.6);color:#fbbf24;border:1px solid rgba(251,191,36,0.45);'
+                + 'backdrop-filter:blur(2px);white-space:nowrap;';
+            tile.appendChild(badge);
+
+            // Le bouton rejoint la pile d'icônes du site (à côté de l'étoile « favoris »)
+            // quand elle existe ; sinon on le pose en haut à droite de la tuile.
+            const btn = makeTrashButton(cardId, title);
+            const fav = tile.querySelector('button[aria-label="Ajouter aux favoris"]');
+            if (fav && fav.parentElement) {
+                fav.parentElement.appendChild(btn);
+            } else {
+                btn.style.position = 'absolute';
+                btn.style.right = '4px';
+                btn.style.top = '4px';
+                btn.style.zIndex = '40';
+                tile.appendChild(btn);
+            }
+
+            const probe = document.createElement('span');
+            probe.dataset.wmCardId = cardId;
+            probe.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
+            tile.appendChild(probe);
+            if (collectionVisibilityObserver) collectionVisibilityObserver.observe(probe);
+            else queueSalesFetch(cardId); // pas d'IntersectionObserver → repli simple
+        }
+
+        if (decorated && !collectionMatchLogged) {
+            collectionMatchLogged = true;
+            wmLog(`🖼️ Collection : cotes du marché affichées sur les cartes${unknown ? ` (${unknown} carte(s) pas encore reconnue(s), l'index se remplit)` : ''}.`);
+        }
+        if (!salesFetchRunning && salesFetchQueue.length > 0) {
+            processSalesQueue(() => refreshCollectionBadges());
+        }
+    }
+
+    function scheduleCollectionDecorate() {
+        if (collectionDecorateScheduled) return;
+        collectionDecorateScheduled = true;
+        // Débounce : le site re-rend sa grille par salves, et nos propres insertions
+        // déclenchent elles aussi l'observateur.
+        setTimeout(() => {
+            collectionDecorateScheduled = false;
+            // Pas de catch muet : une erreur ici laisse la page sans cote ni bouton,
+            // sans rien pour comprendre pourquoi. On le dit, une seule fois.
+            try { decorateCollectionTiles(); }
+            catch (e) {
+                if (!scheduleCollectionDecorate._errLogged) {
+                    scheduleCollectionDecorate._errLogged = true;
+                    wmLog(`⚠️ Surcouche Collection : ${esc((e && e.message) || e)}`);
+                    console.error('[WikiMasters] surcouche collection', e);
+                }
+            }
+        }, 400);
+    }
+
+    function installCollectionOverlay() {
+        if (typeof MutationObserver !== 'function') return;
+        new MutationObserver(scheduleCollectionDecorate).observe(document.body, { childList: true, subtree: true });
+        // Le site est une application à navigation interne : l'URL change sans rechargement.
+        window.addEventListener('popstate', scheduleCollectionDecorate);
+        scheduleCollectionDecorate();
+        // Les cotes arrivent de façon asynchrone : on rafraîchit les badges régulièrement,
+        // sans rien redemander au réseau.
+        setInterval(() => { if (isCollectionPage()) refreshCollectionBadges(); }, 5000);
+    }
+    installCollectionOverlay();
+
     window.addEventListener('offline', handleNetworkChange);
     // Exposé pour que les boucles réseau puissent vérifier l'état
     window.wmIsOnline = () => navigator.onLine;
