@@ -45,6 +45,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   dans une seule IIFE, il n'y a rien à importer — les tests extraient les helpers de
   `src/open_cards.js` par équilibrage d'accolades puis les évaluent. Ils portent donc
   sur le code réellement livré, pas sur une copie.
+- `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
+  pagination, et retombe sur le balayage complet si l'API cesse d'honorer le paramètre.
 - `tests/market-dead-pages.test.mjs` : 40 pages d'enchères terminées puis 3 vivantes —
   vérifie que les vivantes sont trouvées sans télécharger les mortes.
 - `tests/collection-overlay.test.mjs` : reproduit la grille Collection du site (classes
@@ -107,8 +109,10 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       redemandé en boucle (audit #21, #22, #23)
 - [x] Surcouche Collection : cote du marché sur chaque carte + bouton de défausse
       réversible (audit #24, #26)
-- [x] Scan : saut par dichotomie des pages d'enchères déjà terminées — 89 % du marché
-      sur ce site (audit #25)
+- [x] Scan : recherche côté serveur (`q=`) par mot-clé — mêmes résultats que la
+      recherche du site, quelques requêtes au lieu de ~300 pages (audit #32)
+- [x] Scan : saut par dichotomie des pages d'enchères déjà terminées, en repli
+      (audit #25)
 - [x] Cotes : même endpoint que le site (`?scope=summary`), moyenne lue par rareté,
       chargement en parallèle (~1,5 s pour 40 cartes) (audit #27, #29, #30, #31)
 - [x] Échappement HTML systématique — `esc()`/`escUrl()` uniques, 166 points

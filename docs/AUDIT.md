@@ -466,6 +466,45 @@ premier refus, toute la file s'arrête. Et comme l'intercepteur capte déjà les
 le site émet pour sa propre grille, une bonne part des cotes arrive sans que le bot ait
 quoi que ce soit à demander.
 
+### 32. L'API sait chercher — le bot balayait au lieu de demander
+Relevé dans l'onglet Réseau de l'utilisateur, en tapant « femme » dans la recherche du
+marché :
+
+```
+GET /api/marketplace?page=1&limit=50&sort=recent&q=femme   → 200, 14,4 ko
+GET /api/marketplace?page=2&limit=50&sort=recent&q=femme   → 200   (charger la suite)
+```
+
+L'API accepte un paramètre **`q=`** et filtre côté serveur. Le bot, lui, téléchargeait le
+marché entier (~300 pages, 12 000 annonces dont 89 % de terminées) pour refaire ce filtre
+en JavaScript. D'où tout le reste : scans tronqués au plafond, 403 en cascade jusque sur
+l'ouverture de paquets, et surtout un écart permanent entre « ce que je vois sur le site »
+et « ce que le bot trouve ».
+
+**✅ Corrigé (1.3.13-fork.15)** — une recherche serveur par mot-clé de la liste
+(`fetchWatchedAuctions`), paginée via `hasMore`. Sur le test : **60 annonces en 4
+requêtes** au lieu de plusieurs centaines. Et les résultats sont, par construction,
+exactement ceux que le site affiche.
+
+Trois précautions :
+
+- **Repli automatique.** Si l'API cessait d'honorer `q`, elle renverrait le marché entier
+  et le bot afficherait n'importe quoi. Une sonde mesure la **proportion** d'annonces
+  ramenées qui contiennent réellement le mot — se contenter de « au moins une correspond »
+  ne suffit pas, un marché entier en contient forcément quelques-unes. Sous 50 %, retour
+  au balayage complet, signalé dans le log. La sonde tranche **dès la première page** :
+  sans ça, on téléchargeait jusqu'à 20 pages par mot-clé avant de s'en apercevoir.
+- **Pages refusées rejouées sur place.** Abandonner une page perdrait aussi toutes les
+  suivantes (`hasMore` devient inconnu), soit un trou silencieux — le défaut déjà corrigé
+  côté balayage complet (#22), qu'il aurait été absurde de réintroduire ici.
+- **Enchères suivies protégées.** Une enchère où je mise mais qui ne correspond à aucun
+  mot-clé serait absente du scan, et le pruning la déclarerait terminée à tort. Les ids de
+  `myBidsSet` manquants sont donc récupérés un par un.
+
+`tests/market-server-search.test.mjs` vérifie les trois : `q=` utilisé, pagination suivie,
+poignée de requêtes — et le repli déclenché quand l'API ignore `q` (scénario où le bruit
+arrive en tête, sinon une page 1 accidentellement filtrée ne prouverait rien).
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

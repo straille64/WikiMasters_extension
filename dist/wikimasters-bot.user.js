@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.14
+// @version      1.3.13-fork.15
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.14';
+    const WM_VERSION = '1.3.13-fork.15';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -2824,8 +2824,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     const MARKET_THROTTLE_MAX = 8;
     let marketScanRefusals = 0;
 
-    async function fetchMarketPage(page) {
-        const url = `${MARKET_API_BASE}?page=${page}&limit=${MARKET_PAGE_LIMIT}&sort=ending_soon`;
+    async function fetchMarketPage(page, q, sort) {
+        const url = `${MARKET_API_BASE}?page=${page}&limit=${MARKET_PAGE_LIMIT}`
+            + `&sort=${sort || 'ending_soon'}`
+            + (q ? `&q=${encodeURIComponent(q)}` : '');
         const t0 = Date.now();
         const res = await fetch(url, { credentials: "include" });
         syncServerClockFromResponse(res, t0);
@@ -2897,6 +2899,124 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         // Une page de marge : des enchères expirent pendant le scan, la frontière bouge.
         return Math.max(1, hi - 1);
+    }
+
+    /* ── Recherche côté SERVEUR ──
+       Relevé dans l'onglet Réseau : la recherche du site appelle
+       `GET /api/marketplace?page=1&limit=50&sort=recent&q=femme` → 200.
+       L'API sait donc filtrer elle-même. Interroger un mot-clé coûte alors quelques
+       pages au lieu des ~300 qu'exige un balayage complet, et surtout les résultats
+       sont EXACTEMENT ceux que le site montre à l'utilisateur — fini l'écart entre
+       « ce que je vois sur le site » et « ce que le bot trouve ».
+
+       Garde-fou : si l'API ignorait `q` (paramètre retiré, renommé…), elle renverrait
+       le marché entier. On le détecte en vérifiant qu'au moins une annonce ramenée
+       contient réellement le mot ; sinon on repasse au balayage complet et on le dit. */
+    const MARKET_MAX_PAGES_PER_KEYWORD = 20; // 1 000 annonces pour un seul mot : large
+    let serverSearchBroken = false;
+
+    async function fetchKeywordAuctions(kw, absorb, onProgress, ctl) {
+        let pages = 0;
+        for (let page = 1; page <= MARKET_MAX_PAGES_PER_KEYWORD; page++) {
+            if (ctl && ctl.abort) break;
+            /* Page refusée : on la REJOUE sur place. Abandonner ici perdrait la page ET
+               toutes les suivantes (on ne connaît plus `hasMore`), soit un trou silencieux
+               dans les résultats — exactement le défaut corrigé côté balayage complet. */
+            let data = null;
+            for (let attempt = 0; attempt < 3 && !data; attempt++) {
+                if (attempt) await new Promise(r => setTimeout(r, 1200 * attempt));
+                try { data = await fetchMarketPage(page, kw, 'recent'); } catch (e) { data = null; }
+            }
+            if (!data) {
+                wmLog(`⚠️ « ${esc(kw)} » : page ${page} refusée même après plusieurs essais — il manque jusqu'à ${MARKET_PAGE_LIMIT} annonces pour ce mot-clé.`);
+                break;
+            }
+            pages++;
+            const list = (data && data.auctions) || [];
+            absorb(list, kw);
+            // La sonde tranche DÈS LA PREMIÈRE PAGE : si `q` est ignoré, continuer
+            // reviendrait à télécharger 20 pages par mot-clé avant de s'en apercevoir.
+            if (ctl && ctl.check && ctl.check()) break;
+            if (onProgress) onProgress(kw, page, list.length);
+            const more = (data && typeof data.hasMore === 'boolean')
+                ? data.hasMore
+                : list.length >= MARKET_PAGE_LIMIT;
+            if (!more) break;
+            await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+        }
+        return pages;
+    }
+
+    /* Scan par mots-clés : une recherche serveur par entrée de la liste, plus les
+       enchères où je mise déjà (elles doivent rester suivies même si elles ne
+       correspondent à aucun mot-clé, sinon le pruning les déclarerait terminées).
+       Retourne null si la recherche serveur s'avère inopérante — l'appelant repasse
+       alors au balayage complet. */
+    async function fetchWatchedAuctions(onProgress) {
+        const kws = [...new Set(WATCHLIST.filter(e => e.enabled !== false).map(e => e.kw))];
+        if (!kws.length) return null;
+
+        const seen = new Set();
+        const auctions = [];
+        /* Contrôle que `q` filtre RÉELLEMENT. Se contenter de « au moins une annonce
+           contient le mot » ne suffit pas : une API qui ignore `q` renvoie le marché
+           entier, dans lequel se trouvent forcément quelques correspondances. On mesure
+           donc la PROPORTION — si moins de la moitié des annonces ramenées contiennent
+           le mot, c'est qu'on nous sert autre chose que le résultat d'une recherche. */
+        let probeTotal = 0, probeMatched = 0;
+        const absorb = (list, kw) => {
+            for (const a of (list || [])) {
+                if (!a || !a.id) continue;
+                if (kw && probeTotal < 50) {
+                    probeTotal++;
+                    const hay = ((a.card && a.card.wikipedia_title) || '') + ' '
+                              + ((a.card && a.card.category) || '') + ' '
+                              + ((a.card && a.card.summary) || '');
+                    if (hay.toLowerCase().includes(kw.toLowerCase())) probeMatched++;
+                }
+                if (seen.has(a.id)) continue;
+                seen.add(a.id);
+                auctions.push(a);
+            }
+        };
+
+        // `check()` retourne true dès qu'on sait que `q` n'est pas respecté : la boucle
+        // s'arrête alors immédiatement, sans enchaîner les pages ni les mots-clés.
+        const ctl = {
+            abort: false,
+            check() {
+                if (probeTotal >= 10 && probeMatched / probeTotal < 0.5) this.abort = true;
+                return this.abort;
+            },
+        };
+
+        let pages = 0;
+        for (const kw of kws) {
+            if (ctl.abort) break;
+            pages += await fetchKeywordAuctions(kw, absorb, onProgress, ctl);
+            await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+        }
+
+        if (ctl.abort || (probeTotal >= 10 && probeMatched / probeTotal < 0.5)) {
+            // L'API a répondu sans tenir compte de `q` : on ne peut pas s'y fier.
+            serverSearchBroken = true;
+            wmLog(`⚠️ La recherche serveur (<b>q=</b>) ne filtre plus (${probeMatched}/${probeTotal} correspondances) — retour au balayage complet du marché.`);
+            return null;
+        }
+
+        /* Les enchères où je mise déjà : récupérées une par une. Sans ça, une enchère
+           suivie qui ne correspond à aucun mot-clé serait absente du scan et le pruning
+           la déclarerait terminée à tort. myBidsSet reste petit, le coût est marginal. */
+        const missing = [...myBidsSet].filter(id => !seen.has(id)).slice(0, 25);
+        for (const id of missing) {
+            try {
+                const a = await fetchSingleAuction(id);
+                if (a && a.id && !seen.has(a.id)) { seen.add(a.id); auctions.push(a); }
+            } catch (e) {}
+        }
+
+        lastScanPageCount = Math.max(1, pages);
+        return { auctions, total: auctions.length, totalPages: pages, keywordMode: true };
     }
 
     // Fetch TOUTES les pages et retourne tous les auctions
@@ -3761,10 +3881,23 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             await fetchBalance();
             marketStatusEl.innerHTML = `<span style="color:#06b6d4;font-size:10px;">⏳ scan p.1…</span>`;
 
-            const { auctions, total, totalPages } = await fetchAllMarketAuctions((page, total, found) => {
-                marketStatusEl.innerHTML =
-                    `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ p.${page}/${total} · ${found} annonces</span>`;
-            });
+            /* Recherche serveur par mot-clé quand c'est possible : quelques pages au lieu
+               de plusieurs centaines, et surtout les MÊMES résultats que la recherche du
+               site. Repli sur le balayage complet si `q` n'est pas (ou plus) pris en compte. */
+            let scan = null;
+            if (!serverSearchBroken) {
+                scan = await fetchWatchedAuctions((kw, page, found) => {
+                    marketStatusEl.innerHTML =
+                        `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ « ${esc(kw)} » p.${page} · ${found}</span>`;
+                });
+            }
+            if (!scan) {
+                scan = await fetchAllMarketAuctions((page, total, found) => {
+                    marketStatusEl.innerHTML =
+                        `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ p.${page}/${total} · ${found} annonces</span>`;
+                });
+            }
+            const { auctions, total, totalPages } = scan;
 
             const now = new Date().toLocaleTimeString("fr-FR",
                 { hour:"2-digit", minute:"2-digit", second:"2-digit" });
