@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.22
+// @version      1.3.13-fork.23
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.22';
+    const WM_VERSION = '1.3.13-fork.23';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1527,6 +1527,9 @@
     function watchEntryMatches(entry, card) {
         if (!entry) return false;
         const kwLC = entry.kw.toLowerCase();
+        // Ramenée par la recherche serveur pour CE mot-clé → le serveur fait foi, même si
+        // le mot n'apparaît dans aucun champ qu'il nous renvoie (cf. absorb du scan).
+        if (card && card.__wmServerKw && String(card.__wmServerKw).toLowerCase() === kwLC) return true;
         return keywordFields(card, !!entry.extended)
             .some(f => (f || '').toLowerCase().includes(kwLC));
     }
@@ -2946,6 +2949,46 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        contient réellement le mot ; sinon on repasse au balayage complet et on le dit. */
     const MARKET_MAX_PAGES_PER_KEYWORD = 20; // 1 000 annonces pour un seul mot : large
     let serverSearchBroken = false;
+    let serverSearchBrokenTs = 0;
+    // Le balayage complet coûte des centaines de pages : on ne s'y résout jamais
+    // DÉFINITIVEMENT. Au bout de ce délai, on re-sonde la recherche serveur.
+    const SERVER_SEARCH_RETRY_MS = 10 * 60 * 1000;
+
+    /* Est-ce que `q=` filtre vraiment ?
+
+       L'ancienne sonde comptait la proportion d'annonces dont le titre / la catégorie /
+       le résumé contenaient le mot. Elle se trompait dès que le site cherchait dans un
+       champ que la réponse du marché ne renvoie pas (le résumé, justement) : la recherche
+       fonctionnait, la sonde la déclarait cassée, et le bot basculait sur un balayage de
+       277 pages — à chaque scan, sans jamais y revenir.
+
+       On ne devine donc plus ce que le serveur indexe : on compare la 1re page FILTRÉE à
+       la 1re page NON filtrée. Si `q` est ignoré, les deux servent les mêmes annonces. */
+    // La sonde coûte 2 requêtes : on ne la refait pas à chaque scan (le scan tourne
+    // toutes les quelques dizaines de secondes). Un verdict tient 10 min.
+    const SEARCH_PROBE_TTL_MS = 10 * 60 * 1000;
+    let _searchProbe = { verdict: null, ts: 0 };
+
+    async function probeServerSearch(kw) {
+        if (_searchProbe.verdict !== null && Date.now() - _searchProbe.ts < SEARCH_PROBE_TTL_MS) {
+            return _searchProbe.verdict;
+        }
+        let filtered = null, plain = null;
+        try {
+            [filtered, plain] = await Promise.all([
+                fetchMarketPage(1, kw, 'recent').catch(() => null),
+                fetchMarketPage(1, '', 'recent').catch(() => null),
+            ]);
+        } catch (e) { return null; }
+        if (!filtered || !plain) return null;   // refus réseau : indécidable, on n'accuse pas
+        const ids = (filtered.auctions || []).map(x => x && x.id).filter(Boolean);
+        const plainIds = new Set((plain.auctions || []).map(x => x && x.id).filter(Boolean));
+        if (!plainIds.size) return null;
+        const verdict = !ids.length          // 0 résultat filtré = un filtre qui filtre
+            || (ids.filter(id => plainIds.has(id)).length / ids.length) < 0.8;
+        _searchProbe = { verdict, ts: Date.now() };
+        return verdict;
+    }
 
     async function fetchKeywordAuctions(kw, absorb, onProgress, ctl) {
         let pages = 0;
@@ -2988,51 +3031,49 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const kws = [...new Set(WATCHLIST.filter(e => e.enabled !== false).map(e => e.kw))];
         if (!kws.length) return null;
 
+        // Une seule sonde, AVANT de télécharger quoi que ce soit : verdict clair, et on
+        // ne paie pas 20 pages par mot-clé pour s'apercevoir ensuite que `q` est ignoré.
+        const works = await probeServerSearch(kws[0]);
+        if (works === false) {
+            serverSearchBroken = true;
+            serverSearchBrokenTs = Date.now();
+            wmLog(`⚠️ La recherche serveur (<b>q=</b>) renvoie le marché non filtré — balayage complet pendant 10 min, puis nouvelle tentative.`);
+            return null;
+        }
+        // works === null : le serveur a refusé la sonde (403). On ne condamne pas la
+        // recherche pour autant — on tente le scan, quitte à le faire partiellement.
+
         const seen = new Set();
         const auctions = [];
-        /* Contrôle que `q` filtre RÉELLEMENT. Se contenter de « au moins une annonce
-           contient le mot » ne suffit pas : une API qui ignore `q` renvoie le marché
-           entier, dans lequel se trouvent forcément quelques correspondances. On mesure
-           donc la PROPORTION — si moins de la moitié des annonces ramenées contiennent
-           le mot, c'est qu'on nous sert autre chose que le résultat d'une recherche. */
-        let probeTotal = 0, probeMatched = 0;
+        let refusedKeywords = 0;
         const absorb = (list, kw) => {
             for (const a of (list || [])) {
                 if (!a || !a.id) continue;
-                if (kw && probeTotal < 50) {
-                    probeTotal++;
-                    const hay = ((a.card && a.card.wikipedia_title) || '') + ' '
-                              + ((a.card && a.card.category) || '') + ' '
-                              + ((a.card && a.card.summary) || '');
-                    if (hay.toLowerCase().includes(kw.toLowerCase())) probeMatched++;
-                }
+                /* Le site indexe des champs que la réponse du marché ne renvoie pas. Une
+                   annonce ramenée par `q=eiffage` peut donc ne contenir « eiffage » nulle
+                   part dans ce qu'on reçoit : la re-tester localement la rejetait, et le
+                   Market Watcher n'affichait RIEN alors que la recherche avait marché.
+                   On retient donc le mot-clé qui l'a ramenée : c'est le serveur qui sait. */
+                if (kw && a.card && !a.card.__wmServerKw) a.card.__wmServerKw = kw;
                 if (seen.has(a.id)) continue;
                 seen.add(a.id);
                 auctions.push(a);
             }
         };
-
-        // `check()` retourne true dès qu'on sait que `q` n'est pas respecté : la boucle
-        // s'arrête alors immédiatement, sans enchaîner les pages ni les mots-clés.
-        const ctl = {
-            abort: false,
-            check() {
-                if (probeTotal >= 10 && probeMatched / probeTotal < 0.5) this.abort = true;
-                return this.abort;
-            },
-        };
+        const ctl = { abort: false, check() { return false; } };
 
         let pages = 0;
         for (const kw of kws) {
-            if (ctl.abort) break;
-            pages += await fetchKeywordAuctions(kw, absorb, onProgress, ctl);
+            const got = await fetchKeywordAuctions(kw, absorb, onProgress, ctl);
+            if (got === 0) refusedKeywords++;   // page 1 refusée : ce mot-clé n'a rien donné
+            pages += got;
             await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
         }
 
-        if (ctl.abort || (probeTotal >= 10 && probeMatched / probeTotal < 0.5)) {
-            // L'API a répondu sans tenir compte de `q` : on ne peut pas s'y fier.
-            serverSearchBroken = true;
-            wmLog(`⚠️ La recherche serveur (<b>q=</b>) ne filtre plus (${probeMatched}/${probeTotal} correspondances) — retour au balayage complet du marché.`);
+        // TOUS les mots-clés refusés : rendre « 0 annonce » ferait passer un refus serveur
+        // pour un marché vide, et le pruning déclarerait terminées des enchères vivantes.
+        if (refusedKeywords === kws.length) {
+            wmLog(`⚠️ Recherche serveur refusée pour ${refusedKeywords} mot(s)-clé(s) — scan ignoré, nouvelle tentative au prochain passage.`);
             return null;
         }
 
@@ -3048,7 +3089,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
 
         lastScanPageCount = Math.max(1, pages);
-        return { auctions, total: auctions.length, totalPages: pages, keywordMode: true };
+        return { auctions, total: auctions.length, totalPages: pages, keywordMode: true,
+                 incomplete: refusedKeywords > 0 };
     }
 
     // Fetch TOUTES les pages et retourne tous les auctions
@@ -4001,6 +4043,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                de plusieurs centaines, et surtout les MÊMES résultats que la recherche du
                site. Repli sur le balayage complet si `q` n'est pas (ou plus) pris en compte. */
             let scan = null;
+            if (serverSearchBroken && Date.now() - serverSearchBrokenTs > SERVER_SEARCH_RETRY_MS) {
+                serverSearchBroken = false;
+                wmLog('🔁 Nouvelle tentative de recherche serveur (<b>q=</b>) après 10 min de balayage complet.');
+            }
             if (!serverSearchBroken) {
                 scan = await fetchWatchedAuctions((kw, page, found) => {
                     marketStatusEl.innerHTML =
@@ -4013,12 +4059,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ p.${page}/${total} · ${found} annonces</span>`;
                 });
             }
-            const { auctions, total, totalPages } = scan;
+            const { auctions, total, totalPages, incomplete } = scan;
 
             const now = new Date().toLocaleTimeString("fr-FR",
                 { hour:"2-digit", minute:"2-digit", second:"2-digit" });
-            marketStatusEl.innerHTML =
-                `<span style="color:#555;font-size:10px;white-space:nowrap;">✅ ${now} · ${total} annonces · ${totalPages} pages</span>`;
+            marketStatusEl.innerHTML = incomplete
+                ? `<span style="color:#fbbf24;font-size:10px;white-space:nowrap;">⚠️ ${now} · ${total} annonces · scan partiel (refus serveur)</span>`
+                : `<span style="color:#555;font-size:10px;white-space:nowrap;">✅ ${now} · ${total} annonces · ${totalPages} pages</span>`;
             apiHealth.lastMarketScanTs = Date.now(); // santé : dernier scan marché réussi
 
             // Auto-track : si je suis le current bidder sur une enchère, je la mémorise
@@ -4026,10 +4073,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (isSelf(a.current_bidder?.username)) trackMyBid(a.id);
             });
 
-            // Prune : retire de myBidsSet les enchères qui ne sont plus en cours
+            // Prune : retire de myBidsSet les enchères qui ne sont plus en cours.
+            // Un scan PARTIEL (mot-clé refusé par le serveur) ne prouve rien sur ce qui
+            // manque : purger sur cette base déclarerait terminées des enchères vivantes.
             const liveIds = new Set(auctions.map(a => a.id));
             let prunedAny = false;
-            for (const id of [...myBidsSet]) {
+            for (const id of (incomplete ? [] : [...myBidsSet])) {
                 if (liveIds.has(id)) continue;
                 const last = activeHitsMap.get(id);
                 // Garde-fou : si on connaît end_at et qu'il est dans le futur,
@@ -4068,7 +4117,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Garde-fou anti-blip → on ne coupe plus l'auto-bid sur une enchère qui a
             // juste glissé entre 2 pages du scan (cause du « il se désactive sans raison »).
             let autoBidPruned = false;
-            for (const id of [...autoBidSet]) {
+            for (const id of (incomplete ? [] : [...autoBidSet])) {
                 if (liveIds.has(id)) continue;
                 if (auctionLikelyStillLive(id)) continue; // blip de scan : on garde l'auto-bid
                 const last = activeHitsMap.get(id);
@@ -4081,7 +4130,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
             // Prune le mode Fourbe — même garde-fou anti-blip que l'auto-bid.
             let snipePruned = false;
-            for (const id of [...snipeSet]) {
+            for (const id of (incomplete ? [] : [...snipeSet])) {
                 if (liveIds.has(id)) continue;
                 if (auctionLikelyStillLive(id)) continue;
                 const last = activeHitsMap.get(id);
@@ -4096,7 +4145,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // grossirait indéfiniment et un désarmement futur restaurerait des plafonds sur
             // des enchères mortes depuis longtemps.
             let aggroPruned = false;
-            for (const id of [...hunterFourbeMap.keys()]) {
+            for (const id of (incomplete ? [] : [...hunterFourbeMap.keys()])) {
                 if (liveIds.has(id)) continue;
                 if (auctionLikelyStillLive(id)) continue;
                 hunterFourbeMap.delete(id); aggroPruned = true;
@@ -4106,7 +4155,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Prune les plafonds auto-bid — même garde-fou (sinon on perdrait le plafond
             // sur un simple blip, et la carte repasserait en auto-bid SANS limite).
             let maxPruned = false;
-            for (const id of [...autoBidMaxMap.keys()]) {
+            for (const id of (incomplete ? [] : [...autoBidMaxMap.keys()])) {
                 if (liveIds.has(id)) continue;
                 if (auctionLikelyStillLive(id)) continue;
                 autoBidMaxMap.delete(id); maxPruned = true;
@@ -4177,11 +4226,15 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     ? keywordFields(card, true).join(' \u0000 ').toLowerCase()
                     : null;
 
+                const serverKwLC = card && card.__wmServerKw
+                    ? String(card.__wmServerKw).toLowerCase() : null;
+
                 let hunterEntry = null, alert = false, matchedEntry = null;
                 for (const { e, kwLC, hunter } of watchLC) {
-                    const hit = (e.extended && fullLC !== null)
-                        ? fullLC.includes(kwLC)
-                        : (titleLC.includes(kwLC) || categoryLC.includes(kwLC));
+                    const hit = serverKwLC === kwLC   // verdict de la recherche serveur
+                        || ((e.extended && fullLC !== null)
+                            ? fullLC.includes(kwLC)
+                            : (titleLC.includes(kwLC) || categoryLC.includes(kwLC)));
                     if (!hit) continue;
                     alert = true;
                     if (!matchedEntry) matchedEntry = e;

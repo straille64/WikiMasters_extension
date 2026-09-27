@@ -737,6 +737,44 @@ actives en base et un plafond de 5, aucune mise ne doit partir ; avec 4, une mis
 partir (témoin positif). Mutation de contrôle : en rétablissant l'ancienne lecture, le test
 retrouve le symptôme mot pour mot — « Mise en vente de 2 carte(s) (0 actives) ».
 
+### 39. Recherche serveur condamnée à tort, et définitivement
+Capture du 27/09 : le bandeau du Market Watcher affichait `⏳ p.277/277 · 13105 ann…`.
+Le bot ne cherchait plus — il **balayait le marché entier** à chaque scan, pour un seul
+mot-clé. Trois défauts enchaînés.
+
+**1. La sonde jugeait sur des champs que la réponse ne contient pas.** Elle comptait la
+proportion d'annonces dont le titre, la catégorie ou le résumé contenaient le mot. Or le
+site indexe aussi des champs que `/api/marketplace` ne renvoie pas. Une recherche qui
+**fonctionnait** était donc déclarée cassée — « moins de la moitié des annonces contiennent
+le mot » signifiait seulement « je ne reçois pas le champ où il est ».
+
+**2. Le verdict était définitif.** `serverSearchBroken` était un verrou à sens unique :
+une fois posé, plus aucune tentative jusqu'au rechargement de la page. D'où le balayage de
+277 pages répété indéfiniment — « les recherches tournent à l'infini ».
+
+**3. Les résultats trouvés étaient jetés.** Même quand `q=` ramenait les bonnes annonces,
+le bot les re-testait localement avec ses propres champs, ne trouvait pas le mot, et les
+écartait. La recherche marchait, l'affichage restait vide.
+
+**✅ Corrigé (1.3.13-fork.23)**
+
+- Nouvelle sonde, qui ne suppose rien de ce que le serveur indexe : elle compare la 1re page
+  **filtrée** à la 1re page **non filtrée**. Si `q` est ignoré, les deux servent les mêmes
+  annonces (≥ 80 % d'identifiants communs). Verdict mis en cache 10 min — 2 requêtes, pas
+  une par scan.
+- Le verdict « cassée » **expire au bout de 10 min** : le bot re-sonde et repasse sur `q=`
+  dès que le site répond de nouveau correctement. Une ligne de log l'annonce.
+- Une annonce ramenée par `q=<mot>` est **marquée** avec ce mot (`card.__wmServerKw`) et
+  tous les matcheurs l'honorent : c'est le serveur qui sait quels champs il indexe.
+- Une page refusée pour TOUS les mots-clés ne rend plus un scan « réussi » à 0 annonce :
+  le scan est ignoré (sinon le pruning déclarait terminées des enchères vivantes). Un scan
+  partiel est signalé dans le bandeau et **suspend tous les pruning**.
+
+`tests/market-search-probe.test.mjs` rejoue le cas exact : le site filtre, mais le mot
+n'apparaît dans aucun champ renvoyé. Trois mutations de contrôle échouent comme attendu —
+verdict faussé (« déclarée cassée », 14 requêtes non filtrées), verrou définitif (« plus
+aucune tentative »), et verdict serveur ignoré (« aucune annonce ne remonte »).
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
