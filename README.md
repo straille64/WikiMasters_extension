@@ -66,6 +66,10 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/collection-overlay-robust.test.mjs` : carte sans illustration décorée, cote
   refusée redemandée d'elle-même, carte jamais vendue affichée « — » sans boucle, et
   titres non indexés (espace insécable, page non interceptée) résolus.
+- `tests/trash-seller-pricing.test.mjs` : % de la cote par rareté, plancher limité aux
+  premières mises en vente, baisse par invendu bornée, mise de côté réversible.
+- `tests/trash-seller-ui-robust.test.mjs` : titre à apostrophe typographique et fiche
+  lente à s'ouvrir — la bonne carte est vendue, le garde-fou reste actif.
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -160,6 +164,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       manuelle passée par le même chemin que les mises auto (audit #40)
 - [x] Collection : toutes les cartes décorées (y compris sans illustration), cotes qui se
       réparent seules, 4× moins de travail par passage (audit #41)
+- [x] Trash Seller : % de la cote par rareté, plancher puis marché, -10 %/invendu,
+      mise de côté des invendables, et fiabilité de la mise en vente (audit #42)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

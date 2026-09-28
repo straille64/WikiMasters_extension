@@ -867,6 +867,48 @@ avant **400/600** cartes décorées et **146 ms** de JavaScript ; après **600/6
 de contrôle, qui échoue sur sa propre assertion. `tests/collection-overlay.test.mjs`
 (structure réelle du site, modale ignorée, seules les cartes visibles interrogées) reste vert.
 
+### 42. Trash Seller : des cartes relancées en boucle au plancher
+Logs du 28/09, une heure de fonctionnement : **26 mises en vente, 2 ventes**. La plupart des R
+partaient au **plancher de 15 💰** pour une cote de **1 à 10 💰** (*The Tunnel* : cote 2,
+*Pouvoirs* : cote 1), revenaient invendues et repartaient au même prix — 🔁2, 🔁3. L'ancienne
+baisse (-15 % par tranche de 10 remises) ne se déclenchait jamais à ce rythme. À l'inverse,
+*The First Slam Dunk*, listée à sa cote (47), est partie à **100 💰** sur surenchère.
+
+Échecs dans le même log : `card_not_found` ×5 (dont des titres à apostrophe), `no_sell_button`
+×2, « Impossible de créer l'enchère » ×3 (repris au 2e essai).
+
+**✅ Nouvelles règles (1.3.13-fork.26)**, choisies par l'utilisateur :
+
+- **% de la cote par rareté**, réglable dans le panneau Trash Seller (au-dessus de 100 :
+  plus cher que le marché ; en dessous : pour vendre plus vite). Non réglé → le % global.
+- **Plancher limité dans le temps** : le minimum du tableau ne protège que les **2 premières**
+  mises en vente d'une carte (`sellFloorTries`, 0 = toujours) ; ensuite, le marché décide.
+- **Baisse par invendu** : **-10 %** à chaque invendu (`sellDecayStepPct`), jamais sous
+  **50 %** du prix de départ (`sellDecayMinPct`). Remplace -15 %/10 remises.
+- **Mise de côté** : au-delà de **6 invendus** (`sellSetAsideAfter`, 0 = jamais), la carte
+  sort de la file ; elle garde son tag et s'affiche dans « 🗃️ Mises de côté », d'où un clic la
+  remet en vente avec un compteur remis à zéro. Filtre posé dans `selectTrashBatch()`, le
+  point de passage commun (vente, aperçu, refresh).
+- L'aperçu dit tout : `🛡️ marché 7 → min 15 (2×)`, `🔓 plancher levé`, `📉-20%`, et le nombre
+  de cartes mises de côté.
+
+**✅ Échecs corrigés**
+
+- `normTitle()` replie la ponctuation typographique (’ – « ») sur l'ASCII. Utilisée par la
+  recherche de la tuile, le contrôle de la tuile **et** le garde-fou de la fenêtre — qui,
+  sinon, aurait refusé la bonne carte pour une apostrophe.
+- La barre de recherche reçoit le plus long morceau du titre **sans ponctuation**
+  (`searchTermFor`) : taper l'apostrophe ASCII ne trouvait rien si le site stocke l'autre.
+- Attente de la tuile portée à 8 s ; le bouton « Mettre aux enchères » est **attendu**
+  (3 s) au lieu d'être cherché une fois à 600 ms, et la fiche est refermée s'il n'apparaît pas.
+
+`tests/trash-seller-pricing.test.mjs` vérifie les 7 prix d'un pool construit pour couvrir
+chaque règle, la mise de côté et son retour. `tests/trash-seller-ui-robust.test.mjs` rejoue
+l'apostrophe typographique et une fiche lente. Mutations de contrôle : % global à la place du
+% par rareté, plancher permanent, baisse non bornée, mise de côté désactivée, bouton cherché
+une seule fois — toutes échouent. La version précédente échoue sur l'apostrophe avec le
+`card_not_found` exact des logs.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

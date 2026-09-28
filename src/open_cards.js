@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.25';
+    const WM_VERSION = '1.3.13-fork.26';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -97,6 +97,11 @@
         try { localStorage.setItem(SELL_CONFIG_KEY, JSON.stringify(cfg)); } catch(e) {}
     }
     function getSellPrice(rarity)    { return getSellConfig()[rarity]?.price    ?? 10; }
+    // % de la cote appliqué pour cette rareté. Non réglé → le % global (Paramètres).
+    function getSellPct(rarity) {
+        const v = getSellConfig()[String(rarity || '').toUpperCase()]?.pct;
+        return Number.isFinite(v) && v > 0 ? v : getSetting('sellMarketPricePct');
+    }
     function getSellDuration(rarity) { return getSellConfig()[rarity]?.duration ?? 10; }
 
     // Migration : si un sellDuration global existait, on l'applique à toutes les raretés
@@ -498,6 +503,78 @@
     }
     function getRetagCount(cardId) {
         return (cardId && retagCounts[cardId]) ? retagCounts[cardId].count : 0;
+    }
+    function resetRetagCount(cardId) {
+        if (!cardId || !retagCounts[cardId]) return;
+        delete retagCounts[cardId];
+        saveRetagCounts();
+    }
+
+    /* ── Cartes mises de côté ──
+       Au-delà de N invendus, une carte n'a visiblement pas d'acheteur au prix qu'on peut en
+       tirer : la relancer en boucle occupe un créneau pour rien. Elle sort de la file de
+       vente (son tag est conservé) et s'affiche dans le panneau, où l'utilisateur décide :
+       la remettre en vente repart de zéro (compteur d'invendus remis à 0). Local et
+       réversible : rien n'est modifié côté site. */
+    const SET_ASIDE_KEY = 'wm_sell_set_aside';
+    let setAsideCards = {};
+    try { setAsideCards = JSON.parse(localStorage.getItem(SET_ASIDE_KEY) || '{}') || {}; } catch(e) { setAsideCards = {}; }
+    function saveSetAside() {
+        try { localStorage.setItem(SET_ASIDE_KEY, JSON.stringify(setAsideCards)); } catch(e) {}
+    }
+    // Vrai si la carte doit rester hors de la file. L'enregistre au passage (pour l'afficher).
+    function isSetAside(cardId, title, rarity) {
+        if (!cardId) return false;
+        if (setAsideCards[cardId]) return true;
+        const limit = getSetting('sellSetAsideAfter');
+        const n = getRetagCount(cardId);
+        if (!(limit > 0 && n >= limit)) return false;
+        setAsideCards[cardId] = { title: title || retagCounts[cardId]?.title || '?',
+                                  rarity: (rarity || retagCounts[cardId]?.rarity || '').toUpperCase(),
+                                  unsold: n, ts: Date.now() };
+        saveSetAside();
+        wmLog(`🗃️ Mise de côté après <b>${n}</b> invendus : <b>${esc(setAsideCards[cardId].title)}</b> — elle ne repart plus en vente toute seule (panneau Trash Seller → « Mises de côté »).`);
+        if (typeof renderSetAside === 'function') renderSetAside();
+        return true;
+    }
+    function renderSetAside() {
+        const el = document.getElementById('wm-set-aside');
+        if (!el) return;
+        const ids = Object.keys(setAsideCards);
+        if (!ids.length) { el.innerHTML = ''; return; }
+        const rows = ids
+            .sort((a, b) => (setAsideCards[b].ts || 0) - (setAsideCards[a].ts || 0))
+            .map(id => {
+                const c = setAsideCards[id];
+                const rc = RARITY[c.rarity] || { color: '#888' };
+                return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:10px;border-bottom:1px solid rgba(255,255,255,0.04);">
+                    <span style="color:${rc.color};font-weight:700;min-width:22px;">${esc(c.rarity || '?')}</span>
+                    <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;" title="${esc(c.title)}">${esc(c.title)}</span>
+                    <span style="color:#888;white-space:nowrap;" title="Invendue ${c.unsold} fois">🔁${c.unsold}</span>
+                    <button data-wm-restore="${esc(id)}" title="La remettre dans la file de vente, compteur d'invendus remis à zéro (elle repart au prix de départ)."
+                        style="font-size:9px;color:#4ade80;background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.35);border-radius:4px;padding:1px 6px;cursor:pointer;white-space:nowrap;">↩️ Remettre</button>
+                </div>`;
+            }).join('');
+        el.innerHTML = `
+            <details style="margin-bottom:8px;">
+                <summary style="cursor:pointer;font-size:9px;color:#fbbf24;text-transform:uppercase;letter-spacing:1px;">
+                    🗃️ Mises de côté (${ids.length}) — ne repartent plus en vente toutes seules
+                </summary>
+                <div style="margin-top:4px;">${rows}</div>
+            </details>`;
+        el.querySelectorAll('[data-wm-restore]').forEach(b => {
+            b.onclick = () => restoreSetAside(b.getAttribute('data-wm-restore'));
+        });
+    }
+
+    function restoreSetAside(cardId) {
+        if (!setAsideCards[cardId]) return;
+        const t = setAsideCards[cardId].title;
+        delete setAsideCards[cardId];
+        saveSetAside();
+        resetRetagCount(cardId); // repart de zéro : sinon elle serait remise de côté aussitôt
+        wmLog(`↩️ Remise en vente : <b>${esc(t)}</b> — compteur d'invendus remis à zéro.`);
+        if (typeof renderSetAside === 'function') renderSetAside();
     }
     function totalRetagCount() {
         return Object.values(retagCounts).reduce((s, e) => s + (e.count || 0), 0);
@@ -1096,6 +1173,10 @@
         sellOnlyIfSoleTag:     'wm_sell_only_if_sole_tag',
         sellAutoResume:        'wm_sell_auto_resume',
         sellDegressive:        'wm_sell_degressive',
+        sellFloorTries:        'wm_sell_floor_tries',
+        sellDecayStepPct:      'wm_sell_decay_step',
+        sellDecayMinPct:       'wm_sell_decay_min',
+        sellSetAsideAfter:     'wm_sell_set_aside_after',
         sellUndercutMarket:    'wm_sell_undercut_market',
         autoTagPacksFromPresets: 'wm_autotag_packs_presets',
         autoTagSkipLegendary:  'wm_autotag_skip_legendary',
@@ -1151,7 +1232,11 @@
         sellMarketFloor:       true,      // prix marché : jamais sous le prix du tableau (plancher)
         sellOnlyIfSoleTag:     true,      // filet de sécurité : ne vendre que si le tag de vente est le SEUL tag
         sellAutoResume:        false,     // NE relance PAS le Trash Seller tout seul après un rechargement de page
-        sellDegressive:        true,      // Trash Seller : -15% de prix par tranche de 10 remises en vente (invendus)
+        sellDegressive:        true,      // Trash Seller : baisse du prix à chaque invendu (cf. sellDecay*)
+        sellFloorTries:        2,         // le plancher ne s'applique qu'aux N premières mises en vente (0 = toujours)
+        sellDecayStepPct:      10,        // baisse par invendu, en % du prix de base
+        sellDecayMinPct:       50,        // jamais sous ce % du prix de base, quelle que soit la baisse
+        sellSetAsideAfter:     6,         // après N invendus, la carte sort de la file (0 = jamais)
         sellUndercutMarket:    true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
         autoTagPacksFromPresets: false,   // étiquette auto les cartes packées selon les recherches enregistrées
         autoTagSkipLegendary:  true,      // n'auto-étiquette PAS les Légendaires (on veut souvent les garder)
@@ -6211,29 +6296,48 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 ? entry.byRarity[rar]
                 : (entry && !entry.byRarity ? entry.avg : null);
             if (entry && entry.count > 0 && Number.isFinite(marketAvg) && marketAvg > 0) {
-                const pct = getSetting('sellMarketPricePct');
-                let price = Math.max(1, Math.round(marketAvg * (pct / 100)));
-                const marketPrice = price; // ce que la règle marché donne AVANT plancher
-                // Plancher : le prix marché ne descend jamais sous le prix du tableau par rareté.
-                let floored = false;
-                if (getSetting('sellMarketFloor') && price < manual) { price = manual; floored = true; }
-                result = { price, source: 'market', avg: marketAvg, marketPrice,
-                           count: entry.count, pct, floored, floor: manual };
+                // % PAR RARETÉ (réglable dans le panneau), à défaut le % global.
+                const pct = getSellPct(rar);
+                const marketPrice = Math.max(1, Math.round(marketAvg * (pct / 100)));
+                result = { price: marketPrice, source: 'market', avg: marketAvg, marketPrice,
+                           count: entry.count, pct, floored: false, floor: manual };
             } else {
                 result = { price: manual, source: 'table' };
             }
         }
-        // Prix dégressif : -15% par tranche de 10 remises en vente (invendus récurrents 🔁).
-        // Volontairement APRÈS le plancher (le but est justement de brader ce qui ne part pas).
-        // Plafonné à -75% et jamais sous 1 wkb.
-        if (getSetting('sellDegressive') && cardId) {
-            const retag = getRetagCount(cardId);
-            const steps = Math.floor(retag / 10);
-            if (steps > 0) {
-                const discountPct = Math.min(75, steps * 15);
-                const before = result.price;
-                result.price = Math.max(1, Math.round(before * (1 - discountPct / 100)));
-                result.degressive = { retag, discountPct, before };
+
+        /* ── Invendus : baisse, puis plancher limité dans le temps ──
+           Constat des logs du 28/09 : la plupart des R partaient au plancher (15 💰) pour une
+           cote de 1 à 10 💰, revenaient invendues, et repartaient au même prix — en boucle.
+           L'ancienne baisse (-15 % par tranche de 10 remises) n'arrivait jamais : les cartes
+           en étaient à 2 ou 3 remises.
+
+           · k = nombre d'invendus déjà subis par cette carte ;
+           · baisse de `sellDecayStepPct` % par invendu, jamais sous `sellDecayMinPct` % du
+             prix de base ;
+           · le plancher du tableau ne protège que les `sellFloorTries` premières mises en
+             vente (0 = toujours) : on tente d'abord d'en tirer plus, puis on laisse le
+             marché décider plutôt que de bloquer la carte indéfiniment. */
+        const k = cardId ? getRetagCount(cardId) : 0;
+        const base = result.price;
+        if (getSetting('sellDegressive') && k > 0) {
+            const step = Math.max(0, getSetting('sellDecayStepPct')) / 100;
+            const minF = Math.min(1, Math.max(0, getSetting('sellDecayMinPct')) / 100);
+            const factor = Math.max(minF, 1 - step * k);
+            if (factor < 1) {
+                result.price = Math.max(1, Math.round(base * factor));
+                result.degressive = { retag: k, discountPct: Math.round((1 - factor) * 100), before: base };
+            }
+        }
+        if (getSetting('sellMarketFloor') && result.price < manual) {
+            const tries = getSetting('sellFloorTries');
+            if (!(tries > 0) || k < tries) {
+                result.price = manual;
+                result.floored = true;
+                result.floor = manual;
+                result.floorTriesLeft = tries > 0 ? tries - k : null; // null = plancher permanent
+            } else {
+                result.floorLifted = { after: tries, floor: manual };
             }
         }
         return result;
@@ -6295,8 +6399,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return !!(el && el.closest && el.closest('[id^="wm-"], [class*="wm-"]'));
     }
     function findLeafByExactText(text) {
+        const want = normTitle(text);
         for (const el of document.querySelectorAll('*')) {
-            if (el.children.length === 0 && el.textContent.trim() === text && !isBotOwnNode(el)) return el;
+            if (el.children.length !== 0) continue;
+            // Filtre bon marché avant la normalisation : appelée ~30 fois par vente sur une
+            // page de plusieurs milliers de nœuds, elle doit rester légère.
+            const raw = el.textContent;
+            if (!raw || Math.abs(raw.length - want.length) > 12) continue;
+            if (normTitle(raw) === want && !isBotOwnNode(el)) return el;
         }
         return null;
     }
@@ -6335,8 +6445,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Exclut aussi le DOM du bot : le dashboard porte des libellés qui peuvent coïncider avec
     // ceux du site (durées « 1 h », « 30 min »…) — on ne veut cliquer QUE dans l'UI du site.
     function findButtonByText(text) {
+        const want = normTitle(text);
         return [...document.querySelectorAll('button')]
-            .find(b => b.textContent.trim() === text && !isBotOwnNode(b)) || null;
+            .find(b => normTitle(b.textContent) === want && !isBotOwnNode(b)) || null;
+    }
+
+    /* Terme tapé dans la barre de recherche du site. Un titre avec apostrophe ou tiret
+       peut y être stocké sous sa forme typographique : taper la forme ASCII ne trouvait
+       alors rien (card_not_found). On tape le plus long morceau SANS ponctuation — la
+       comparaison exacte qui suit départage les homonymes éventuels. */
+    function searchTermFor(title) {
+        const t = String(title || '').trim();
+        if (!/['\u2018\u2019\u02bc"\u201c\u201d\u00ab\u00bb\u2010-\u2014\u2212-]/.test(t)) return t;
+        const best = t.split(/['\u2018\u2019\u02bc"\u201c\u201d\u00ab\u00bb\u2010-\u2014\u2212-]/)
+            .map(x => x.trim()).sort((a, b) => b.length - a.length)[0] || '';
+        return best.length >= 4 ? best : t;
     }
 
     // Sondage périodique de l'API directe : le contournement DOM est lent et dépend d'une
@@ -6447,14 +6570,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         const searchInput = await waitForCollectionSearchInput(6000);
         if (!searchInput) return { ok: false, reason: 'no_search_input' };
-        setReactInputValue(searchInput, title);
+        setReactInputValue(searchInput, searchTermFor(title));
 
         // Le filtrage du site peut prendre plus d'une seconde (debounce + requête) : on sonde
         // plutôt qu'un délai fixe, jusqu'à trouver une tuile cliquable pour ce titre. Redemande
         // findLeafByExactText à chaque tour : un match "orphelin" trouvé trop tôt (avant que le
         // rendu ne se termine) disparaît une fois les vrais résultats affichés.
+        // 8 s au lieu de 5 : sous charge (refus 403 en série), la recherche du site met
+        // parfois plus longtemps à répondre — « Argentavis » échouait puis passait 1 min après.
         let tile = null;
-        for (let i = 0; i < 20 && !tile; i++) {
+        for (let i = 0; i < 32 && !tile; i++) {
             await new Promise(r => setTimeout(r, 250));
             const titleEl = findLeafByExactText(title);
             if (!titleEl) continue;
@@ -6466,15 +6591,26 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Double contrôle avant le clic : la tuile résolue doit bien porter le titre attendu
         // (un re-render React entre la recherche du titre et la remontée vers .cursor-pointer
         // peut nous laisser un ancêtre appartenant à une AUTRE carte).
-        if (!tile.textContent.includes(title)) {
+        if (!normTitle(tile.textContent).includes(normTitle(title))) {
             wmLog(`🛡️ Vente annulée : la tuile trouvée ne correspond pas à <b>${esc(title)}</b>`);
             return { ok: false, reason: 'tile_mismatch' };
         }
         tile.click();
-        await new Promise(r => setTimeout(r, 600));
 
-        const sellBtn = findButtonByText('Mettre aux enchères');
-        if (!sellBtn) return { ok: false, reason: 'no_sell_button' };
+        // La fiche de la carte s'ouvre avec un temps variable : on ATTEND le bouton (3 s)
+        // au lieu de le chercher une seule fois après 600 ms (`no_sell_button`).
+        let sellBtn = null;
+        for (let i = 0; i < 20 && !sellBtn; i++) {
+            await new Promise(r => setTimeout(r, 150));
+            sellBtn = findButtonByText('Mettre aux enchères');
+        }
+        if (!sellBtn) {
+            // Fiche ouverte sans bouton de vente (carte engagée ailleurs, etc.) : on la
+            // referme, sinon elle masquerait la grille pour la carte suivante.
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            await new Promise(r => setTimeout(r, 300));
+            return { ok: false, reason: 'no_sell_button' };
+        }
         sellBtn.click();
         await new Promise(r => setTimeout(r, 500));
 
@@ -6496,7 +6632,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // par la mise en vente d'une carte qu'on ne voulait PAS vendre — irrécupérable.
         const modal = findModalRoot(launchBtn);
         const shownTitle = modal && modalCardTitle(modal);
-        if (shownTitle ? shownTitle !== title : !(modal && modal.textContent.includes(title))) {
+        if (shownTitle
+            ? normTitle(shownTitle) !== normTitle(title)
+            : !(modal && normTitle(modal.textContent).includes(normTitle(title)))) {
             wmLog(`🛡️ Vente annulée : la fenêtre affiche <b>${esc(shownTitle || '?')}</b> au lieu de <b>${esc(title)}</b>`);
             if (modal) dismissModal(modal);
             await new Promise(r => setTimeout(r, 300));
@@ -6650,9 +6788,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         ? ` <span style="color:#fbbf24;font-size:9px;">(🛡️ plancher tableau ${priceInfo.floor} 💰 · moy. marché ${priceInfo.avg} 💰)</span>`
                         : ` <span style="color:#4ade80;font-size:9px;">(💹 ${priceInfo.pct}% de la moy. ${priceInfo.avg} 💰)</span>`)
                     : '';
-                const degrTag = priceInfo.degressive
-                    ? ` <span style="color:#f97316;font-size:9px;">(📉 -${priceInfo.degressive.discountPct}% invendus 🔁${priceInfo.degressive.retag} · avant ${priceInfo.degressive.before} 💰)</span>`
-                    : '';
+                const degrTag = (priceInfo.degressive
+                    ? ` <span style="color:#f97316;font-size:9px;">(📉 -${priceInfo.degressive.discountPct}% après ${priceInfo.degressive.retag} invendu(s) · avant ${priceInfo.degressive.before} 💰)</span>`
+                    : '')
+                    + (priceInfo.floorLifted
+                    ? ` <span style="color:#22d3ee;font-size:9px;">(🔓 plancher ${priceInfo.floorLifted.floor} 💰 levé après ${priceInfo.floorLifted.after} invendus)</span>`
+                    : '');
                 const underTag = priceInfo.undercut
                     ? ` <span style="color:#22d3ee;font-size:9px;">(🃏 undercut : marché ${priceInfo.undercut.market} 💰)</span>`
                     : '';
@@ -6920,7 +7061,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // les ex æquo, puis trié. Retourne les `slots` premières. Async : la stratégie
     // « value » récupère les prix marché manquants avant de trier.
     async function selectTrashBatch(trashCards, slots) {
-        const shuffled = [...trashCards];
+        // Point de passage commun (vente, aperçu, refresh) : une carte mise de côté n'est
+        // jamais sélectionnée, quel que soit le chemin.
+        const shuffled = trashCards.filter(c => {
+            const id = c.card_id || c.card?.id;
+            return !isSetAside(id, c.card?.wikipedia_title, c.card?.rarity || c.rarity);
+        });
         for (let i = shuffled.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
@@ -7023,15 +7169,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // D'où vient le prix : c'est l'information la plus utile de l'aperçu.
             const pctNote = r.info.pct !== undefined && r.info.pct !== 100
                 ? ` × ${r.info.pct} % → ${r.info.marketPrice} 💰` : '';
-            const src = r.info.source === 'market'
+            const triesNote = r.info.floorTriesLeft != null
+                ? ` Le plancher s'applique encore ${r.info.floorTriesLeft} fois, puis la carte partira au prix du marché.` : '';
+            const src = r.info.floorLifted
+                ? `<span style="color:#22d3ee;" title="Invendue ${r.info.floorLifted.after} fois au minimum de ${r.info.floorLifted.floor} 💰 : le plancher est levé, on laisse le marché décider.">🔓 plancher levé${r.info.source === 'market' ? ` · marché ${r.info.marketPrice}` : ''}</span>`
+                : r.info.source === 'market'
                 ? (r.info.floored
                     // On affiche les DEUX chiffres : la cote trouvée, et le minimum qui la
                     // remplace. Sans ça « plancher » se lit comme « aucune cote trouvée ».
-                    ? `<span style="color:#fbbf24;" title="Cote du marché en ${r.rarity} : ${r.info.avg} 💰 (sur ${r.info.count} vente(s))${pctNote}. C'est sous ton minimum de ${r.info.floor} 💰 pour cette rareté → on vend au minimum.">🛡️ marché ${r.info.marketPrice} → min ${r.info.floor}</span>`
+                    ? `<span style="color:#fbbf24;" title="Cote du marché en ${r.rarity} : ${r.info.avg} 💰 (sur ${r.info.count} vente(s))${pctNote}. C'est sous ton minimum de ${r.info.floor} 💰 pour cette rareté → on vend au minimum.${triesNote}">🛡️ marché ${r.info.marketPrice} → min ${r.info.floor}${r.info.floorTriesLeft != null ? ` (${r.info.floorTriesLeft}×)` : ''}</span>`
                     : `<span style="color:#4ade80;" title="Cote du marché en ${r.rarity} : ${r.info.avg} 💰, sur ${r.info.count} vente(s)${pctNote}. Au-dessus de ton minimum de ${r.info.floor} 💰 → on vend au prix du marché.">💹 marché ${r.info.avg}</span>`)
                 : `<span style="color:#888;" title="Aucune cote connue pour cette carte en ${r.rarity} — on applique le minimum du tableau par rareté.">📋 pas de cote → min</span>`;
             const degr = r.info.degressive
-                ? ` <span style="color:#f97316;" title="Invendue ${r.info.degressive.retag} fois : -${r.info.degressive.discountPct} % (avant ${r.info.degressive.before} 💰)">📉</span>`
+                ? ` <span style="color:#f97316;" title="Invendue ${r.info.degressive.retag} fois : -${r.info.degressive.discountPct} % (avant ${r.info.degressive.before} 💰)">📉-${r.info.degressive.discountPct}%</span>`
                 : '';
             return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;${now ? 'background:rgba(74,222,128,0.06);' : ''}">
                 <span style="color:${now ? '#4ade80' : '#555'};min-width:14px;text-align:right;font-family:'JetBrains Mono',monospace;"
@@ -7053,7 +7203,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     style="background:none;border:none;color:#666;cursor:pointer;font-size:12px;line-height:1;padding:0 2px;">×</button>
             </div>
             <div style="font-size:9px;color:#666;margin-bottom:3px;">
-                ${data.poolSize} carte(s) dans le pool · ${data.rows.length} affichée(s)${data.truncated ? ` (+${data.truncated} sans prix)` : ''} ·
+                ${data.poolSize} carte(s) dans le pool · ${data.rows.length} affichée(s)${data.truncated ? ` (+${data.truncated} sans prix)` : ''}${Object.keys(setAsideCards).length ? ` · 🗃️ ${Object.keys(setAsideCards).length} mise(s) de côté` : ''} ·
                 <b style="color:#4ade80;">${data.slots}</b> partiront tout de suite
                 (${data.active}/${data.maxActive} ventes en cours) ·
                 stratégie « ${esc(getSetting('trashSellStrategy'))} » · total <b style="color:#fbbf24;">${total.toLocaleString('fr-FR')} 💰</b>
@@ -9461,6 +9611,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 </div>
                 <div class="wm-pb">
                     <div id="wm-trash-status" style="font-size:10px;color:#888;min-height:14px;margin-bottom:6px;"></div>
+                    <div id="wm-sell-pct-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-bottom:6px;font-size:9px;color:#888;"
+                        title="Prix de départ = cote du marché × ce %, par rareté. Au-dessus de 100 : on vend plus cher que la cote ; en dessous : moins cher, pour vendre plus vite."></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px;">
                         <div class="wm-lbl" style="margin:0;">Ventes actives</div>
@@ -9474,6 +9626,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     </div>
                     <div id="wm-sale-preview" style="margin-bottom:8px;"></div>
                     <div id="wm-active-sales" style="margin-bottom:8px;"></div>
+                    <div id="wm-set-aside"></div>
                     <div class="wm-sep"></div>
                     <div class="wm-lbl">Ventes (aujourd'hui)</div>
                     <div id="wm-sell-history" style="margin-bottom:8px;"></div>
@@ -9722,18 +9875,26 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <input type="checkbox" id="wm-set-sell-market">
                         <span>Mettre en vente au prix moyen du marché (× %)</span>
                     </label>
-                    <div class="wm-set-sub" style="margin-top:4px;">% du prix moyen des ventes passées appliqué comme prix de base (ex. 90 = 90% de la moyenne). Si <b>aucune vente</b> n'est connue pour la carte, le prix manuel du tableau ci-dessous est utilisé.</div>
+                    <div class="wm-set-sub" style="margin-top:4px;">% de la cote appliqué comme prix de départ (ex. 90 = 90 % de la moyenne) — valeur <b>par défaut</b> : un % propre à chaque rareté se règle directement dans le panneau Trash Seller. Si <b>aucune vente</b> n'est connue pour la carte, le prix du tableau ci-dessous est utilisé.</div>
                     <input id="wm-set-sell-market-pct" type="number" min="1" max="500" step="5" class="wm-input">
                     <label class="wm-toggle" style="margin-top:6px;">
                         <input type="checkbox" id="wm-set-sell-market-floor">
                         <span>🛡️ Ne jamais vendre sous le prix du tableau (plancher)</span>
                     </label>
                     <div class="wm-set-sub" style="margin-top:2px;">Si le prix marché calculé est inférieur au prix du tableau pour cette rareté, on garde le prix du tableau. Évite de brader une carte sous-cotée.</div>
+                    <div class="wm-set-sub" style="margin-top:4px;">Le plancher ne protège que les <b>N premières</b> mises en vente d'une carte ; ensuite elle part au prix du marché (0 = plancher toujours).</div>
+                    <input id="wm-set-sell-floor-tries" type="number" min="0" max="50" step="1" class="wm-input">
                     <label class="wm-toggle" style="margin-top:6px;">
                         <input type="checkbox" id="wm-set-sell-degressive">
-                        <span>📉 Prix dégressif sur les invendus (-15% / 10 remises)</span>
+                        <span>📉 Baisser le prix à chaque invendu</span>
                     </label>
-                    <div class="wm-set-sub" style="margin-top:2px;">Une carte remise en vente sans être vendue (🔁) voit son prix baisser de <b>15%</b> à chaque tranche de <b>10 remises</b> (plafonné à -75%, jamais sous 1 💰). S'applique après le plancher — le but est d'écouler ce qui stagne.</div>
+                    <div class="wm-set-sub" style="margin-top:2px;">Baisse par invendu (% du prix de départ) — et jamais sous ce % du prix de départ :</div>
+                    <div style="display:flex;gap:6px;">
+                        <input id="wm-set-sell-decay-step" type="number" min="0" max="50" step="1" class="wm-input" title="Baisse par invendu, en %">
+                        <input id="wm-set-sell-decay-min" type="number" min="1" max="100" step="5" class="wm-input" title="Minimum, en % du prix de départ">
+                    </div>
+                    <div class="wm-set-sub" style="margin-top:6px;">Mettre une carte de côté après <b>N invendus</b> — elle sort de la file et attend ta décision dans le panneau (0 = jamais) :</div>
+                    <input id="wm-set-sell-set-aside" type="number" min="0" max="100" step="1" class="wm-input">
                     <label class="wm-toggle" style="margin-top:6px;">
                         <input type="checkbox" id="wm-set-sell-undercut">
                         <span>🃏 Undercut : se placer sous une annonce existante</span>
@@ -10550,17 +10711,68 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             };
         }
 
-        // Prix dégressif sur les invendus récurrents
+        // Baisse à chaque invendu
         const sellDegressiveChk = document.getElementById('wm-set-sell-degressive');
         if (sellDegressiveChk) {
             sellDegressiveChk.checked = getSetting('sellDegressive');
             sellDegressiveChk.onchange = () => {
                 setSetting('sellDegressive', sellDegressiveChk.checked);
                 wmLog(sellDegressiveChk.checked
-                    ? '📉 Prix dégressif activé : -15% par tranche de 10 remises en vente'
-                    : '📉 Prix dégressif désactivé');
+                    ? `📉 Baisse activée : -${getSetting('sellDecayStepPct')} % par invendu, jamais sous ${getSetting('sellDecayMinPct')} % du prix de départ`
+                    : '📉 Baisse sur invendus désactivée');
             };
         }
+        // Réglages numériques du Trash Seller : même motif pour les quatre.
+        [['wm-set-sell-floor-tries', 'sellFloorTries', 0, 50,
+          v => v === 0 ? '🛡️ Plancher : appliqué à TOUTES les mises en vente' : `🛡️ Plancher : appliqué aux ${v} première(s) mise(s) en vente, puis prix du marché`],
+         ['wm-set-sell-decay-step', 'sellDecayStepPct', 0, 50, v => `📉 Baisse : -${v} % par invendu`],
+         ['wm-set-sell-decay-min', 'sellDecayMinPct', 1, 100, v => `📉 Jamais sous ${v} % du prix de départ`],
+         ['wm-set-sell-set-aside', 'sellSetAsideAfter', 0, 100,
+          v => v === 0 ? '🗃️ Mise de côté désactivée' : `🗃️ Mise de côté après ${v} invendus`],
+        ].forEach(([id, key, min, max, msg]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.value = getSetting(key);
+            el.onchange = () => {
+                let v = parseInt(el.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS[key];
+                v = Math.min(max, Math.max(min, v));
+                el.value = v;
+                setSetting(key, v);
+                wmLog(msg(v));
+            };
+        });
+
+        // % de la cote PAR RARETÉ, directement dans le panneau Trash Seller.
+        function renderSellPctRow() {
+            const row = document.getElementById('wm-sell-pct-row');
+            if (!row) return;
+            const order = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+            row.innerHTML = '<span style="text-transform:uppercase;letter-spacing:1px;">% cote</span>' + order.map(rar => {
+                const c = RARITY[rar] || { color: '#888' };
+                const v = getSellPct(rar);
+                return `<label style="display:inline-flex;align-items:center;gap:2px;">
+                    <span style="color:${c.color};font-weight:700;">${rar}</span>
+                    <input data-wm-sell-pct="${rar}" type="number" min="1" max="500" step="5" value="${v}"
+                        style="width:42px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,255,255,0.15);background:#0f0f13;color:${v === 100 ? '#aaa' : (v > 100 ? '#4ade80' : '#fbbf24')};font-size:9px;text-align:center;">
+                </label>`;
+            }).join('');
+            row.querySelectorAll('[data-wm-sell-pct]').forEach(inp => {
+                inp.onchange = () => {
+                    const rar = inp.getAttribute('data-wm-sell-pct');
+                    let v = parseInt(inp.value, 10);
+                    if (!Number.isFinite(v) || v < 1) v = 100;
+                    if (v > 500) v = 500;
+                    const cfg = getSellConfig();
+                    cfg[rar].pct = v;
+                    setSellConfig(cfg);
+                    wmLog(`💹 ${rar} : mise en vente à <b>${v} %</b> de la cote${v > 100 ? ' (au-dessus du marché)' : v < 100 ? ' (sous le marché, pour vendre plus vite)' : ''}`);
+                    renderSellPctRow();
+                };
+            });
+        }
+        renderSellPctRow();
+        renderSetAside();
 
         // Undercut du marché à la mise en vente
         const sellUndercutChk = document.getElementById('wm-set-sell-undercut');
@@ -13733,6 +13945,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function normTitle(t) {
         let s = String(t == null ? '' : t);
         try { s = s.normalize('NFC'); } catch (e) {}
+        // Le site affiche volontiers la ponctuation typographique (’ – «…») là où l'API
+        // renvoie la forme ASCII : « Équipe de voltige de l’Armée de l’air » contre
+        // « … de l'Armée de l'air ». Sans ce repli, la comparaison exacte échouait.
+        s = s.replace(/[\u2018\u2019\u02bc\u0060\u00b4]/g, "'")
+             .replace(/[\u2010\u2011\u2012\u2013\u2014\u2212]/g, '-')
+             .replace(/[\u201c\u201d\u00ab\u00bb]/g, '"');
         return s.replace(/[\s\u00a0\u202f]+/g, ' ').trim().toLowerCase();
     }
 
