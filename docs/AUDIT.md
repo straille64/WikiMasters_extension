@@ -819,6 +819,54 @@ refusée parce qu'un autre joueur venait de miser affichait « ✗ Échec », po
 (le symptôme exact) ; sans le repli de titre, le log dit « ? » ; sans `placeBid`, la mise
 manuelle s'arrête au premier refus.
 
+### 41. Collection : cartes sans cote ni bouton, et « ? » qui ne partaient jamais
+Capture du 28/09 : sur la page Collection, une carte sur trois environ n'avait **ni cote
+ni bouton 🗑️** — Pierre Berger, Rydge Conseil, Pouvoirs, Maquis des Vosges, John Fowles,
+The Tunnel, DoTerra, Véra Belmont. Point commun : **toutes affichent le logo « WM »**, faute
+d'illustration Wikipédia. Et ailleurs, des cotes bloquées sur « ? » alors que le site, lui,
+connaissait le prix. Quatre causes.
+
+**1. La détection partait de l'image.** Une tuile était « le plus petit ancêtre d'une
+`<img>` dont l'`alt` égale le titre du `<h3>` ». Les cartes sans illustration n'ont pas
+cette image : elles n'étaient jamais reconnues.
+
+**2. Une cote manquée n'était plus jamais redemandée.** L'`IntersectionObserver` se
+désabonnait d'une tuile dès sa première apparition. Si la demande échouait (refus du site)
+ou était écartée pendant une pause globale de l'endpoint, **rien ne la relançait** tant que
+la carte restait affichée : « ? » ou « ⋯ » jusqu'au rechargement de la page.
+
+**3. Une carte jamais vendue n'était pas mémorisée.** `{"summary":{}}` faisait sortir
+`storeSalesEntry()` sans rien écrire : « ⋯ » à vie, et la carte redemandée à chaque passage.
+
+**4. Un titre non indexé laissait la tuile nue.** La liaison tuile → carte passe par le
+titre ; une espace insécable dans le `<h3>`, ou une page de collection chargée sans passer
+par l'intercepteur, et la tuile n'était jamais décorée.
+
+**✅ Corrigé (1.3.13-fork.25)**
+
+- Détection ancrée sur le **`<h3>`**, toujours présent : la tuile est son plus petit
+  ancêtre portant le badge de rareté et ne contenant qu'un seul titre. Une tuile déjà
+  décorée est écartée d'un simple `closest`, **avant** tout calcul de style.
+- Visibilité suivie **en continu** ; `healCollectionQuotes()` remet en file, à chaque tic
+  de 5 s, les cartes visibles encore sans cote dès que c'est permis (blocage par carte
+  expiré, pause globale terminée). Aucune requête sinon.
+- Résumé vide mémorisé comme « aucune vente » (« — »), avec une durée de vie d'1 h au lieu
+  de 12 h : une première vente peut arriver à tout moment.
+- `normTitle()` (NFC, espaces insécables, espaces multiples) des deux côtés de l'index ; et
+  pour les titres toujours inconnus, **une** requête groupée à la table `cards`, au plus
+  toutes les 30 s, sans redemander un titre avant 10 min. Deux cartes au même titre : on
+  ne devine pas, la tuile reste sans décoration.
+- Nouvel état « ⏸ » quand le site a mis les demandes de cote en pause, avec le délai de
+  reprise — au lieu d'un « ⋯ » qui laisse croire que ça charge.
+- Les badges ne sont réécrits que s'ils changent.
+
+**Mesuré** sur une grille de 600 cartes dont 200 sans illustration, 30 re-rendus du site :
+avant **400/600** cartes décorées et **146 ms** de JavaScript ; après **600/600** et **37 ms**.
+
+`tests/collection-overlay-robust.test.mjs` couvre les quatre causes ; chacune a sa mutation
+de contrôle, qui échoue sur sa propre assertion. `tests/collection-overlay.test.mjs`
+(structure réelle du site, modale ignorée, seules les cartes visibles interrogées) reste vert.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

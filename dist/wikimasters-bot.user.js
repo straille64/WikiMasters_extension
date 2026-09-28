@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.24
+// @version      1.3.13-fork.25
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.24';
+    const WM_VERSION = '1.3.13-fork.25';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -725,6 +725,8 @@
     // L'historique bouge sur des jours/semaines, donc un TTL long évite de refetcher inutilement.
     const SALES_CACHE_KEY = 'wm_sales_cache';
     const SALES_CACHE_TTL = 12 * 3600 * 1000; // 12h
+    // « Aucune vente » se périme plus vite : une première vente peut arriver à tout moment.
+    const SALES_EMPTY_TTL = 60 * 60 * 1000; // 1h
     let salesCache = {};
     try { salesCache = JSON.parse(localStorage.getItem(SALES_CACHE_KEY) || '{}') || {}; } catch(e) { salesCache = {}; }
     function saveSalesCache() {
@@ -753,7 +755,8 @@
         // « en chargement », jamais un faux « aucune vente »), mais bien vue par
         // queueSalesFetch, qui n'insiste pas.
         if (entry.failed) return null;
-        if (Date.now() - entry.fetchedAt > SALES_CACHE_TTL) return null; // périmé
+        const ttl = entry.count === 0 ? SALES_EMPTY_TTL : SALES_CACHE_TTL;
+        if (Date.now() - entry.fetchedAt > ttl) return null; // périmé
         // Invalide les entrées de l'ancien format (avant l'ajout de avg/min/max/last)
         if (entry.count > 0 && entry.avg === undefined) return null;
         // Normalise les médianes à demi-entier des anciennes entrées (cache d'avant l'arrondi)
@@ -824,7 +827,16 @@
                 if (Number.isFinite(num)) byRarity[String(rar).toUpperCase()] = Math.round(num);
             }
             const values = Object.values(byRarity);
-            if (!values.length) return null;
+            /* Résumé VIDE ({"summary":{}}) = la carte ne s'est jamais vendue. Ne rien
+               mémoriser laissait le badge sur « ⋯ » indéfiniment, et la carte était
+               redemandée à chaque passage. C'est une vraie réponse : on la garde. */
+            if (!values.length) {
+                const empty = { median: 0, avg: null, count: 0, last: null, min: null, max: null,
+                                byRarity: {}, summary: true, fetchedAt: Date.now() };
+                salesCache[cardId] = empty;
+                saveSalesCache();
+                return empty;
+            }
             const fallback = rarityHint && byRarity[String(rarityHint).toUpperCase()] != null
                 ? byRarity[String(rarityHint).toUpperCase()]
                 : values[0];
@@ -13734,7 +13746,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
           VISIBLES à l'écran mettent leur carte en file (IntersectionObserver), et la
           file reste celle, étalée et auto-limitée, du reste du bot. */
 
-    const collectionTitleIndex = new Map(); // titre en minuscules → card_id
+    const collectionTitleIndex = new Map(); // titre normalisé → card_id
+
+    /* Le titre du <h3> et celui de l'API ne sont pas toujours octet pour octet
+       identiques : espaces insécables, espaces multiples, formes Unicode composées ou
+       décomposées (« é » en un ou deux caractères). Une seule clé pour les deux côtés. */
+    function normTitle(t) {
+        let s = String(t == null ? '' : t);
+        try { s = s.normalize('NFC'); } catch (e) {}
+        return s.replace(/[\s\u00a0\u202f]+/g, ' ').trim().toLowerCase();
+    }
 
     // Alimente l'index depuis n'importe quelle réponse ressemblant à une collection.
     // Tolérant sur la forme : le site encapsule tantôt la carte dans `card`, tantôt pas.
@@ -13747,7 +13768,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const title = card && (card.wikipedia_title || card.title);
             const id = (item && item.card_id) || (card && card.id);
             if (!title || !id) continue;
-            const key = String(title).trim().toLowerCase();
+            const key = normTitle(title);
             if (!collectionTitleIndex.has(key)) { collectionTitleIndex.set(key, id); added++; }
         }
         return added;
@@ -13852,38 +13873,49 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return /\/collection(\/|$|\?)/.test(location.pathname + location.search);
     }
 
-    /* Repère les tuiles de cartes sans dépendre d'un nom de classe : le site est en
-       Tailwind, ses classes changent à chaque retouche de style. On s'appuie sur un
-       invariant de contenu — l'image de la carte porte un `alt` identique au titre
-       affiché dans le <h3>. La tuile est le plus petit ancêtre qui contient les deux. */
+    /* Les fenêtres modales du site (« Mettre aux enchères »…) contiennent une mini-carte
+       de même structure. Les décorer y ajoute un doublon inutile — le site y affiche déjà
+       sa MOYENNE — et un bouton par-dessus ses propres commandes. On reconnaît une modale
+       à son fond qui COUVRE LE VIEWPORT. Tester seulement `position: fixed` était bien
+       trop large : n'importe quel conteneur de mise en page fixe (barre, coquille
+       d'application) suffisait alors à écarter toutes les cartes de la grille. */
+    function inViewportModal(el) {
+        for (let a = el; a && a !== document.body; a = a.parentElement) {
+            if (getComputedStyle(a).position !== 'fixed') continue;
+            const r = a.getBoundingClientRect();
+            if (r.width >= innerWidth * 0.9 && r.height >= innerHeight * 0.9) return true;
+        }
+        return false;
+    }
+
+    /* Repère les tuiles de cartes sans dépendre d'un nom de classe (le site est en
+       Tailwind, ses classes changent à chaque retouche de style).
+
+       On partait de l'IMAGE : la tuile était le plus petit ancêtre contenant une image
+       dont l'`alt` égale le titre du <h3>. Les cartes SANS illustration Wikipédia (le logo
+       « WM » à la place) n'ont pas cette image — elles n'étaient donc jamais reconnues :
+       ni cote, ni bouton de défausse. On part désormais du TITRE, toujours présent : la
+       tuile est le plus petit ancêtre du <h3> qui porte le badge de rareté, à condition
+       qu'il ne contienne qu'UN titre (sinon on est remonté jusqu'à la grille).
+
+       Coût : une tuile déjà décorée est écartée d'un simple `closest`, avant tout calcul
+       de style. C'est ce qui rend les passages suivants quasi gratuits. */
     function findCollectionTiles() {
         const tiles = [];
-        for (const img of document.querySelectorAll('img[alt]')) {
-            const alt = (img.getAttribute('alt') || '').trim();
-            if (!alt) continue;
-            // Les fenêtres modales du site (« Mettre aux enchères »…) contiennent une
-            // mini-carte de même structure. Les décorer y ajoute un doublon inutile —
-            /* le site y affiche déjà sa MOYENNE — et un bouton par-dessus ses propres
-               commandes. On reconnaît une modale à son fond qui COUVRE LE VIEWPORT.
-               Tester seulement `position: fixed` était bien trop large : n'importe quel
-               conteneur de mise en page fixe (barre, coquille d'application) suffisait
-               alors à écarter toutes les cartes de la grille — l'inverse du but. */
-            let inModal = false;
-            for (let a = img.parentElement; a && a !== document.body; a = a.parentElement) {
-                if (getComputedStyle(a).position !== 'fixed') continue;
-                const r = a.getBoundingClientRect();
-                if (r.width >= innerWidth * 0.9 && r.height >= innerHeight * 0.9) { inModal = true; break; }
+        const seen = new Set();
+        for (const h3 of document.querySelectorAll('h3')) {
+            if (h3.closest('[data-wm-decorated="1"]') || isBotOwnNode(h3)) continue;
+            const title = (h3.textContent || '').trim();
+            if (!title || title.length > 300) continue;
+            let tile = null;
+            for (let el = h3.parentElement, depth = 0; el && depth < 8; el = el.parentElement, depth++) {
+                if (el.querySelectorAll('h3').length > 1) break;   // remonté trop haut
+                if (tileRarity(el)) { tile = el; break; }
             }
-            if (inModal) continue;
-
-            let el = img.parentElement;
-            for (let depth = 0; el && depth < 6; el = el.parentElement, depth++) {
-                const h3 = el.querySelector('h3');
-                if (h3 && (h3.textContent || '').trim() === alt) {
-                    tiles.push({ tile: el, title: alt, rarity: tileRarity(el) });
-                    break;
-                }
-            }
+            if (!tile || seen.has(tile)) continue;
+            seen.add(tile);
+            if (inViewportModal(tile)) continue;
+            tiles.push({ tile, title, rarity: tileRarity(tile) });
         }
         return tiles;
     }
@@ -13905,9 +13937,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (!cardId) return { text: '—', title: 'Carte non reconnue dans ta collection (index en cours de chargement).' };
         const entry = getCachedSales(cardId);
         if (!entry) {
-            return salesFetchBlocked(cardId)
-                ? { text: '?', title: "Le site a refusé l'historique des ventes de cette carte. Nouvelle tentative dans quelques minutes." }
-                : { text: '⋯', title: 'Cote en cours de chargement…' };
+            if (salesFetchBlocked(cardId)) {
+                return { text: '?', title: "Le site a refusé l'historique des ventes de cette carte. Nouvelle tentative automatique dans quelques minutes." };
+            }
+            const pauseMs = salesEndpointCooldownUntil - Date.now();
+            if (pauseMs > 0) {
+                return { text: '⏸', title: `Le site limite les demandes de cote — reprise automatique dans ${Math.ceil(pauseMs / 60000)} min.` };
+            }
+            return { text: '⋯', title: 'Cote en cours de chargement…' };
         }
         if (!entry.count) return { text: '—', title: 'Aucune vente passée pour cette carte : pas de cote.' };
         // Une même carte n'a pas la même cote selon sa rareté : on prend celle de
@@ -13933,15 +13970,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Une seule observation de visibilité pour toute la page : c'est elle qui décide
     // quelles cotes sont réellement demandées.
     let collectionVisibilityObserver = null;
+    /* Sondes des tuiles actuellement à l'écran. L'observateur se désabonnait après la
+       première apparition (« une fois suffit ») : une cote refusée une fois, ou écartée
+       pendant une pause du site, n'était plus JAMAIS redemandée tant que la carte restait
+       affichée — d'où les « ? » et « ⋯ » qui ne partaient pas, alors que le site, lui,
+       connaissait bien le prix. On suit donc la visibilité en continu, et
+       healCollectionQuotes() re-demande ce qui manque dès que c'est permis. */
+    const collectionVisibleProbes = new Set();
     function ensureVisibilityObserver() {
         if (collectionVisibilityObserver || typeof IntersectionObserver !== 'function') return;
         collectionVisibilityObserver = new IntersectionObserver((entries) => {
             let queued = 0;
             for (const e of entries) {
-                if (!e.isIntersecting) continue;
+                if (!e.isIntersecting) { collectionVisibleProbes.delete(e.target); continue; }
+                collectionVisibleProbes.add(e.target);
                 const id = e.target.dataset.wmCardId;
                 if (id && !getCachedSales(id)) { queueSalesFetch(id); queued++; }
-                collectionVisibilityObserver.unobserve(e.target); // une fois suffit
             }
             if (queued && !salesFetchRunning) {
                 processSalesQueue(() => refreshCollectionBadges());
@@ -13949,11 +13993,29 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }, { rootMargin: '200px' });
     }
 
+    // Re-met en file les cartes VISIBLES encore sans cote, dès que le site le permet
+    // (blocage par carte expiré, pause globale terminée). Aucune requête sinon.
+    function healCollectionQuotes() {
+        if (Date.now() < salesEndpointCooldownUntil) return;
+        let queued = 0;
+        for (const el of collectionVisibleProbes) {
+            if (!el.isConnected) { collectionVisibleProbes.delete(el); continue; }
+            const id = el.dataset.wmCardId;
+            if (!id || getCachedSales(id) || salesFetchBlocked(id) || salesFetchQueued.has(id)) continue;
+            queueSalesFetch(id);
+            queued++;
+        }
+        if (queued && !salesFetchRunning) processSalesQueue(() => refreshCollectionBadges());
+    }
+
     function refreshCollectionBadges() {
         for (const el of document.querySelectorAll('.' + COLLECTION_BADGE_CLASS)) {
             const { text, title } = collectionPriceText(el.dataset.wmCardId, el.dataset.wmRarity);
-            el.textContent = '💰 ' + text;
-            el.title = title;
+            // N'écrit que ce qui change : réécrire des dizaines de badges identiques toutes
+            // les 5 s forçait le navigateur à recalculer la page pour rien.
+            const next = '💰 ' + text;
+            if (el.textContent !== next) el.textContent = next;
+            if (el.title !== title) el.title = title;
         }
     }
 
@@ -14014,15 +14076,62 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     let collectionDecorateScheduled = false;
     let collectionMatchLogged = false;
 
+    /* Titres affichés mais absents de l'index (la réponse /api/my-collection qui les
+       contenait n'est pas passée par l'intercepteur, ou le site les a chargés autrement).
+       Un seul aller-retour groupé à la table `cards`, au plus toutes les 30 s, et un titre
+       déjà cherché n'est pas redemandé avant 10 min. Si plusieurs cartes portent le même
+       titre, on ne devine pas : la tuile reste sans décoration plutôt que d'agir sur la
+       mauvaise carte. */
+    const titleLookupAskedAt = new Map();
+    let titleLookupLastTs = 0;
+    let titleLookupRunning = false;
+    async function resolveUnknownCollectionTitles(titles) {
+        if (titleLookupRunning || Date.now() - titleLookupLastTs < 30000) return;
+        const now = Date.now();
+        const todo = [...new Set(titles.map(t => String(t).trim()))]
+            .filter(t => t && now - (titleLookupAskedAt.get(normTitle(t)) || 0) > 600000)
+            .slice(0, 40);
+        if (!todo.length) return;
+        titleLookupRunning = true;
+        titleLookupLastTs = now;
+        todo.forEach(t => titleLookupAskedAt.set(normTitle(t), now));
+        try {
+            const list = todo.map(t => '"' + t.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"').join(',');
+            const res = await fetch(
+                `${SUPABASE_URL}/cards?select=id,wikipedia_title&wikipedia_title=in.(${encodeURIComponent(list)})&limit=200`,
+                { credentials: 'omit', headers: supabaseAuthHeaders() });
+            if (!res.ok) return;
+            const rows = await res.json();
+            const byKey = new Map();
+            for (const r of (Array.isArray(rows) ? rows : [])) {
+                if (!r || !r.id || !r.wikipedia_title) continue;
+                const k = normTitle(r.wikipedia_title);
+                byKey.set(k, byKey.has(k) ? null : r.id);   // null = homonymes → on s'abstient
+            }
+            let added = 0;
+            for (const [k, id] of byKey) {
+                if (id && !collectionTitleIndex.has(k)) { collectionTitleIndex.set(k, id); added++; }
+            }
+            if (added) scheduleCollectionDecorate();
+        } catch (e) {
+        } finally {
+            titleLookupRunning = false;
+        }
+    }
+
     function decorateCollectionTiles() {
         if (!isCollectionPage()) return;
         ensureVisibilityObserver();
         const tiles = findCollectionTiles();
         let decorated = 0, unknown = 0;
+        const unknownTitles = [];
         for (const { tile, title, rarity } of tiles) {
             if (tile.dataset.wmDecorated === '1') continue;
-            const cardId = collectionTitleIndex.get(title.trim().toLowerCase()) || '';
-            if (!cardId) { unknown++; continue; } // index pas encore prêt → on retentera
+            // Garde-fou : une tuile qui porte déjà nos éléments (détection passée par un
+            // autre ancêtre) ne doit pas en recevoir une seconde série.
+            if (tile.querySelector('.' + COLLECTION_BADGE_CLASS)) { tile.dataset.wmDecorated = '1'; continue; }
+            const cardId = collectionTitleIndex.get(normTitle(title)) || '';
+            if (!cardId) { unknown++; unknownTitles.push(title); continue; } // on retentera
             tile.dataset.wmDecorated = '1';
             decorated++;
 
@@ -14076,6 +14185,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }).catch(() => {});
         }
 
+        if (unknownTitles.length) resolveUnknownCollectionTitles(unknownTitles);
+
         if (decorated && !collectionMatchLogged) {
             collectionMatchLogged = true;
             wmLog(`🖼️ Collection : cotes du marché affichées sur les cartes${unknown ? ` (${unknown} carte(s) pas encore reconnue(s), l'index se remplit)` : ''}.`);
@@ -14113,7 +14224,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         scheduleCollectionDecorate();
         // Les cotes arrivent de façon asynchrone : on rafraîchit les badges régulièrement,
         // sans rien redemander au réseau.
-        setInterval(() => { if (isCollectionPage()) refreshCollectionBadges(); }, 5000);
+        setInterval(() => {
+            if (!isCollectionPage()) return;
+            healCollectionQuotes();
+            refreshCollectionBadges();
+        }, 5000);
     }
     installCollectionOverlay();
 

@@ -63,6 +63,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/bid-mode-ui.test.mjs` : le bouton Manuel/Auto-bid/Fourbe doit se mettre à jour
   même quand le re-render de la liste est suspendu, nommer la bonne carte, et la mise
   manuelle doit rattraper une surenchère simultanée comme les mises automatiques.
+- `tests/collection-overlay-robust.test.mjs` : carte sans illustration décorée, cote
+  refusée redemandée d'elle-même, carte jamais vendue affichée « — » sans boucle, et
+  titres non indexés (espace insécable, page non interceptée) résolus.
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -155,6 +158,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       serveur honorés tels quels — fini le balayage de 277 pages en boucle (audit #39)
 - [x] Boutons de mode : état visible immédiatement, carte correctement nommée, et mise
       manuelle passée par le même chemin que les mises auto (audit #40)
+- [x] Collection : toutes les cartes décorées (y compris sans illustration), cotes qui se
+      réparent seules, 4× moins de travail par passage (audit #41)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 
