@@ -166,6 +166,8 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       réparent seules, 4× moins de travail par passage (audit #41)
 - [x] Trash Seller : % de la cote par rareté, plancher puis marché, -10 %/invendu,
       mise de côté des invendables, et fiabilité de la mise en vente (audit #42)
+- [x] Market Watcher : recherche refusée retentée au lieu du balayage complet, scan en cours
+      annulé au changement de mot-clé ou au STOP (audit #43)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

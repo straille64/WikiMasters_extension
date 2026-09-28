@@ -909,6 +909,30 @@ l'apostrophe typographique et une fiche lente. Mutations de contrôle : % global
 une seule fois — toutes échouent. La version précédente échoue sur l'apostrophe avec le
 `card_not_found` exact des logs.
 
+### 43. Un refus de recherche déclenchait un balayage de 7 minutes, qui masquait la suivante
+Logs du 28/09 : à 19:59 la recherche « eiffage » est refusée (403) ; le bot bascule sur le
+**balayage complet** du marché (8016 annonces). À 20:00 l'utilisateur remplace le mot-clé par
+« Marcel Dassault » et relance le Market Watcher : le premier scan est **abandonné en silence**
+(`if (marketScanInProgress) return;`, sans reprogrammation). À 20:07 c'est le vieux balayage qui
+s'affiche — après même un STOP — et il rate les 2 « Marcel Dassault » UR que la recherche du site
+trouve en une requête.
+
+**✅ Corrigé (1.3.13-fork.27)**
+
+- Une recherche **refusée** n'entraîne plus de balayage complet : l'affichage est conservé et la
+  recherche est retentée 20 s plus tard. Le balayage complet reste réservé au cas où le site
+  ignore réellement `q=`.
+- **Génération de scan** (`marketScanGen`) : démarrage, arrêt et toute modification de la liste
+  de mots-clés rendent le scan en cours périmé ; il s'arrête à la page suivante et n'affiche rien.
+- Une seule boucle de scan vit à la fois (`marketLoopGen`) ; si un scan périmé finit sa page, la
+  nouvelle boucle repasse 500 ms plus tard au lieu de mourir.
+- Ajouter, retirer ou modifier un mot-clé relance la recherche **immédiatement**.
+- Les deux compteurs sont déclarés en tête du script : `saveWatchlist()` peut être appelé dès le
+  chargement (migration des anciennes listes), avant l'endroit où ils étaient d'abord définis.
+
+Couvert par la suite existante du Market Watcher (recherche serveur, sonde, filtres, pagination,
+modes, mises). Pas encore de test dédié au changement de mot-clé en cours de scan.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

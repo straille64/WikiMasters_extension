@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.26
+// @version      1.3.13-fork.27
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.26';
+    const WM_VERSION = '1.3.13-fork.27';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -679,6 +679,8 @@
     // Cache prix marketplace par card_id
     let marketPriceCache = {}; // { card_id: avgPrice }
     let marketWatcherActive = false;
+    let marketScanGen = 0;   // génération de scan (cf. requestMarketRescan)
+    let marketLoopGen = 0;   // génération de la boucle de scan (une seule vivante)
     let lastMarketHits = new Set();
     let marketCountdownInterval = null;
 
@@ -1596,6 +1598,9 @@
         try { localStorage.setItem(WATCHLIST_KEY, JSON.stringify(WATCHLIST)); }
         catch(e) { wmLog(`⚠️ Sauvegarde des mots-clés ÉCHOUÉE : <b>${esc(e.name || 'Erreur')}</b> — ${esc(e.message || 'inconnue')}`); }
         compileWatchlist();
+        // Nouvelle liste → le scan en cours (sur l'ancienne liste) est périmé, et on
+        // cherche les nouveaux mots-clés tout de suite au lieu d'attendre le prochain tour.
+        if (typeof requestMarketRescan === 'function') requestMarketRescan();
     }
 
     /* Compile la liste vers les tableaux que le moteur consomme déjà.
@@ -1908,7 +1913,7 @@
         e.extended = !e.extended;
         saveWatchlist();
         renderKeywordsPanel();
-        wmLog(`🔎 <b>${esc(e.kw)}</b> : recherche <b>${e.extended ? 'étendue (titre + catégorie + description)' : 'stricte (titre + catégorie)'}</b>. Effet au prochain scan.`);
+        wmLog(`🔎 <b>${esc(e.kw)}</b> : recherche <b>${e.extended ? 'étendue (titre + catégorie + description)' : 'stricte (titre + catégorie)'}</b>.`);
     };
 
     window.wmWatchToggleEnabled = function (i) {
@@ -3124,9 +3129,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        correspondent à aucun mot-clé, sinon le pruning les déclarerait terminées).
        Retourne null si la recherche serveur s'avère inopérante — l'appelant repasse
        alors au balayage complet. */
-    async function fetchWatchedAuctions(onProgress) {
+    async function fetchWatchedAuctions(scanGen, onProgress) {
         const kws = [...new Set(WATCHLIST.filter(e => e.enabled !== false).map(e => e.kw))];
         if (!kws.length) return null;
+        const stale = () => scanGen !== undefined && isScanStale(scanGen);
 
         // Une seule sonde, AVANT de télécharger quoi que ce soit : verdict clair, et on
         // ne paie pas 20 pages par mot-clé pour s'apercevoir ensuite que `q` est ignoré.
@@ -3157,10 +3163,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 auctions.push(a);
             }
         };
-        const ctl = { abort: false, check() { return false; } };
+        const ctl = { get abort() { return stale(); }, check() { return stale(); } };
 
         let pages = 0;
         for (const kw of kws) {
+            if (stale()) return { aborted: true };
             const got = await fetchKeywordAuctions(kw, absorb, onProgress, ctl);
             if (got === 0) refusedKeywords++;   // page 1 refusée : ce mot-clé n'a rien donné
             pages += got;
@@ -3169,9 +3176,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // TOUS les mots-clés refusés : rendre « 0 annonce » ferait passer un refus serveur
         // pour un marché vide, et le pruning déclarerait terminées des enchères vivantes.
+        if (stale()) return { aborted: true };
         if (refusedKeywords === kws.length) {
-            wmLog(`⚠️ Recherche serveur refusée pour ${refusedKeywords} mot(s)-clé(s) — scan ignoré, nouvelle tentative au prochain passage.`);
-            return null;
+            wmLog(`⚠️ Recherche refusée par le site pour ${refusedKeywords} mot(s)-clé(s) — affichage conservé, nouvel essai dans 20 s (pas de balayage complet).`);
+            return { refused: true };
         }
 
         /* Les enchères où je mise déjà : récupérées une par une. Sans ça, une enchère
@@ -3191,7 +3199,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     }
 
     // Fetch TOUTES les pages et retourne tous les auctions
-    async function fetchAllMarketAuctions(onProgress) {
+    async function fetchAllMarketAuctions(scanGen, onProgress) {
+        if (typeof scanGen === 'function') { onProgress = scanGen; scanGen = undefined; }
+        const stale = () => scanGen !== undefined && isScanStale(scanGen);
         // Déduplication à l'absorption : les enchères sont triées par fin proche et le
         // temps s'écoule pendant la pagination, donc une même annonce peut apparaître
         // sur 2 pages consécutives. `absorb` retourne le nombre d'entrées RÉELLEMENT
@@ -3250,6 +3260,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const failedPages = [];
         let pagesFetched = 1;
         for (let start = startPage; more && start <= MARKET_MAX_PAGES; start += MARKET_PAGE_CONCURRENCY) {
+            if (stale()) return { aborted: true, auctions: [], total: 0, totalPages: 0 };
             const batch = [];
             for (let p = start; p < start + MARKET_PAGE_CONCURRENCY && p <= MARKET_MAX_PAGES; p++) {
                 if (expectedPages && p > expectedPages) break;
@@ -4198,7 +4209,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return false;
     }
 
-    async function checkMarketplace(marketAlertEl, marketStatusEl) {
+    async function checkMarketplace(marketAlertEl, marketStatusEl, scanGen) {
+        if (scanGen === undefined) scanGen = marketScanGen;
         // Pause propre si le réseau est coupé
         if (!navigator.onLine) {
             if (marketStatusEl) marketStatusEl.innerHTML = `<span style="color:#ef4444;font-size:10px;">📡 hors ligne</span>`;
@@ -4222,17 +4234,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 wmLog('🔁 Nouvelle tentative de recherche serveur (<b>q=</b>) après 10 min de balayage complet.');
             }
             if (!serverSearchBroken) {
-                scan = await fetchWatchedAuctions((kw, page, found) => {
+                scan = await fetchWatchedAuctions(scanGen, (kw, page, found) => {
                     marketStatusEl.innerHTML =
                         `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ « ${esc(kw)} » p.${page} · ${found}</span>`;
                 });
             }
+            // Recherche REFUSÉE (403 sur les mots-clés) : on garde l'affichage actuel et on
+            // retente la recherche dans 20 s. Surtout PAS de balayage complet : ~160 pages,
+            // plusieurs minutes, lui-même refusé par endroits — et incapable de retrouver
+            // à coup sûr une carte précise (les enchères changent de page pendant le
+            // parcours). C'est ce qui a fait rater les 2 « Marcel Dassault » UR.
+            if (scan && scan.refused) {
+                if (isScanStale(scanGen)) return null;
+                marketStatusEl.innerHTML = `<span style="color:#fbbf24;font-size:10px;white-space:nowrap;">⚠️ recherche refusée par le site — nouvel essai dans 20 s</span>`;
+                return 20000 * marketThrottleFactor;
+            }
+            if (isScanStale(scanGen)) return null;
             if (!scan) {
-                scan = await fetchAllMarketAuctions((page, total, found) => {
+                scan = await fetchAllMarketAuctions(scanGen, (page, total, found) => {
                     marketStatusEl.innerHTML =
                         `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ p.${page}/${total} · ${found} annonces</span>`;
                 });
             }
+            // Liste de mots-clés changée (ou STOP) pendant le scan : ces résultats
+            // répondent à une question qu'on ne pose plus. On ne les affiche pas.
+            if (!scan || scan.aborted || isScanStale(scanGen)) return null;
             const { auctions, total, totalPages, incomplete } = scan;
 
             const now = new Date().toLocaleTimeString("fr-FR",
@@ -5643,7 +5669,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // prendre du temps sur les gros comptes) pour ne rater aucune enchère. Les infos
         // de possession (✔ ×N) se rempliront dès que la collection est chargée en parallèle.
         startCountdownTicker(marketAlertEl);
-        runMarketScanLoop(marketAlertEl, marketStatusEl);
+        runMarketScanLoop(marketAlertEl, marketStatusEl, marketLoopGen);
         // Hot lane : démarre peu après (elle ne fait rien tant qu'aucune enchère n'est suivie)
         setTimeout(() => { if (marketWatcherActive) startHotLane(); }, 1000);
 
@@ -5674,18 +5700,53 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     let marketScanInProgress = false;
     let lastScanPageCount = 1; // pages du dernier scan → espacement du suivant
 
-    async function runMarketScanLoop(marketAlertEl, marketStatusEl) {
-        if (!marketWatcherActive || marketScanInProgress) return;
+    /* Génération de scan. Incrémentée à chaque démarrage/arrêt du Market Watcher et à
+       chaque changement de la liste de mots-clés. Un scan capture la valeur à son départ :
+       dès qu'elle change, il s'interrompt à la page suivante et n'affiche RIEN.
+
+       Constat du 28/09 : un balayage complet lancé à 19:59 pour « eiffage » a tourné
+       7 minutes ; pendant ce temps l'utilisateur avait remplacé le mot-clé par « Marcel
+       Dassault » et relancé le Market Watcher — dont le premier scan avait été abandonné
+       en silence (« un scan est déjà en cours »). À 20:07, c'est le vieux balayage qui a
+       affiché ses résultats, après même un STOP. */
+    // (marketScanGen / marketLoopGen sont déclarés tout en haut, avec marketWatcherActive :
+    //  saveWatchlist() peut être appelé dès le chargement — migration des anciennes listes —
+    //  bien avant cette ligne, et un `let` pas encore atteint y lèverait une erreur.)
+    function isScanStale(gen) { return gen !== marketScanGen; }
+
+    // Demande un nouveau scan TOUT DE SUITE (changement de mots-clés) : le scan en cours
+    // devient périmé et la boucle repart sans attendre sa cadence normale.
+    function requestMarketRescan() {
+        marketScanGen++;
+        if (!marketWatcherActive || !window.__wmMarketEls) return;
+        if (marketWatcherTimeout) { clearTimeout(marketWatcherTimeout); marketWatcherTimeout = null; }
+        const { alertEl, statusEl } = window.__wmMarketEls;
+        const loop = marketLoopGen;
+        marketWatcherTimeout = setTimeout(() => runMarketScanLoop(alertEl, statusEl, loop), 300);
+    }
+
+    async function runMarketScanLoop(marketAlertEl, marketStatusEl, loopGen) {
+        if (loopGen === undefined) loopGen = marketLoopGen;
+        // Une boucle d'un démarrage précédent ne programme plus rien : une seule boucle vit.
+        if (!marketWatcherActive || loopGen !== marketLoopGen) return;
+        window.__wmMarketEls = { alertEl: marketAlertEl, statusEl: marketStatusEl };
+        if (marketScanInProgress) {
+            // Un scan (périmé) finit sa page en cours : on repasse dans un instant au lieu
+            // d'abandonner — avant, ce `return` tuait la boucle jusqu'à la fin du vieux scan.
+            marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl, loopGen), 500);
+            return;
+        }
         marketScanInProgress = true;
         const startedAt = Date.now();
+        let nextWaitOverride = null;
         try {
-            await checkMarketplace(marketAlertEl, marketStatusEl);
+            nextWaitOverride = await checkMarketplace(marketAlertEl, marketStatusEl, marketScanGen);
         } catch (e) {
             wmLog(`⚠️ scan échoué : ${esc(e.message || e)}`);
         } finally {
             marketScanInProgress = false;
         }
-        if (!marketWatcherActive) return;
+        if (!marketWatcherActive || loopGen !== marketLoopGen) return;
 
         /* Espacement PROPORTIONNEL au coût du scan. Avec l'ancien calcul (viser 10 s
            entre deux débuts), un scan de 136 pages repartait 1,5 s après avoir fini :
@@ -5706,11 +5767,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         const elapsed = Date.now() - startedAt;
         const budget = Math.max(MARKET_REFRESH_MS, lastScanPageCount * MARKET_MS_PER_PAGE) * marketThrottleFactor;
-        const wait = Math.max(MARKET_MIN_GAP_MS, budget - elapsed);
-        marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl), wait);
+        let wait = Math.max(MARKET_MIN_GAP_MS, budget - elapsed);
+        // Recherche refusée : nouvel essai rapproché (mais pas en rafale), plutôt que
+        // d'attendre la cadence normale ou de basculer sur le balayage complet.
+        if (Number.isFinite(nextWaitOverride)) wait = nextWaitOverride;
+        marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl, loopGen), wait);
     }
 
     function stopMarketWatcher(persist = true) {
+        marketScanGen++;   // le scan en cours ne doit plus rien afficher
+        marketLoopGen++;   // …ni reprogrammer quoi que ce soit
         if (persist) {
             sessionStorage.removeItem('wm_watcher_active');
             sessionStorage.removeItem('wm_hits_cache');
