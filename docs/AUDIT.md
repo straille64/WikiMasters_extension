@@ -995,6 +995,43 @@ L chère ignorée, aucune mise en pause. Troisième passage avec une règle du s
 (+3 annoncé dans le refus ; +2 sans chiffre) : 6 ✗ → 8 ✓ et 5 ✗ → 6 ✓. Mutation « minimum
 appris ignoré » : échoue (6 refusé en boucle).
 
+### 46. Revente Légendaire (nouveau mode) et boutons de la Chasse
+Demande du 29/09 : « les cartes Légendaires gagnées, on les remet sur le marché au prix moyen
+réel du marché », en mode distinct du Trash Seller. Précision de l'utilisateur : trois modes —
+**👑 Chasse** (achat seul), **👑 Chasse + Revente**, et le **Trash Seller** (inchangé).
+
+Choix de l'utilisateur :
+- **quelles L** : celles gagnées **après l'activation** de « Chasse + Revente », quelle que soit
+  la façon de miser (Chasse, auto-bid, fourbe, à la main) ;
+- **prix** : moyenne réelle de CETTE carte **en L** (cote `?scope=summary`, relue à chaque mise en
+  vente), **jamais sous le prix payé + marge** — marge **50 %** par défaut, réglable ;
+- **pas de moyenne en L** : pas de vente (liste « 📋 pas de cote », recontrôlée toutes les heures) ;
+- **invendue** : remise en vente au même calcul, **sans tag Trash** ;
+- **priorité** sur le Trash Seller pour les 5 places de vente.
+
+**✅ Ajouté (1.3.13-fork.29)**
+
+- Market Watcher : la case « Chasse Légendaire » devient deux boutons exclusifs, « 👑 Chasse » et
+  « 👑 Chasse + Revente » ; re-clic = arrêt.
+- Panneau Trash Seller : section « 👑 Revente Légendaire » (marge, état, file avec prix payé et
+  plancher, ✕ pour garder une carte, bilan des reventes).
+- Suivi : `syncWonAuctions()` alimente la file (`wm_legend_resell`) ; la boucle de revente relit
+  les victoires elle-même (le Market Watcher n'a pas à tourner).
+- Vente : même moteur que le Trash Seller (`sellBatch`), prix propre, pas d'undercut. Un verrou
+  (`withSellLock`) empêche les deux modes de cliquer en même temps dans /collection ; le Trash
+  Seller laisse libres les places attendues par la revente.
+- Suivi des ventes : une vente de la revente (`legend` dans l'historique) n'est jamais re-taguée
+  Trash ; « 🔄 Refresh ventes » ne l'annule pas. `checkSellHistoryResults` ne tourne plus qu'une
+  passe à la fois (deux modes l'appellent).
+- Rechargement de page : pas de reprise automatique (elle clique), sauf si c'est le bot qui a
+  rechargé (retour sur /collection). Le bouton affiche alors ⏸ et un clic relance.
+
+`tests/legend-resell.test.mjs` : six victoires en base (une ancienne, une SR, une L sans cote, une
+L cotée seulement en SR, deux L cotées). Attendu : 400 (moyenne), 450 (payée 300 + 50 %), rien
+pour les autres, rien avant le clic, l'invendue remise à 400 sans écriture de tag, boutons
+exclusifs. Mutations « plancher ignoré » et « date d'activation ignorée » : échouent. La priorité
+sur le Trash Seller n'a pas de test dédié.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

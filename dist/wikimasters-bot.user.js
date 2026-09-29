@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.28
+// @version      1.3.13-fork.29
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.28';
+    const WM_VERSION = '1.3.13-fork.29';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -378,6 +378,9 @@
         let archived = 0;
         won.forEach(w => { if (recordPurchase(w)) archived++; });
         if (archived > 0) saveBuyHistory();
+        // Revente Légendaire : à chaque passage, 1er compris (le filtre par date d'activation
+        // écarte les anciennes victoires).
+        won.forEach(w => { try { enqueueLegendResell(w); } catch(e) {} });
 
         // Premier passage de la session : on mémorise les achats déjà existants sans les
         // compter (ils datent d'avant — ils ne doivent pas gonfler la session courante).
@@ -596,6 +599,127 @@
         resetRetagCount(cardId); // repart de zéro : sinon elle serait remise de côté aussitôt
         wmLog(`↩️ Remise en vente : <b>${esc(t)}</b> — compteur d'invendus remis à zéro.`);
         if (typeof renderSetAside === 'function') renderSetAside();
+    }
+
+    /* ── 👑 Revente Légendaire ──
+       Mode à part (ni Trash Seller, ni Chasse Légendaire) : les Légendaires GAGNÉES aux enchères
+       sont remises en vente. Choix de l'utilisateur (29/09) :
+         · seulement celles gagnées APRÈS l'activation du mode, quelle que soit la façon de miser ;
+         · prix = moyenne réelle du marché de CETTE carte en L, jamais sous le prix payé + marge
+           (50 % par défaut) ;
+         · pas de moyenne en L → pas de vente (« en attente », recontrôlée toutes les heures) ;
+         · invendue → remise en vente au même calcul (la moyenne est relue à chaque fois) ;
+         · priorité sur le Trash Seller pour les créneaux de vente.
+       Statuts : waiting (à lister) · listed · no_cote · sold · removed. */
+    const LEGEND_RESELL_KEY = 'wm_legend_resell';
+    const LEGEND_NO_COTE_RECHECK_MS = 60 * 60 * 1000;
+    let legendResellRunning = false;   // boucle de mise en vente active dans CET onglet
+    let legendResell = [];
+    try {
+        const raw = JSON.parse(localStorage.getItem(LEGEND_RESELL_KEY) || '[]');
+        if (Array.isArray(raw)) legendResell = raw.filter(e => e && e.wonAuctionId);
+    } catch(e) {}
+    function saveLegendResell() {
+        try { localStorage.setItem(LEGEND_RESELL_KEY, JSON.stringify(legendResell.slice(-300))); } catch(e) {}
+    }
+    function legendResellFloor(paid) {
+        const m = Math.max(0, getSetting('legendResellMarginPct'));
+        return Math.max(1, Math.ceil((Number(paid) || 0) * (1 + m / 100) - 1e-9));
+    }
+    // Appelé pour chaque enchère gagnée lue en base. true si elle entre dans la file.
+    function enqueueLegendResell(w) {
+        if (!getSetting('legendResellEnabled') || !w || !w.id) return false;
+        const rar = (w.snapshot_rarity || w.card?.rarity || '').toUpperCase();
+        if (rar !== 'L') return false;
+        const ts = w.settled_at ? new Date(w.settled_at).getTime()
+                 : w.end_at ? new Date(w.end_at).getTime() : NaN;
+        if (!(ts >= (getSetting('legendResellSince') || 0))) return false;   // gagnée avant l'activation
+        if (legendResell.some(e => e.wonAuctionId === w.id)) return false;
+        const cardId = w.card?.id || w.card_id;
+        if (!cardId) return false;
+        const paid = Math.max(0, Number(w.final_price ?? w.current_bid ?? 0) || 0);
+        const e = { wonAuctionId: w.id, cardId, title: w.card?.wikipedia_title || '?', paid,
+                    wonAt: ts, status: 'waiting', listings: 0 };
+        legendResell.push(e);
+        saveLegendResell();
+        wmLog(`👑 L gagnée → Revente Légendaire : <b>${esc(e.title)}</b> · payée ${paid} 💰 · jamais sous ${legendResellFloor(paid)} 💰${legendResellRunning ? '' : ' <span style="color:#fbbf24;">(revente en pause — clique « 👑 Chasse + Revente » pour reprendre)</span>'}`);
+        renderLegendResell();
+        return true;
+    }
+    // Entrées prêtes à partir. Une « sans cote » est recontrôlée au bout d'une heure.
+    function legendResellReady() {
+        const now = Date.now();
+        let changed = false;
+        for (const e of legendResell) {
+            if (e.status === 'no_cote' && now - (e.checkedAt || 0) > LEGEND_NO_COTE_RECHECK_MS) { e.status = 'waiting'; changed = true; }
+        }
+        if (changed) saveLegendResell();
+        return legendResell.filter(e => e.status === 'waiting' && !(e.retryAt && now < e.retryAt));
+    }
+    function legendResellItem(e) {
+        return { card_id: e.cardId, card: { id: e.cardId, wikipedia_title: e.title, rarity: 'L' }, _legendResell: e };
+    }
+    function legendResellByListing(auctionId) {
+        return auctionId ? legendResell.find(e => e.listedAuctionId === auctionId) : null;
+    }
+    // Prix : moyenne du marché en L (relue à chaque mise en vente), relevée au plancher.
+    async function resolveLegendResellPrice(e) {
+        const fresh = await fetchCardSales(e.cardId);
+        const entry = fresh || getCachedSales(e.cardId);
+        const floor = legendResellFloor(e.paid);
+        if (!entry) return { skip: true, reason: 'unreadable', floor };   // refus du site : on retentera
+        const avg = entry.byRarity ? entry.byRarity.L : (entry.count > 0 ? entry.avg : null);
+        if (!Number.isFinite(avg) || avg <= 0) return { skip: true, reason: 'no_cote', floor };
+        return { price: Math.max(Math.round(avg), floor), avg: Math.round(avg), floor, floored: avg < floor, source: 'legend' };
+    }
+    // Issue d'une vente suivie (appelée par le suivi des ventes).
+    function legendResellSettled(s, sold, finalPrice) {
+        const e = legendResell.find(x => x.wonAuctionId === s.legend);
+        if (!e || e.status !== 'listed') return;
+        if (sold) {
+            e.status = 'sold';
+            e.soldPrice = Number.isFinite(finalPrice) ? finalPrice : (s.price || null);
+            const gain = Number.isFinite(e.soldPrice) ? e.soldPrice - e.paid : null;
+            wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> vendue ${e.soldPrice ?? '?'} 💰 (payée ${e.paid} 💰${gain != null ? ` · <span style="color:${gain >= 0 ? '#4ade80' : '#ef4444'};">${gain >= 0 ? '+' : ''}${gain} 💰</span>` : ''})`);
+        } else {
+            e.status = 'waiting';
+            e.listedAuctionId = null;
+            wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> invendue — remise en vente au même calcul (moyenne relue, jamais sous ${legendResellFloor(e.paid)} 💰).`);
+        }
+        saveLegendResell();
+        renderLegendResell();
+    }
+    function renderLegendResell() {
+        const el = document.getElementById('wm-lresell-list');
+        if (!el) return;
+        const live = legendResell.filter(e => e.status !== 'removed' && e.status !== 'sold');
+        const sold = legendResell.filter(e => e.status === 'sold');
+        const gain = sold.reduce((s, e) => s + ((e.soldPrice || 0) - (e.paid || 0)), 0);
+        const label = { waiting: ['⏳ à vendre', '#fbbf24'], listed: ['🏷️ en vente', '#4ade80'], no_cote: ['📋 pas de cote', '#888'] };
+        const rows = live.slice().sort((a, b) => (b.wonAt || 0) - (a.wonAt || 0)).map(e => {
+            const [txt, col] = label[e.status] || [e.status, '#888'];
+            const price = e.status === 'listed' && e.listedPrice ? ` · ${e.listedPrice} 💰` : '';
+            return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:10px;border-bottom:1px solid rgba(255,255,255,0.04);">
+                <span style="color:#FFD700;font-weight:700;min-width:14px;">L</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;" title="${esc(e.title)}">${esc(e.title)}</span>
+                <span style="color:#888;white-space:nowrap;" title="Prix payé · plancher (payé + ${getSetting('legendResellMarginPct')} %)">payée ${e.paid} · min ${legendResellFloor(e.paid)}</span>
+                <span style="color:${col};white-space:nowrap;">${txt}${price}</span>
+                ${e.status === 'listed' ? '' : `<button data-wm-lresell-drop="${esc(e.wonAuctionId)}" title="La garder : elle sort de la Revente Légendaire (rien n'est modifié sur le site)."
+                    style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:9px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;">✕</button>`}
+            </div>`;
+        }).join('');
+        el.innerHTML = (rows || '<div style="color:#444;font-size:10px;">Aucune Légendaire gagnée à revendre pour l\'instant.</div>')
+            + (sold.length ? `<div style="font-size:9px;color:#888;margin-top:3px;">${sold.length} revendue(s) · bilan <b style="color:${gain >= 0 ? '#4ade80' : '#ef4444'};">${gain >= 0 ? '+' : ''}${gain} 💰</b></div>` : '');
+        el.querySelectorAll('[data-wm-lresell-drop]').forEach(b => {
+            b.onclick = () => {
+                const e = legendResell.find(x => x.wonAuctionId === b.getAttribute('data-wm-lresell-drop'));
+                if (!e) return;
+                e.status = 'removed';
+                saveLegendResell();
+                wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> retirée — tu la gardes.`);
+                renderLegendResell();
+            };
+        });
     }
     function totalRetagCount() {
         return Object.values(retagCounts).reduce((s, e) => s + (e.count || 0), 0);
@@ -1203,7 +1327,10 @@
         legendHuntEnabled:     'wm_legend_hunt',
         legendHuntMaxPrice:    'wm_legend_hunt_max',
         legendHuntWindowSec:   'wm_legend_hunt_window',
-        sellUndercutMarket:    'wm_sell_undercut_market',
+        legendResellEnabled:   'wm_legend_resell_on',
+        legendResellSince:     'wm_legend_resell_since',
+        legendResellMarginPct: 'wm_legend_resell_margin',
+        sellUndercutMarket:   'wm_sell_undercut_market',
         autoTagPacksFromPresets: 'wm_autotag_packs_presets',
         autoTagSkipLegendary:  'wm_autotag_skip_legendary',
         snipeSecondsBefore:    'wm_snipe_seconds',
@@ -1266,6 +1393,9 @@
         legendHuntEnabled:     false,     // Chasse Légendaire : miser sur les L bradées en toute fin d'enchère
         legendHuntMaxPrice:    10,        // …tant que la mise reste ≤ ce montant (riposte comprise)
         legendHuntWindowSec:   20,        // …dans les N dernières secondes
+        legendResellEnabled:   false,     // mode « Chasse + Revente » : les L gagnées sont remises en vente
+        legendResellSince:     0,         // …seulement celles gagnées après cette date (activation du mode)
+        legendResellMarginPct: 50,        // …jamais sous le prix payé + ce % (plancher)
         sellUndercutMarket:    true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
         autoTagPacksFromPresets: false,   // étiquette auto les cartes packées selon les recherches enregistrées
         autoTagSkipLegendary:  true,      // n'auto-étiquette PAS les Légendaires (on veut souvent les garder)
@@ -6851,9 +6981,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         //    zéro — on pose un marqueur horodaté pour que le Trash Seller reprenne malgré la
         //    reprise auto désactivée. Le marqueur ne vaut que pour une navigation déclenchée
         //    par le bot, et pour une minute : un F5 de l'utilisateur ne relance toujours rien.
-        if (trashSellerRunning) {
+        if (trashSellerRunning || legendResellRunning) {
             try {
-                sessionStorage.setItem('wm_trashseller_selfnav', String(Date.now()));
+                if (legendResellRunning) sessionStorage.setItem('wm_lresell_selfnav', String(Date.now()));
+                if (trashSellerRunning) sessionStorage.setItem('wm_trashseller_selfnav', String(Date.now()));
                 wmLog('↩️ Retour forcé sur <code>/collection</code> (le site avait navigué ailleurs après la mise en vente).');
                 location.assign('/collection');
             } catch(e) {}
@@ -7022,13 +7153,38 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const title = item.card?.wikipedia_title || item.wikipedia_title || '?';
             if (!cardId) { skipped++; wmLog(`⚠️ Carte ignorée (ID manquant) : ${esc(title)}`); continue; }
 
-            // Prix de base : marché (moyenne × %) si activé & historique dispo, sinon tableau
-            const priceInfo = await resolveSellBasePrice(rarity, cardId);
+            // 👑 Revente Légendaire : son propre prix (moyenne L, plancher payé + marge), et
+            // pas d'undercut — il ferait passer sous le plancher.
+            const lr = item._legendResell || null;
+            let priceInfo;
+            if (lr) {
+                priceInfo = await resolveLegendResellPrice(lr);
+                if (priceInfo.skip) {
+                    skipped++;
+                    lr.checkedAt = Date.now();
+                    if (priceInfo.reason === 'no_cote') {
+                        lr.status = 'no_cote';
+                        if (!lr.noCoteLogged) {
+                            lr.noCoteLogged = true;
+                            wmLog(`👑 Revente Légendaire : <b>${esc(title)}</b> n'a aucune vente connue en L — pas mise en vente (recontrôle toutes les heures).`);
+                        }
+                    } else {
+                        lr.retryAt = Date.now() + 5 * 60 * 1000;
+                        wmLog(`👑 Revente Légendaire : cote de <b>${esc(title)}</b> illisible (refus du site) — nouvel essai dans 5 min.`);
+                    }
+                    saveLegendResell();
+                    renderLegendResell();
+                    continue;
+                }
+            } else {
+                // Prix de base : marché (moyenne × %) si activé & historique dispo, sinon tableau
+                priceInfo = await resolveSellBasePrice(rarity, cardId);
+            }
             let price = priceInfo.price;
 
             // Undercut : si une annonce active existe déjà pour cette carte, se placer juste en
             // dessous de la plus basse (−1) pour vendre plus vite. Uniquement si ça BAISSE le prix.
-            if (getSetting('sellUndercutMarket')) {
+            if (!lr && getSetting('sellUndercutMarket')) {
                 const lowest = await fetchLowestActiveListing(cardId);
                 if (lowest != null && (lowest - 1) < price) {
                     priceInfo.undercut = { from: price, market: lowest };
@@ -7092,7 +7248,24 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 continue;
             }
 
-            if (success) {
+            if (success && lr) {
+                consecutiveFailures = 0;
+                sold++;
+                lr.status = 'listed';
+                lr.listedAuctionId = result.auctionId || null;
+                lr.listedPrice = price;
+                lr.listedAt = Date.now();
+                lr.listedDuration = duration;
+                lr.listings = (lr.listings || 0) + 1;
+                lr.noCoteLogged = false;
+                saveLegendResell();
+                renderLegendResell();
+                recordSale(item, price, 'pending', result.auctionId || null);
+                invalidateSalesDetail();
+                wmLog(`👑 Revente Légendaire : <b>${esc(title)}</b> mise en vente ${price} 💰 <span style="color:#888;font-size:9px;">(${priceInfo.floored
+                    ? `🛡️ moy. L ${priceInfo.avg} 💰 &lt; plancher ${priceInfo.floor} 💰`
+                    : `💹 moy. L ${priceInfo.avg} 💰 · plancher ${priceInfo.floor} 💰`} · payée ${lr.paid} 💰)</span>`);
+            } else if (success) {
                 consecutiveFailures = 0;
                 sold++;
                 incrementListedCount(cardId); // couverture équitable du pool Trash
@@ -7123,6 +7296,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             } else {
                 skipped++;
                 consecutiveFailures++;
+                if (lr) { lr.retryAt = Date.now() + 2 * 60 * 1000; saveLegendResell(); }
                 wmLog(`❌ Échec mise en vente : <b>${esc(title)}</b> [${rarity}] · <span style="color:#888;font-size:9px;">${esc(result ? result.reason : '?')}</span>`);
                 if (consecutiveFailures >= SELL_MAX_CONSECUTIVE_FAILURES) {
                     aborted = true;
@@ -7603,7 +7777,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // plutôt que d'annuler à l'aveugle, et on va directement re-lister ce qui rentre.
             let cancelled = 0, keptWithBids = 0;
             if (st.detailed) {
-                const cancellable = st.list.filter(a => !(a.current_bidder && a.current_bidder.username));
+                // Les ventes de la Revente Légendaire ne sont pas au Trash Seller : on n'y touche
+                // pas (les annuler leur remettrait le tag Trash).
+                const cancellable = st.list.filter(a => !(a.current_bidder && a.current_bidder.username)
+                    && !legendResellByListing(a.id));
                 keptWithBids = st.list.length - cancellable.length;
                 for (const a of cancellable) {
                     const ok = await cancelSaleForRefresh(a);
@@ -7638,7 +7815,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
             const batch = await selectTrashBatch(trashCards, slots);
             if (statusEl) statusEl.innerHTML = `<span style="color:#06b6d4;">🛒 Mise en vente de ${batch.length} carte(s)…</span>`;
-            const { sold, skipped, deferred } = await sellBatch(batch, statusEl);
+            const { sold, skipped, deferred } = await withSellLock(() => sellBatch(batch, statusEl));
             const afterSell = await fetchSellingState();
             if (afterSell) renderActiveSales(afterSell.list, afterSell);
 
@@ -7654,6 +7831,82 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             refreshSalesRunning = false;
             if (btn) { btn.disabled = false; btn.innerText = prevLabel || '🔄 Refresh ventes'; }
         }
+    }
+
+    /* Trash Seller et Revente Légendaire vendent tous deux en cliquant dans /collection : un
+       seul lot à la fois, sinon les deux se disputeraient la barre de recherche et la fiche. */
+    let _sellLock = Promise.resolve();
+    function withSellLock(fn) {
+        const run = _sellLock.then(fn, fn);
+        _sellLock = run.catch(() => {});
+        return run;
+    }
+
+    /* ── Boucle de la Revente Légendaire ──
+       Tourne tant que le mode « Chasse + Revente » est actif dans cet onglet. Même moteur que
+       le Trash Seller (sellBatch → mise en vente dans /collection), sa propre file. */
+    async function legendResellLoop() {
+        const statusEl = () => document.getElementById('wm-lresell-status');
+        const say = (html) => { const el = statusEl(); if (el) el.innerHTML = html; };
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        let lastSync = 0;
+        while (legendResellRunning) {
+            try {
+                // Les victoires : lues ici aussi, le Market Watcher n'est pas forcément lancé.
+                if (Date.now() - lastSync > 60000) { lastSync = Date.now(); await syncWonAuctions().catch(() => {}); }
+                await checkSellHistoryResults();
+                await reviewStaleLegendListings();
+                if (!legendResellRunning) break;
+                const ready = legendResellReady();
+                if (!ready.length) {
+                    const listed = legendResell.filter(e => e.status === 'listed').length;
+                    say(`<span style="color:#888;">👑 En attente d'une Légendaire gagnée${listed ? ` · ${listed} en vente` : ''}…</span>`);
+                    await sleep(30000);
+                    continue;
+                }
+                const state = await fetchSellingState();
+                if (!state) { say('<span style="color:#fbbf24;">⚠ Ventes actives illisibles — nouvel essai dans 15 s…</span>'); await sleep(15000); continue; }
+                const mx = effectiveMaxActive(state.max);
+                const slots = Math.max(0, mx - state.count);
+                if (!slots) { say(`<span style="color:#888;">⏳ ${state.count}/${mx} ventes actives — ${ready.length} L en attente d'une place (prioritaire)…</span>`); await sleep(15000); continue; }
+                const batch = ready.slice(0, slots).map(legendResellItem);
+                say(`<span style="color:#06b6d4;">👑 Mise en vente de ${batch.length} Légendaire(s)…</span>`);
+                const r = await withSellLock(() => legendResellRunning ? sellBatch(batch, null) : { sold: 0 });
+                say(`<span style="color:#4ade80;">👑 ${r.sold || 0} Légendaire(s) mise(s) en vente</span>`);
+                // Rien listé (page, plafond, échecs) : on souffle une minute au lieu d'insister.
+                await sleep(!r.sold || r.limitReached || r.aborted ? 60000 : 5000);
+            } catch (e) {
+                say(`<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`);
+                await sleep(15000);
+            }
+        }
+        say('<span style="color:#888;">Revente Légendaire arrêtée.</span>');
+    }
+    // Vente sans identifiant (ou annulée à la main) : au-delà de sa durée, on regarde si la
+    // carte est revenue dans la collection pour trancher vendue / à relister.
+    async function reviewStaleLegendListings() {
+        const now = Date.now();
+        for (const e of legendResell) {
+            if (e.status !== 'listed') continue;
+            const pending = e.listedAuctionId && sellHistory.some(s => s.auctionId === e.listedAuctionId && s.status === 'pending');
+            const limit = (e.listedAt || 0) + ((e.listedDuration || 1440) + 10) * 60000;
+            if (pending || now < limit) continue;
+            // null = plus dans la collection (ou illisible) → considérée vendue : on ne
+            // relance jamais à l'aveugle une carte qu'on ne retrouve pas.
+            const back = await findCurrentUserCardId(e.cardId, e.title).catch(() => null);
+            legendResellSettled({ legend: e.wonAuctionId, price: e.listedPrice }, !back, null);
+        }
+    }
+    function startLegendResell(reason) {
+        if (legendResellRunning) return;
+        legendResellRunning = true;
+        try { sessionStorage.setItem('wm_lresell_active', '1'); } catch(e) {}
+        wmLog(`👑 Revente Légendaire en marche${reason ? ` (${reason})` : ''} : les L gagnées depuis l'activation sont remises en vente — moyenne L du marché, jamais sous payé + ${getSetting('legendResellMarginPct')} %. Reste sur <code>/collection</code> pendant les mises en vente.`);
+        legendResellLoop();
+    }
+    function stopLegendResell() {
+        legendResellRunning = false;
+        try { sessionStorage.removeItem('wm_lresell_active'); } catch(e) {}
     }
 
     async function sellTrashCards(btn, statusEl) {
@@ -7722,10 +7975,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // plus les ventes, la liste est vide alors que 10 ventes sont bien actives.
                 const activeCount = state.count;
                 const maxActive = effectiveMaxActive(state.max);
-                const slots = Math.max(0, maxActive - activeCount);
+                // 👑 Priorité à la Revente Légendaire : les créneaux qu'elle attend ne sont pas
+                // pris par le Trash.
+                const lWaiting = legendResellRunning ? legendResellReady().length : 0;
+                const slots = Math.max(0, maxActive - activeCount - lWaiting);
 
                 if (slots === 0) {
-                    statusEl.innerHTML = `<span style="color:#888;">⏳ ${activeCount}/${maxActive} ventes actives — vérif dans 15s…</span>`;
+                    statusEl.innerHTML = `<span style="color:#888;">⏳ ${activeCount}/${maxActive} ventes actives${lWaiting ? ` · ${lWaiting} place(s) gardée(s) pour la Revente Légendaire` : ''} — vérif dans 15s…</span>`;
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
                 }
@@ -7734,7 +7990,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const batch = buffer.slice(0, slots);
                 statusEl.innerHTML = `<span style="color:#06b6d4;">🛒 Mise en vente de ${batch.length} carte(s) (${activeCount} actives)…</span>`;
 
-                const { sold, skipped, deferred, limitReached, aborted } = await sellBatch(batch, statusEl);
+                const { sold, skipped, deferred, limitReached, aborted } = await withSellLock(() => sellBatch(batch, statusEl));
                 const newActive = activeCount + sold;
 
                 statusEl.innerHTML =
@@ -7837,6 +8093,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function recordSale(item, price, status, auctionId) {
         // status : 'pending' | 'sold' | 'unsold'
         sellHistory.push({
+            // Vente de la Revente Légendaire : ni re-tag Trash à l'invendu, ni compteur Trash.
+            ...(item._legendResell ? { legend: item._legendResell.wonAuctionId } : {}),
             title: item.card?.wikipedia_title || "?",
             rarity: (item.card?.rarity || "C").toUpperCase(),
             price,
@@ -8885,7 +9143,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (auctionRowSettledSold(h)) {
                     s.status = 'sold';
                     creditSoldSale(s, h.final_price ?? s.finalPrice ?? null);
+                    if (s.legend) legendResellSettled(s, true, h.final_price);
                     changed = true; soldN++;
+                    continue;
+                }
+                // Revente Légendaire terminée sans acheteur : jamais de tag Trash, elle
+                // repart dans la file de la revente.
+                if (s.legend && h) {
+                    s.status = 'unsold';
+                    creditUnsoldSale(s);
+                    legendResellSettled(s, false);
+                    changed = true;
                     continue;
                 }
 
@@ -8897,6 +9165,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // Plus dans la collection → considérée vendue (prix inconnu si absent de l'historique).
                     s.status = 'sold';
                     if (h && Number.isFinite(h.final_price)) creditSoldSale(s, h.final_price);
+                    if (s.legend) legendResellSettled(s, true, h ? h.final_price : null);
                     changed = true; soldN++;
                     continue;
                 }
@@ -8904,6 +9173,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 s.status = 'unsold';
                 creditUnsoldSale(s);
                 changed = true;
+                if (s.legend) { legendResellSettled(s, false); continue; }
                 if (retagOn) {
                     const ok = await reapplyTrashTag(targetId); // idempotent
                     if (ok) { incrementRetagCount(s.cardId, s.title, s.rarity); retagged++; }
@@ -8920,9 +9190,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
     }
 
+    // Appelée par le Trash Seller ET la Revente Légendaire : une seule passe à la fois, sinon
+    // une même vente serait conclue (et journalisée) deux fois.
+    let _checkSellRunning = false;
     async function checkSellHistoryResults() {
+        if (_checkSellRunning) return;
         const pending = sellHistory.filter(s => s.status === 'pending' && s.auctionId);
         if (pending.length === 0) return;
+        _checkSellRunning = true;
         try {
             // Ex-`data.history` de /mine, disparu : lecture par ID exact sur `auctions`.
             const byId = await fetchAuctionsByIds(pending.map(s => s.auctionId));
@@ -8937,7 +9212,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     s.finalPrice = match.final_price ?? null;
                     changed      = true;
 
-                    if (s.status === 'sold') {
+                    if (s.legend) {
+                        // Revente Légendaire : son propre bilan (vs prix payé), jamais de re-tag.
+                        if (s.status === 'sold') creditSoldSale(s, null);
+                        else creditUnsoldSale(s);
+                        legendResellSettled(s, s.status === 'sold', s.finalPrice);
+                        if (s.status === 'sold') sendToDiscord("👑 **Revente Légendaire — VENDU**\n**" + s.title + "** → **" + s.finalPrice + " 💰**", 5763719);
+                    } else if (s.status === 'sold') {
                         creditSoldSale(s, null);
                         const gain = (s.finalPrice || 0) - s.price;
                         const gainStr = gain > 0 ? ` <span style="color:#4ade80;">(+${gain} 💰 🔥)</span>` : '';
@@ -8993,7 +9274,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 }
             });
             if (changed) { saveSellHistory(); renderSellHistory(); }
-        } catch(e) {}
+        } catch(e) {
+        } finally {
+            _checkSellRunning = false;
+        }
     }
 
     function renderSellHistory() {
@@ -9858,11 +10142,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <span id="wm-hunter-aggro-lbl">🕵️ Mode fourbe (snipe en fin, pas de mise immédiate)</span>
                     </label>
                     <div id="wm-legend-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin:-2px 0 8px;padding-left:2px;font-size:10px;color:#888;"
-                        title="Mise automatiquement sur les Légendaires dont l'enchère se termine, tant que la mise reste sous ton maximum — et riposte si quelqu'un surenchérit, jusqu'à ce maximum. Actif quand le Market Watcher tourne, soumis à « Mises auto », au plafond global et à la limite de mises par heure.">
-                        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;">
-                            <input type="checkbox" id="wm-legend-hunt" style="width:13px;height:13px;accent-color:#FFD700;cursor:pointer;margin:0;flex-shrink:0;">
-                            <span>👑 Chasse Légendaire : mise si ≤</span>
-                        </label>
+                        title="Chasse Légendaire : mise automatiquement sur les Légendaires dont l'enchère se termine, tant que la mise reste sous ton maximum — et riposte si quelqu'un surenchérit, jusqu'à ce maximum. Actif quand le Market Watcher tourne, soumis à « Mises auto », au plafond global et à la limite de mises par heure.">
+                        <button id="wm-legend-hunt-btn" type="button" title="Chasse Légendaire seule : achète les L bradées, ne revend rien. Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">👑 Chasse</button>
+                        <button id="wm-legend-resell-btn" type="button" title="Chasse Légendaire + Revente : achète les L bradées, puis remet en vente chaque L gagnée (moyenne L du marché, jamais sous le prix payé + marge — réglée dans le panneau Trash Seller). Met en vente dans /collection, comme le Trash Seller. Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">👑 Chasse + Revente</button>
+                        <span>mise si ≤</span>
                         <input id="wm-legend-max" type="number" min="1" step="1" style="width:46px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
                         <span>💰 dans les</span>
                         <input id="wm-legend-window" type="number" min="3" max="120" step="1" style="width:38px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
@@ -9956,6 +10241,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <div id="wm-sale-preview" style="margin-bottom:8px;"></div>
                     <div id="wm-active-sales" style="margin-bottom:8px;"></div>
                     <div id="wm-set-aside"></div>
+                    <div class="wm-sep"></div>
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px;flex-wrap:wrap;">
+                        <div class="wm-lbl" style="margin:0;color:#FFD700;" title="Mode à part du Trash Seller : s'active avec le bouton « 👑 Chasse + Revente » du Market Watcher.">👑 Revente Légendaire</div>
+                        <label style="display:inline-flex;align-items:center;gap:3px;font-size:9px;color:#888;"
+                            title="Plancher : jamais vendue sous le prix payé + ce %. Prix de départ = moyenne L du marché si elle est plus haute.">
+                            jamais sous payé +
+                            <input id="wm-lresell-margin" type="number" min="0" max="1000" step="5" style="width:40px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                            %
+                        </label>
+                    </div>
+                    <div id="wm-lresell-status" style="font-size:10px;color:#888;min-height:14px;margin-bottom:4px;"></div>
+                    <div id="wm-lresell-list" style="margin-bottom:8px;"></div>
                     <div class="wm-sep"></div>
                     <div class="wm-lbl">Ventes (aujourd'hui)</div>
                     <div id="wm-sell-history" style="margin-bottom:8px;"></div>
@@ -10454,24 +10751,102 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (aggroChk) aggroChk.onchange = () => window.wmToggleHunterAggressive();
         paintHunterAggro(); // reflète l'état persisté au chargement (case + libellé du bouton)
 
-        // 👑 Chasse Légendaire
-        const legendChk = document.getElementById('wm-legend-hunt');
+        /* 👑 Deux boutons, deux modes (le Trash Seller reste le 3e, à part) :
+             · « Chasse »           : achète les L bradées, ne revend rien ;
+             · « Chasse + Revente » : achète, puis remet en vente les L gagnées.
+           Exclusifs. Un re-clic sur le mode actif l'arrête. Après un rechargement de page, la
+           revente ne reprend PAS toute seule (elle clique dans /collection) : le bouton
+           affiche ⏸ et un clic la relance. */
+        const legendHuntBtn = document.getElementById('wm-legend-hunt-btn');
+        const legendResellBtn = document.getElementById('wm-legend-resell-btn');
         const legendMax = document.getElementById('wm-legend-max');
         const legendWin = document.getElementById('wm-legend-window');
-        if (legendChk) {
-            legendChk.checked = getSetting('legendHuntEnabled');
-            legendChk.onchange = () => {
-                setSetting('legendHuntEnabled', legendChk.checked);
-                if (legendChk.checked) {
-                    wmLog(`👑 Chasse Légendaire ACTIVÉE : mise sur les Légendaires ≤ <b>${getSetting('legendHuntMaxPrice')} 💰</b> dans les <b>${getSetting('legendHuntWindowSec')} dernières secondes</b>, riposte jusqu'à ce maximum.${marketWatcherActive ? '' : ' Démarre le Market Watcher pour qu\'elle tourne.'}`);
-                    warnAutoBidsPaused('la Chasse Légendaire');
-                    if (marketWatcherActive) discoverLegends().catch(() => {});
-                } else {
-                    for (const id of [...legendHunt.keys()]) forgetLegend(id);
-                    wmLog('👑 Chasse Légendaire désactivée.');
-                }
+        function setLegendHunt(on) {
+            if (on === getSetting('legendHuntEnabled')) return;
+            setSetting('legendHuntEnabled', on);
+            if (on) {
+                wmLog(`👑 Chasse Légendaire ACTIVÉE : mise sur les Légendaires ≤ <b>${getSetting('legendHuntMaxPrice')} 💰</b> dans les <b>${getSetting('legendHuntWindowSec')} dernières secondes</b>, riposte jusqu'à ce maximum.${marketWatcherActive ? '' : ' Démarre le Market Watcher pour qu\'elle tourne.'}`);
+                warnAutoBidsPaused('la Chasse Légendaire');
+                if (marketWatcherActive) discoverLegends().catch(() => {});
+            } else {
+                for (const id of [...legendHunt.keys()]) forgetLegend(id);
+                wmLog('👑 Chasse Légendaire désactivée.');
+            }
+        }
+        function paintLegendModes() {
+            const hunt = getSetting('legendHuntEnabled');
+            const resell = getSetting('legendResellEnabled');
+            const paint = (btn, on, paused) => {
+                if (!btn) return;
+                btn.style.color = on ? (paused ? '#fbbf24' : '#0f0f13') : '#FFD700';
+                btn.style.background = on ? (paused ? 'rgba(251,191,36,0.12)' : '#FFD700') : 'rgba(255,215,0,0.06)';
+                btn.style.border = `1px solid ${on ? (paused ? '#fbbf24' : '#FFD700') : 'rgba(255,215,0,0.35)'}`;
+                btn.style.fontWeight = on ? '700' : '400';
+            };
+            paint(legendHuntBtn, hunt && !resell, false);
+            paint(legendResellBtn, resell, resell && !legendResellRunning);
+            if (legendHuntBtn) legendHuntBtn.innerText = hunt && !resell ? '👑 Chasse ✓' : '👑 Chasse';
+            if (legendResellBtn) legendResellBtn.innerText = !resell ? '👑 Chasse + Revente'
+                : legendResellRunning ? '👑 Chasse + Revente ✓' : '👑 Chasse + Revente ⏸';
+            const st = document.getElementById('wm-lresell-status');
+            if (st && !legendResellRunning) st.innerHTML = resell
+                ? '<span style="color:#fbbf24;">⏸️ Revente en pause (rechargement de la page) — clique « 👑 Chasse + Revente ⏸ » pour reprendre.</span>'
+                : '<span style="color:#555;">Inactive — bouton « 👑 Chasse + Revente » du Market Watcher.</span>';
+        }
+        if (legendHuntBtn) legendHuntBtn.onclick = () => {
+            const active = getSetting('legendHuntEnabled') && !getSetting('legendResellEnabled');
+            if (getSetting('legendResellEnabled')) {
+                setSetting('legendResellEnabled', false);
+                stopLegendResell();
+                wmLog('👑 Revente Légendaire arrêtée — Chasse seule.');
+            }
+            setLegendHunt(!active);
+            paintLegendModes();
+        };
+        if (legendResellBtn) legendResellBtn.onclick = () => {
+            if (getSetting('legendResellEnabled')) {
+                if (!legendResellRunning) { startLegendResell('reprise'); paintLegendModes(); return; }
+                setSetting('legendResellEnabled', false);
+                stopLegendResell();
+                setLegendHunt(false);
+                wmLog('👑 Chasse + Revente arrêtées.');
+                paintLegendModes();
+                return;
+            }
+            // « À partir de maintenant » : seules les L gagnées après ce clic seront revendues.
+            setSetting('legendResellSince', Date.now());
+            setSetting('legendResellEnabled', true);
+            setLegendHunt(true);
+            startLegendResell();
+            paintLegendModes();
+        };
+        window.wmPaintLegendModes = paintLegendModes;
+        const lresellMargin = document.getElementById('wm-lresell-margin');
+        if (lresellMargin) {
+            lresellMargin.value = getSetting('legendResellMarginPct');
+            lresellMargin.onchange = () => {
+                let v = parseInt(lresellMargin.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS.legendResellMarginPct;
+                v = Math.min(1000, Math.max(0, v));
+                lresellMargin.value = v;
+                setSetting('legendResellMarginPct', v);
+                wmLog(`👑 Revente Légendaire : jamais sous le prix payé + <b>${v} %</b>.`);
+                renderLegendResell();
             };
         }
+        // Reprise après rechargement : seulement si c'est le bot qui a rechargé la page.
+        if (getSetting('legendResellEnabled')) {
+            let selfNav = false;
+            try {
+                const ts = parseInt(sessionStorage.getItem('wm_lresell_selfnav') || '0', 10);
+                selfNav = !!sessionStorage.getItem('wm_lresell_active') && Number.isFinite(ts) && (Date.now() - ts) < 60000;
+                sessionStorage.removeItem('wm_lresell_selfnav');
+                if (!selfNav) sessionStorage.removeItem('wm_lresell_active');
+            } catch(e) {}
+            if (selfNav) startLegendResell('reprise après le retour sur /collection');
+        }
+        renderLegendResell();
+        paintLegendModes();
         [[legendMax, 'legendHuntMaxPrice', 1, 1000000, v => `👑 Chasse Légendaire : maximum ${v} 💰`],
          [legendWin, 'legendHuntWindowSec', 3, 120, v => `👑 Chasse Légendaire : fenêtre de ${v} s avant la fin`],
         ].forEach(([el, key, min, max, msg]) => {
