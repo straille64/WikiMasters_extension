@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.27';
+    const WM_VERSION = '1.3.13-fork.28';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1179,6 +1179,9 @@
         sellDecayStepPct:      'wm_sell_decay_step',
         sellDecayMinPct:       'wm_sell_decay_min',
         sellSetAsideAfter:     'wm_sell_set_aside_after',
+        legendHuntEnabled:     'wm_legend_hunt',
+        legendHuntMaxPrice:    'wm_legend_hunt_max',
+        legendHuntWindowSec:   'wm_legend_hunt_window',
         sellUndercutMarket:    'wm_sell_undercut_market',
         autoTagPacksFromPresets: 'wm_autotag_packs_presets',
         autoTagSkipLegendary:  'wm_autotag_skip_legendary',
@@ -1239,6 +1242,9 @@
         sellDecayStepPct:      10,        // baisse par invendu, en % du prix de base
         sellDecayMinPct:       50,        // jamais sous ce % du prix de base, quelle que soit la baisse
         sellSetAsideAfter:     6,         // après N invendus, la carte sort de la file (0 = jamais)
+        legendHuntEnabled:     false,     // Chasse Légendaire : miser sur les L bradées en toute fin d'enchère
+        legendHuntMaxPrice:    10,        // …tant que la mise reste ≤ ce montant (riposte comprise)
+        legendHuntWindowSec:   20,        // …dans les N dernières secondes
         sellUndercutMarket:    true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
         autoTagPacksFromPresets: false,   // étiquette auto les cartes packées selon les recherches enregistrées
         autoTagSkipLegendary:  true,      // n'auto-étiquette PAS les Légendaires (on veut souvent les garder)
@@ -2185,10 +2191,45 @@
     function bidIncrement(amount) {
         return Math.ceil(amount * 1.1 - 1e-9);
     }
+    /* Mise minimale : notre calcul (+10 %) n'est qu'une estimation de la règle du site. Si
+       l'annonce porte elle-même un minimum, ou si le site a refusé une mise en indiquant le
+       sien, c'est lui qui gagne — sinon on retentait trois fois le même montant refusé. */
+    const SITE_MIN_BID_KEYS = ['min_next_bid', 'minNextBid', 'next_min_bid', 'nextMinBid', 'min_bid', 'minBid',
+        'minimum_bid', 'minimumBid', 'min_amount', 'minAmount', 'minimum_amount', 'minimumAmount'];
+    function siteMinBid(o) {
+        if (!o || typeof o !== 'object') return 0;
+        for (const k of SITE_MIN_BID_KEYS) {
+            const v = Number(o[k]);
+            if (o[k] != null && Number.isFinite(v) && v > 0) return Math.ceil(v);
+        }
+        return 0;
+    }
+    // auctionId → { cur, amount } : minimum appris d'un refus, valable tant que l'enchère
+    // n'a pas bougé (même current_bid).
+    const learnedMinBid = new Map();
     function minNextBid(auction) {
-        return auction.current_bid != null
+        const est = auction.current_bid != null
             ? bidIncrement(auction.current_bid)
             : (auction.base_amount || 0);
+        let m = Math.max(est, siteMinBid(auction));
+        const l = auction.id != null ? learnedMinBid.get(auction.id) : null;
+        if (l && l.cur === (auction.current_bid ?? null)) m = Math.max(m, l.amount);
+        return m;
+    }
+    // Minimum annoncé par un refus : champ JSON, sinon nombre qui suit « minim… » dans le
+    // message, sinon le plus grand nombre plausible (> montant refusé). 0 si rien.
+    function minBidFromRefusal(data, msg, refused) {
+        const f = siteMinBid(data) || siteMinBid(data && data.auction);
+        if (f > refused) return f;
+        for (const k of ['minimum', 'min', 'required', 'requiredAmount', 'required_amount']) {
+            const v = Number(data && data[k]);
+            if (data && data[k] != null && Number.isFinite(v) && v > refused) return Math.ceil(v);
+        }
+        const txt = String(msg || '').replace(/(\d)[\s  .,](?=\d{3}\b)/g, '$1');
+        const kw = txt.match(/minim\D{0,40}?(\d+)/i);
+        if (kw && Number(kw[1]) > refused) return Number(kw[1]);
+        const nums = (txt.match(/\d+/g) || []).map(Number).filter(n => n > refused && n <= refused * 2 + 10);
+        return nums.length ? Math.max(...nums) : 0;
     }
 
     function countdownColor(endAtStr) {
@@ -2940,10 +2981,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     const MARKET_THROTTLE_MAX = 8;
     let marketScanRefusals = 0;
 
-    async function fetchMarketPage(page, q, sort) {
+    async function fetchMarketPage(page, q, sort, extra) {
         const url = `${MARKET_API_BASE}?page=${page}&limit=${MARKET_PAGE_LIMIT}`
             + `&sort=${sort || 'ending_soon'}`
-            + (q ? `&q=${encodeURIComponent(q)}` : '');
+            + (q ? `&q=${encodeURIComponent(q)}` : '')
+            + (extra ? `&${extra}` : '');
         const t0 = Date.now();
         const res = await fetch(url, { credentials: "include" });
         syncServerClockFromResponse(res, t0);
@@ -3490,7 +3532,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     const BID_RETRY_MAX = 3;
     const BID_RETRY_DELAY_MS = 180;
     // Refus qui veulent dire « le prix a bougé » → relancer a un sens.
-    const BID_STALE_RE = /trop\s*bas|too\s*low|higher|sup[ée]rieur|minimum|montant|amount|outbid|surench/i;
+    const BID_STALE_RE = /trop\s*bas|too\s*low|higher|sup[ée]rieur|minim|montant|amount|outbid|surench|insuffisant/i;
     // Refus définitifs → insister ne ferait que spammer le serveur.
     const BID_FATAL_RE = /termin|ended|closed|expir|finished|insufficient|fonds|solde|balance|propre|own|self/i;
 
@@ -3532,8 +3574,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 return { ok: true, amount: amt, attempts: attempt, data, auction: a };
             }
             lastErr = (data && (data.error || data.message)) || (res ? `HTTP ${res.status}` : lastErr) || 'erreur';
-            if (attempt === BID_RETRY_MAX) break;
             if (BID_FATAL_RE.test(String(lastErr))) break;
+            // Le site a dit « trop bas » : on retient son minimum (ou, faute de chiffre, un cran
+            // au-dessus) pour ce prix-là — les prochaines mises sur cette enchère en tiendront
+            // compte, même après ce passage.
+            const curAtRefusal = a.current_bid ?? null;
+            if (res && !res.ok && BID_STALE_RE.test(String(lastErr))) {
+                const told = minBidFromRefusal(data, lastErr, amt);
+                if (told > amt) learnedMinBid.set(a.id, { cur: curAtRefusal, amount: told });
+            }
+            if (attempt === BID_RETRY_MAX) break;
 
             await new Promise(r => setTimeout(r, BID_RETRY_DELAY_MS));
             let fresh = null;
@@ -3542,6 +3592,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             a = fresh;
             if (isAuctionOver(a)) { lastErr = 'enchère terminée'; break; }
             if (iAmLeading(a)) return { ok: true, amount: amt, attempts: attempt, alreadyLeading: true, auction: a };
+
+            // Prix inchangé et pourtant refusé « trop bas », sans minimum lisible : notre +10 %
+            // est sous la règle du site → un cran au-dessus plutôt que le même montant refusé.
+            if (res && !res.ok && BID_STALE_RE.test(String(lastErr)) && (a.current_bid ?? null) === curAtRefusal
+                && minNextBid(a) <= amt) {
+                learnedMinBid.set(a.id, { cur: curAtRefusal, amount: amt + Math.max(1, Math.ceil(amt * 0.05)) });
+            }
+            if (learnedMinBid.size > 500) learnedMinBid.clear();
 
             const next = minNextBid(a);
             if (!Number.isFinite(next) || next <= 0) break;
@@ -5413,10 +5471,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Calcule l'intervalle de polling en fonction de l'enchère trackée la plus urgente.
     // Retourne null si rien d'urgent à surveiller (le main scan suffit).
     function computeHotLaneInterval() {
-        const tracked = new Set([...myBidsSet, ...autoBidSet, ...snipeSet]);
+        const tracked = new Set([...myBidsSet, ...autoBidSet, ...snipeSet, ...legendHunt.keys()]);
         if (tracked.size === 0) return null;
 
-        let minMs = Infinity, minSnipeMs = Infinity;
+        let minMs = Infinity, minSnipeMs = Infinity, minLegendMs = Infinity;
         tracked.forEach(id => {
             const hit = activeHitsMap.get(id);
             if (!hit) return;
@@ -5426,7 +5484,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const ms = new Date(hit.endAt).getTime() - serverNow();
             if (ms > 0 && ms < minMs) minMs = ms;
             if (snipeSet.has(id) && ms > 0 && ms < minSnipeMs) minSnipeMs = ms;
+            if (legendHunt.has(id) && ms > 0 && ms < minLegendMs) minLegendMs = ms;
         });
+        if (minLegendMs < (getSetting('legendHuntWindowSec') + 10) * 1000) return 150;
 
         // Snipe imminent : polling très serré (~150ms) pour tirer pile au bon moment. La
         // fenêtre suit le RÉGLAGE (+10s de marge) : figée à 20s, un snipe réglé à 60s était
@@ -5447,8 +5507,128 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     }
 
     // Un tick : fetch en parallèle toutes les enchères trackées, détecte outbid, ripote.
+    /* ══════════ CHASSE LÉGENDAIRE ══════════
+       Demande du 29/09 : repérer les Légendaires dont l'enchère finit (ex. dans 20 s) à un
+       prix bradé (ex. ≤ 10 💰) et miser au dernier moment. Choix de l'utilisateur : riposte
+       jusqu'au prix max, y compris sur les Légendaires déjà possédées, L seulement.
+
+       Deux temps :
+         · REPÉRAGE, toutes les 15 s : les L qui finissent dans les 3 prochaines minutes et
+           dont la mise minimale est sous le max entrent dans `legendHunt`. Le site accepte
+           peut-être un filtre `rarity=L` : on l'essaie et on le VÉRIFIE (toutes les annonces
+           renvoyées doivent être des L), sinon repli sur le début « vivant » du marché trié
+           par fin proche — là où se trouvent justement les enchères qui vont finir.
+         · TIR, dans la hot lane (sondage à ~150 ms près de la fin) : sous la fenêtre, si je
+           ne mène pas et que la mise minimale est ≤ max → placeBid. Réévalué à chaque tick :
+           une surenchère adverse relance donc une riposte, jusqu'au max.
+       Même garde-fous que toute mise automatique : interrupteur « Mises auto », plafond
+       global, limite de mises par heure, et un plafond PAR ENCHÈRE égal au max (il borne
+       aussi les relances de placeBid en cas de course). */
+    const legendHunt = new Map(); // auctionId → { title, setCap }
+    let legendHuntTimer = null;
+    let legendRarityParam = null;     // null = pas encore vérifié · true / false
+    let legendLivePage = 0, legendLivePageAt = 0;
+    const LEGEND_LOOKAHEAD_MS = 3 * 60 * 1000;
+
+    function auctionEndMs(a) {
+        const t = new Date((a && (a.end_at || a.ends_at)) || NaN).getTime();
+        return Number.isFinite(t) ? t : NaN;
+    }
+
+    function forgetLegend(id) {
+        const e = legendHunt.get(id);
+        if (!e) return;
+        legendHunt.delete(id);
+        if (e.setCap && autoBidMaxMap.has(id)) { autoBidMaxMap.delete(id); saveAutoBidMax(); }
+    }
+
+    async function discoverLegends() {
+        if (!getSetting('legendHuntEnabled') || !marketWatcherActive) return;
+        // Ménage : enchères terminées depuis plus de 30 s.
+        for (const id of [...legendHunt.keys()]) {
+            const hit = activeHitsMap.get(id);
+            const end = hit ? auctionEndMs(hit.auction) : NaN;
+            if (!Number.isFinite(end) || serverNow() - end > 30000) forgetLegend(id);
+        }
+        const max = getSetting('legendHuntMaxPrice');
+        const found = [];
+
+        // A) Filtre serveur par rareté, s'il est honoré.
+        if (legendRarityParam !== false) {
+            try {
+                for (let p = 1; p <= 6; p++) {
+                    const d = await fetchMarketPage(p, '', 'ending_soon', 'rarity=L');
+                    const list = (d && d.auctions) || [];
+                    if (legendRarityParam === null && list.length) {
+                        legendRarityParam = list.every(a => (a.card?.rarity || '').toUpperCase() === 'L');
+                        wmLog(legendRarityParam
+                            ? '👑 Chasse Légendaire : le site filtre par rareté — seules les Légendaires sont lues.'
+                            : '👑 Chasse Légendaire : pas de filtre de rareté côté site — lecture du début du marché trié par fin proche.');
+                        if (!legendRarityParam) break;
+                    }
+                    found.push(...list);
+                    // Liste triée par fin : au-delà de l'horizon, inutile d'aller plus loin.
+                    if (list.some(a => !isAuctionOver(a) && auctionEndMs(a) - serverNow() > LEGEND_LOOKAHEAD_MS)) break;
+                    const more = (d && typeof d.hasMore === 'boolean') ? d.hasMore : list.length >= MARKET_PAGE_LIMIT;
+                    if (!more) break;
+                    await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+                }
+            } catch (e) {
+                return; // refus du site : on retentera au prochain passage, sans insister
+            }
+        }
+
+        // B) Repli : le début « vivant » du marché (les enchères qui finissent le plus tôt).
+        if (legendRarityParam === false) {
+            try {
+                if (!legendLivePage || Date.now() - legendLivePageAt > 3 * 60 * 1000) {
+                    legendLivePage = await findFirstLivePage(MARKET_MAX_PAGES);
+                    legendLivePageAt = Date.now();
+                }
+                for (let p = legendLivePage; p < legendLivePage + 2; p++) {
+                    const d = await fetchMarketPage(p, '', 'ending_soon');
+                    found.push(...((d && d.auctions) || []));
+                    await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+                }
+            } catch (e) {
+                return;
+            }
+        }
+
+        for (const a of found) {
+            if (!a || !a.id || legendHunt.has(a.id)) continue;
+            if ((a.card?.rarity || '').toUpperCase() !== 'L') continue;
+            if (isAuctionOver(a)) continue;
+            const remaining = auctionEndMs(a) - serverNow();
+            if (!(remaining <= LEGEND_LOOKAHEAD_MS)) continue;
+            const next = minNextBid(a);
+            if (!(next <= max)) continue;
+            const hadCap = autoBidMaxMap.has(a.id);
+            if (!hadCap) { autoBidMaxMap.set(a.id, max); saveAutoBidMax(); }
+            legendHunt.set(a.id, { title: a.card?.wikipedia_title || '?', setCap: !hadCap });
+            // Connue de la hot lane : elle resserre son sondage à l'approche de la fin.
+            activeHitsMap.set(a.id, { auction: a, endAt: a.end_at });
+            wmLog(`👑 Légendaire repérée : <b>${esc(a.card?.wikipedia_title || '?')}</b> — mise minimale ${next} 💰, fin dans ${Math.round(remaining / 1000)} s · mise si ≤ ${max} 💰 dans les ${getSetting('legendHuntWindowSec')} dernières secondes`);
+            warnAutoBidsPaused('la Chasse Légendaire');
+        }
+    }
+
+    function startLegendHunt() {
+        stopLegendHunt();
+        const tick = async () => {
+            try { await discoverLegends(); } catch (e) {}
+            if (!marketWatcherActive) return;
+            legendHuntTimer = setTimeout(tick, 15000 * marketThrottleFactor);
+        };
+        legendHuntTimer = setTimeout(tick, 2000);
+    }
+    function stopLegendHunt() {
+        if (legendHuntTimer) { clearTimeout(legendHuntTimer); legendHuntTimer = null; }
+    }
+    window.wmDiscoverLegends = () => discoverLegends();
+
     async function hotLaneTick() {
-        const tracked = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet])];
+        const tracked = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet, ...legendHunt.keys()])];
         if (tracked.length === 0) return;
 
         // Ne pas fetch les enchères en cours de bid (lock)
@@ -5512,6 +5692,41 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             bidLockSet.delete(a.id);
                         }
                         continue; // ce tick a servi au snipe pour cette enchère
+                    }
+                }
+            }
+
+            // 👑 CHASSE LÉGENDAIRE : dans la fenêtre de fin, mise (ou riposte) tant que la
+            // mise minimale reste ≤ au max. Réévalué à chaque tick → riposte automatique.
+            const legendEntry = legendHunt.get(a.id);
+            if (legendEntry && endTs > 0 && !bidLockSet.has(a.id)
+                && !(legendEntry.failAt && Date.now() - legendEntry.failAt < 2000)) {
+                const remaining = endTs - serverNow();
+                const windowMs = (getSetting('legendHuntWindowSec') + 1) * 1000;
+                const maxL = getSetting('legendHuntMaxPrice');
+                if (remaining <= 0) { forgetLegend(a.id); }
+                else if (remaining <= windowMs && remaining > 1200 && !iAmLeading(a) && wikibidousBalance > 0) {
+                    const bidAmount = minNextBid(a);
+                    if (bidAmount <= maxL && autoBidAllowed(a, bidAmount, 'Chasse Légendaire')) {
+                        bidLockSet.add(a.id);
+                        const tL = a.card?.wikipedia_title || '?';
+                        try {
+                            const r = await placeBid(a, bidAmount, 'Chasse Légendaire');
+                            if (r.ok) {
+                                wmLog(`👑 Chasse Légendaire : <b>${esc(tL)}</b> [L] → <span style="color:#fbbf24;">${r.amount} 💰</span> (fin dans ${Math.round(remaining / 1000)} s)${bidRetryNote(r)}`);
+                                fetchBalance().catch(() => {});
+                                sendToDiscord("👑 Chasse Légendaire : **" + tL + "** → **" + r.amount + " 💰**", 16766720, 'market');
+                            } else {
+                                // Pas de rafale : 2 s avant de retenter (placeBid a déjà relancé).
+                                legendEntry.failAt = Date.now();
+                                wmLog(`⚠️ Chasse Légendaire échouée : <b>${esc(tL)}</b> · ${esc(r.reason)}`);
+                            }
+                        } catch (e) {
+                            legendEntry.failAt = Date.now();
+                        } finally {
+                            bidLockSet.delete(a.id);
+                        }
+                        continue;
                     }
                 }
             }
@@ -5649,6 +5864,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // de possession (✔ ×N) se rempliront dès que la collection est chargée en parallèle.
         startCountdownTicker(marketAlertEl);
         runMarketScanLoop(marketAlertEl, marketStatusEl, marketLoopGen);
+        startLegendHunt();
         // Hot lane : démarre peu après (elle ne fait rien tant qu'aucune enchère n'est suivie)
         setTimeout(() => { if (marketWatcherActive) startHotLane(); }, 1000);
 
@@ -5764,6 +5980,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (marketWatcherTimeout)    { clearTimeout(marketWatcherTimeout);     marketWatcherTimeout = null; }
         if (marketCountdownInterval) { clearInterval(marketCountdownInterval); marketCountdownInterval = null; }
         stopHotLane();
+        stopLegendHunt();
         marketWatcherActive = false;
     }
 
@@ -5811,10 +6028,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Point d'entrée à utiliser à la place d'un appel direct à fetchTrashCards() dans les
     // boucles/actions répétées : ne re-scanne que si le pool n'a jamais été chargé ou a dépassé
     // l'intervalle de réconciliation.
-    async function getTrashPool(onProgress) {
-        const stale = !trashPoolCacheReady || (Date.now() - trashPoolCacheTs) > TRASH_POOL_RESCAN_INTERVAL_MS;
+    /* `opts.shouldAbort` : seul le Trash Seller en marche l'utilise (arrêt = on coupe le
+       scan). `opts.force` : rescan complet même si le cache est frais (aperçu manuel).
+
+       Bug du 29/09 (« il ne détecte que 2 cartes Trash, j'en ai une quinzaine ») : le scan
+       s'interrompait après la 1re page dès que le Trash Seller n'était PAS démarré — cas de
+       l'aperçu et du « Refresh ventes ». Il ne lisait donc que les 50 premières cartes de la
+       collection (triée par rareté : les plus rares), et ce pool tronqué était ensuite
+       gardé 12 min en cache, y compris pour le vendeur une fois lancé. */
+    async function getTrashPool(onProgress, opts) {
+        const o = opts || {};
+        const stale = o.force || !trashPoolCacheReady || (Date.now() - trashPoolCacheTs) > TRASH_POOL_RESCAN_INTERVAL_MS;
         if (stale) {
-            trashPoolCache = await fetchTrashCards(onProgress);
+            const cards = await fetchTrashCards(onProgress, o.shouldAbort);
+            if (cards.aborted) return cards;   // scan coupé : on ne l'érige pas en vérité
+            trashPoolCache = cards;
             trashPoolCacheTs = Date.now();
             trashPoolCacheReady = true;
         }
@@ -5840,16 +6068,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (idx !== -1) trashPoolCache.splice(idx, 1);
     }
 
-    async function fetchTrashCards(onProgress) {
+    async function fetchTrashCards(onProgress, shouldAbort) {
+        const abort = typeof shouldAbort === 'function' ? shouldAbort : () => false;
         const limit = 50;
         let trashCards = [];
+        let aborted = false;
 
         const url = (p) => `https://www.wiki-masters.com/api/my-collection?page=${p}&limit=${limit}&sort=rarity&pending=1`;
 
         // Fetch une page avec retry automatique (3 tentatives, backoff linéaire)
         async function fetchPage(p) {
             for (let attempt = 0; attempt < 3; attempt++) {
-                if (!trashSellerRunning) return null;
+                if (abort()) return null;
                 try {
                     const res = await fetch(url(p), { credentials: "include" });
                     if (!res.ok) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); continue; }
@@ -5901,7 +6131,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             let reachedEnd = false;
             const failedPageNums = [];
             for (let start = 1; start < upperLimit && !reachedEnd; start += BATCH) {
-                if (!trashSellerRunning) break;
+                if (abort()) { aborted = true; break; }
                 const pages = [];
                 for (let p = start; p < Math.min(start + BATCH, upperLimit); p++) pages.push(p);
                 const results = await Promise.all(pages.map(fetchPage));
@@ -5922,11 +6152,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // 2e passe : on RE-TENTE les pages échouées une à une. Crucial avec sort=rarity :
             // un échec non rattrapé prive le pool d'une tranche entière de rareté, ce qui
             // biaise la sélection équitable et fait grimper le compteur des cartes chargées.
-            if (failedPageNums.length > 0 && trashSellerRunning && !reachedEnd) {
+            if (failedPageNums.length > 0 && !abort() && !reachedEnd) {
                 wmLog(`🔁 Scan Trash : 2e tentative sur ${failedPageNums.length} page(s) échouée(s)…`);
                 const stillFailed = [];
                 for (const p of failedPageNums) {
-                    if (!trashSellerRunning) break;
+                    if (abort()) { aborted = true; break; }
                     const items = await fetchPage(p);
                     if (items === null) { stillFailed.push(p); continue; }
                     trashCards = trashCards.concat(filterTrash(items));
@@ -5971,6 +6201,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         lastTrashCardIds = currentIds;
 
+        if (aborted) trashCards.aborted = true;
         return trashCards;
     }
 
@@ -7185,7 +7416,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        autrement que la vente elle-même serait pire qu'aucun aperçu : il donnerait
        confiance dans un chiffre faux. Seule différence assumée : rien n'est envoyé. */
     async function buildSalePreview() {
-        const pool = await getTrashPool();
+        const pool = await getTrashPool(null, { force: true });
         if (!Array.isArray(pool) || pool.length === 0) return { rows: [], poolSize: 0, slots: 0 };
 
         // Mêmes créneaux que la vente réelle : plafond de ventes simultanées moins
@@ -7424,7 +7655,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const scanPool = async (showProgress) => {
             const cards = await getTrashPool((page, total) => {
                 if (showProgress) statusEl.innerHTML = `<span style="color:#888;">🔍 Recherche cartes Trash… ${Math.round((page / total) * 100)}% (p.${page}/${total})</span>`;
-            });
+            }, { shouldAbort: () => !trashSellerRunning });
             if (!trashSellerRunning) return [];
             return await selectTrashBatch(cards, cards.length); // tout le pool, trié
         };
@@ -9605,6 +9836,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <input type="checkbox" id="wm-hunter-aggro" style="width:13px;height:13px;accent-color:#c084fc;cursor:pointer;margin:0;flex-shrink:0;">
                         <span id="wm-hunter-aggro-lbl">🕵️ Mode fourbe (snipe en fin, pas de mise immédiate)</span>
                     </label>
+                    <div id="wm-legend-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin:-2px 0 8px;padding-left:2px;font-size:10px;color:#888;"
+                        title="Mise automatiquement sur les Légendaires dont l'enchère se termine, tant que la mise reste sous ton maximum — et riposte si quelqu'un surenchérit, jusqu'à ce maximum. Actif quand le Market Watcher tourne, soumis à « Mises auto », au plafond global et à la limite de mises par heure.">
+                        <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;">
+                            <input type="checkbox" id="wm-legend-hunt" style="width:13px;height:13px;accent-color:#FFD700;cursor:pointer;margin:0;flex-shrink:0;">
+                            <span>👑 Chasse Légendaire : mise si ≤</span>
+                        </label>
+                        <input id="wm-legend-max" type="number" min="1" step="1" style="width:46px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                        <span>💰 dans les</span>
+                        <input id="wm-legend-window" type="number" min="3" max="120" step="1" style="width:38px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                        <span>dernières s</span>
+                    </div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
                         <div class="wm-lbl" id="wm-kw-label" style="margin:0;">Mots-clés (0)</div>
@@ -10191,6 +10433,44 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (aggroChk) aggroChk.onchange = () => window.wmToggleHunterAggressive();
         paintHunterAggro(); // reflète l'état persisté au chargement (case + libellé du bouton)
 
+        // 👑 Chasse Légendaire
+        const legendChk = document.getElementById('wm-legend-hunt');
+        const legendMax = document.getElementById('wm-legend-max');
+        const legendWin = document.getElementById('wm-legend-window');
+        if (legendChk) {
+            legendChk.checked = getSetting('legendHuntEnabled');
+            legendChk.onchange = () => {
+                setSetting('legendHuntEnabled', legendChk.checked);
+                if (legendChk.checked) {
+                    wmLog(`👑 Chasse Légendaire ACTIVÉE : mise sur les Légendaires ≤ <b>${getSetting('legendHuntMaxPrice')} 💰</b> dans les <b>${getSetting('legendHuntWindowSec')} dernières secondes</b>, riposte jusqu'à ce maximum.${marketWatcherActive ? '' : ' Démarre le Market Watcher pour qu\'elle tourne.'}`);
+                    warnAutoBidsPaused('la Chasse Légendaire');
+                    if (marketWatcherActive) discoverLegends().catch(() => {});
+                } else {
+                    for (const id of [...legendHunt.keys()]) forgetLegend(id);
+                    wmLog('👑 Chasse Légendaire désactivée.');
+                }
+            };
+        }
+        [[legendMax, 'legendHuntMaxPrice', 1, 1000000, v => `👑 Chasse Légendaire : maximum ${v} 💰`],
+         [legendWin, 'legendHuntWindowSec', 3, 120, v => `👑 Chasse Légendaire : fenêtre de ${v} s avant la fin`],
+        ].forEach(([el, key, min, max, msg]) => {
+            if (!el) return;
+            el.value = getSetting(key);
+            el.onchange = () => {
+                let v = parseInt(el.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS[key];
+                v = Math.min(max, Math.max(min, v));
+                el.value = v;
+                setSetting(key, v);
+                // Le max change → les plafonds posés par la chasse suivent.
+                if (key === 'legendHuntMaxPrice') {
+                    for (const [id, e] of legendHunt) if (e.setCap) autoBidMaxMap.set(id, v);
+                    saveAutoBidMax();
+                }
+                wmLog(msg(v));
+            };
+        });
+
         // Tri du watcher market : initialise la valeur sauvegardée et réagit aux changements
         const sortSelect = document.getElementById('wm-sort-select');
         if (sortSelect) {
@@ -10329,6 +10609,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     marketBtn.className = "wm-btn wm-r wm-sm"; marketBtn.innerText = "⏹ STOP";
                     document.getElementById('dot-market').classList.add('on');
                     runMarketScanLoop(marketAlertEl, marketStatusEl);
+                    startLegendHunt();
                     // Démarre la hot lane (cas reload : on a déjà les hits en cache)
                     setTimeout(() => startHotLane(), 1000);
                     updateDots();
@@ -14294,12 +14575,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
               + " Rien n'est supprimé, et un second clic retire l'étiquette.";
     }
 
-    function makeTrashButton(cardId, title) {
+    function makeTrashButton(cardId, title, rarity) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = COLLECTION_BTN_CLASS;
         btn.dataset.wmCardId = cardId;
         btn.dataset.wmTitle = title;
+        btn.dataset.wmRarity = rarity || '';
         btn.style.cssText = 'cursor:pointer;border:1px solid rgba(255,255,255,0.25);'
             + 'border-radius:6px;padding:1px 4px;font-size:13px;line-height:1.1;color:#fff;backdrop-filter:blur(2px);';
         paintTrashButton(btn, trashTaggedCardIds.has(cardId));
@@ -14316,6 +14598,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const r = await toggleTrashTag(cardId, title);
                 if (r.ok) {
                     paintTrashButton(btn, r.action === 'added');
+                    // Le pool du Trash Seller est en cache (rescan toutes les 12 min) : sans
+                    // ça, une carte défaussée ici n'était vue par le vendeur que 12 min plus tard.
+                    if (r.action === 'added') pushToTrashPoolCache(cardId, title, btn.dataset.wmRarity || 'C');
+                    else removeFromTrashPoolCache(cardId);
                     wmLog(r.action === 'added'
                         ? `🗑️ Défaussée : <b>${esc(title)}</b> → étiquette <b>${esc(getSellTagName())}</b>.`
                         : `♻️ Étiquette retirée : <b>${esc(title)}</b> n'est plus à vendre.`);
@@ -14417,7 +14703,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
             // Le bouton rejoint la pile d'icônes du site (à côté de l'étoile « favoris »)
             // quand elle existe ; sinon on le pose en haut à droite de la tuile.
-            const btn = makeTrashButton(cardId, title);
+            const btn = makeTrashButton(cardId, title, rarity);
             const fav = tile.querySelector('button[aria-label="Ajouter aux favoris"]');
             if (fav && fav.parentElement) {
                 fav.parentElement.appendChild(btn);

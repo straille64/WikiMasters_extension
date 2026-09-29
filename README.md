@@ -70,6 +70,10 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   premières mises en vente, baisse par invendu bornée, mise de côté réversible.
 - `tests/trash-seller-ui-robust.test.mjs` : titre à apostrophe typographique et fiche
   lente à s'ouvrir — la bonne carte est vendue, le garde-fou reste actif.
+- `tests/trash-pool-scan.test.mjs` : collection de 4 pages — toutes les cartes Trash
+  sont trouvées même vendeur arrêté (aperçu, refresh).
+- `tests/legend-hunt.test.mjs` : Chasse Légendaire — mise minimale dans la fenêtre de
+  fin, riposte jusqu'au max puis arrêt, L trop chère ignorée, rien en pause.
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -168,6 +172,10 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       mise de côté des invendables, et fiabilité de la mise en vente (audit #42)
 - [x] Market Watcher : recherche refusée retentée au lieu du balayage complet, scan en cours
       annulé au changement de mot-clé ou au STOP (audit #43)
+- [x] Trash Seller : toute la collection lue même vendeur arrêté, 🗑️ de la Collection
+      synchronisé avec le pool (audit #44)
+- [x] Chasse Légendaire : mise sur les L bradées en fin d'enchère, riposte jusqu'au
+      prix max (audit #45)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

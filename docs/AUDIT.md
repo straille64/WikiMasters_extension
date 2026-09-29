@@ -933,6 +933,68 @@ trouve en une requête.
 Couvert par la suite existante du Market Watcher (recherche serveur, sonde, filtres, pagination,
 modes, mises). Pas encore de test dédié au changement de mot-clé en cours de scan.
 
+### 44. Le Trash Seller ne voyait que 2 cartes Trash sur une quinzaine
+Retour du 29/09 : « il me détecte 2 cartes Trash, pourtant j'en ai une quinzaine ». Le scan de la
+collection utilisait `!trashSellerRunning` comme signal d'arrêt : vendeur **non démarré** (aperçu,
+« Refresh ventes »), il s'arrêtait après la **1re page**. Triée par rareté, cette page ne contient
+que les cartes les plus rares ; les Trash étaient plus loin. Ce pool tronqué restait ensuite
+**12 min en cache**, y compris pour le vendeur une fois lancé. Autre trou : poser ou retirer le
+tag avec le 🗑️ de la page Collection ne prévenait pas le pool.
+
+**✅ Corrigé (1.3.13-fork.28)**
+
+- `fetchTrashCards(onProgress, shouldAbort)` : le signal d'arrêt est fourni par l'appelant. Le
+  vendeur passe `() => !trashSellerRunning` ; l'aperçu et le refresh lisent tout.
+- Un scan interrompu (`aborted`) n'écrase plus le cache.
+- L'aperçu force une relecture complète (`getTrashPool(null, { force: true })`).
+- Le 🗑️ de la Collection ajoute / retire la carte du pool immédiatement (avec sa rareté).
+
+Rappel : une carte qui porte un **autre tag en plus** de Trash reste exclue par sécurité (règle
+du tag unique), et les cartes mises de côté (#42) sont comptées à part.
+
+`tests/trash-pool-scan.test.mjs` : collection de 4 pages, Trash réparties sur toutes. La version
+précédente échoue avec « 2 carte(s) dans le pool — pages lues : [0] ».
+
+### 45. Chasse Légendaire (nouveau mode)
+Demande du 29/09 : « on scanne les Légendaires dont l'enchère finit bientôt, par exemple dans
+20 s, et si elle est à 10 wikibidous, on mise ». Choix de l'utilisateur : **riposte jusqu'au prix
+max**, Légendaires **déjà possédées comprises**, **L seulement**.
+
+**✅ Ajouté (1.3.13-fork.28)** — case « 👑 Chasse Légendaire » sous « Mode fourbe », avec le prix
+max (10 par défaut) et la fenêtre (20 s par défaut).
+
+- Repérage toutes les 15 s tant que le Market Watcher tourne : `rarity=L` trié « fin proche »
+  (vérifié : si le site ignore le filtre, repli sur les pages en cours du marché). Retient les L
+  qui finissent dans les 3 min et dont la mise minimale est ≤ max ; journalise « 👑 Légendaire
+  repérée ».
+- La voie rapide (hot lane) suit ces enchères et passe à 150 ms à l'approche de la fenêtre.
+- Dans la fenêtre, si on ne mène pas : mise **minimale** (`minNextBid`) si ≤ max, riposte à
+  chaque surenchère tant que ça reste ≤ max. Rien sous 1,2 s de la fin.
+- Tout passe par `autoBidAllowed()` / `placeBid()` : interrupteur « Mises auto ARMÉES »,
+  plafond global, limite horaire, plafond par enchère (posé au max de la chasse). En pause, le
+  journal le dit.
+
+- Après un échec, 2 s de pause avant de retenter cette enchère (avant : une mise refusée
+  repartait à chaque passage de la hot lane, ~5 fois par seconde).
+
+**Mise minimale du site** (remarque de l'utilisateur : « si la carte est à 10, pas sûr qu'une
+enchère à 11 passe, le site propose automatiquement la mise minimum »). Notre `minNextBid` (+10 %
+arrondi au-dessus) n'est qu'une estimation. Désormais :
+
+- si l'annonce porte un champ de minimum (`min_next_bid`, `minBid`, `minimum_bid`…), il l'emporte ;
+- un refus « trop bas » / « mise minimale » est lu : le minimum annoncé (champ JSON ou chiffre
+  après « minim… ») est retenu pour cette enchère tant que son prix ne bouge pas, et placeBid
+  relance directement à ce montant ; sans chiffre, un cran au-dessus (+5 %, au moins +1) ;
+- `BID_STALE_RE` reconnaît « minimale » (avant : seulement « minimum » → la relance repartait
+  au même montant refusé) ;
+- plafonds inchangés : si le minimum du site dépasse le max, on ne mise pas.
+
+`tests/legend-hunt.test.mjs` : une L à 5 qui finit dans 30 s (un rival relance à 8 puis 12) et
+une L à 500. Attendu : 1re mise à 5 dans les 20 dernières secondes, riposte à 9, arrêt à 12,
+L chère ignorée, aucune mise en pause. Troisième passage avec une règle du site plus stricte
+(+3 annoncé dans le refus ; +2 sans chiffre) : 6 ✗ → 8 ✓ et 5 ✗ → 6 ✓. Mutation « minimum
+appris ignoré » : échoue (6 refusé en boucle).
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
