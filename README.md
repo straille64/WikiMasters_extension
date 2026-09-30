@@ -74,6 +74,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   sont trouvées même vendeur arrêté (aperçu, refresh).
 - `tests/legend-hunt.test.mjs` : Chasse Légendaire — mise minimale dans la fenêtre de
   fin, riposte jusqu'au max puis arrêt, L trop chère ignorée, rien en pause.
+- `tests/opti-hunt.test.mjs` : 🎯 Chasse opti — mise sous le plafond min(cote × 60 %, cote − 20,
+  mise max), riposte puis arrêt, raretés décochées et propres ventes ignorées.
 - `tests/top-cards.test.mjs` : 💎 Cartes les plus chères — collection entière, cote de la
   rareté de chaque exemplaire, sans cote à part, filtre par rareté.
 - `tests/low-balance.test.mjs` : solde insuffisant — aucune mise auto au-delà du solde,
@@ -190,6 +192,7 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Chasse : réserve de solde ; bouton « Revente seule » (audit #49)
 - [x] Panneau « 💎 Cartes les plus chères » : ma collection classée par cote (audit #50)
 - [x] Revente Légendaire : -Y % toutes les X invendues, jamais sous payé + marge (audit #51)
+- [x] 🎯 Chasse opti (achat sous la cote) ; Revente limitée aux achats de la Chasse (audit #52)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

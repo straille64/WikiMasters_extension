@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.34
+// @version      1.3.13-fork.35
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.34';
+    const WM_VERSION = '1.3.13-fork.35';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -614,6 +614,19 @@
     const LEGEND_RESELL_KEY = 'wm_legend_resell';
     const LEGEND_NO_COTE_RECHECK_MS = 60 * 60 * 1000;
     let legendResellRunning = false;   // boucle de mise en vente active dans CET onglet
+    /* Enchères où une Chasse (L ou opti) a misé. Choix du 30/09 : la Revente ne remet en vente
+       QUE ces achats-là — une carte achetée à la main n'est jamais revendue par le bot. */
+    const CHASSE_BIDS_KEY = 'wm_chasse_bids';
+    let chasseBidIds = new Set();
+    try {
+        const raw = JSON.parse(localStorage.getItem(CHASSE_BIDS_KEY) || '[]');
+        if (Array.isArray(raw)) chasseBidIds = new Set(raw);
+    } catch(e) {}
+    function markChasseBid(auctionId) {
+        if (!auctionId || chasseBidIds.has(auctionId)) return;
+        chasseBidIds.add(auctionId);
+        try { localStorage.setItem(CHASSE_BIDS_KEY, JSON.stringify([...chasseBidIds].slice(-500))); } catch(e) {}
+    }
     const LEGEND_RESELL_LIVE = new Set(['waiting', 'listed', 'no_cote']);
     const LEGEND_OWN_GRACE_MS = 10 * 60 * 1000; // une L tout juste gagnée peut tarder à arriver
     let legendResell = [];
@@ -632,7 +645,7 @@
     function enqueueLegendResell(w) {
         if (!getSetting('legendResellEnabled') || !w || !w.id) return false;
         const rar = (w.snapshot_rarity || w.card?.rarity || '').toUpperCase();
-        if (rar !== 'L') return false;
+        if (!chasseBidIds.has(w.id)) return false;   // pas un achat de la Chasse → jamais revendu
         const ts = w.settled_at ? new Date(w.settled_at).getTime()
                  : w.end_at ? new Date(w.end_at).getTime() : NaN;
         if (!(ts >= (getSetting('legendResellSince') || 0))) return false;   // gagnée avant l'activation
@@ -641,10 +654,10 @@
         if (!cardId) return false;
         const paid = Math.max(0, Number(w.final_price ?? w.current_bid ?? 0) || 0);
         const e = { wonAuctionId: w.id, cardId, title: w.card?.wikipedia_title || '?', paid,
-                    wonAt: ts, status: 'waiting', listings: 0 };
+                    rarity: rar || 'L', wonAt: ts, status: 'waiting', listings: 0 };
         legendResell.push(e);
         saveLegendResell();
-        wmLog(`👑 L gagnée → Revente Légendaire : <b>${esc(e.title)}</b> · payée ${paid} 💰 · jamais sous ${legendResellFloor(paid)} 💰${legendResellRunning ? '' : ' <span style="color:#fbbf24;">(revente en pause — clique le bouton marqué ⏸ du Market Watcher pour reprendre)</span>'}`);
+        wmLog(`🏷️ Achat de la Chasse → Revente : <b>${esc(e.title)}</b> [${esc(e.rarity)}] · payée ${paid} 💰 · jamais sous ${legendResellFloor(paid)} 💰${legendResellRunning ? '' : ' <span style="color:#fbbf24;">(revente en pause — clique le bouton marqué ⏸ du Market Watcher pour reprendre)</span>'}`);
         renderLegendResell();
         return true;
     }
@@ -659,7 +672,7 @@
         return legendResell.filter(e => e.status === 'waiting' && !(e.retryAt && now < e.retryAt));
     }
     function legendResellItem(e) {
-        return { card_id: e.cardId, card: { id: e.cardId, wikipedia_title: e.title, rarity: 'L' }, _legendResell: e };
+        return { card_id: e.cardId, card: { id: e.cardId, wikipedia_title: e.title, rarity: e.rarity || 'L' }, _legendResell: e };
     }
     function legendResellByListing(auctionId) {
         return auctionId ? legendResell.find(e => e.listedAuctionId === auctionId) : null;
@@ -670,7 +683,7 @@
         const entry = fresh || getCachedSales(e.cardId);
         const floor = legendResellFloor(e.paid);
         if (!entry) return { skip: true, reason: 'unreadable', floor };   // refus du site : on retentera
-        const avg = entry.byRarity ? entry.byRarity.L : (entry.count > 0 ? entry.avg : null);
+        const avg = entry.byRarity ? entry.byRarity[e.rarity || 'L'] : (entry.count > 0 ? entry.avg : null);
         if (!Number.isFinite(avg) || avg <= 0) return { skip: true, reason: 'no_cote', floor };
         /* Baisse par invendus (demande du 30/09) : on part du prix du marché ; toutes les N
            mises en vente sans acheteur, -Y % (cumulés) ; jamais sous le plancher payé + marge. */
@@ -716,7 +729,7 @@
             const price = (e.status === 'listed' && e.listedPrice ? ` · ${e.listedPrice} 💰` : '')
                 + (e.unsold ? ` <span style="color:#f97316;" title="Mises en vente sans acheteur">🔁${e.unsold}</span>` : '');
             return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:10px;border-bottom:1px solid rgba(255,255,255,0.04);">
-                <span style="color:#FFD700;font-weight:700;min-width:14px;">L</span>
+                <span style="color:${(RARITY[e.rarity || 'L'] || { color: '#888' }).color};font-weight:700;min-width:18px;">${esc(e.rarity || 'L')}</span>
                 <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;" title="${esc(e.title)}">${esc(e.title)}</span>
                 <span style="color:#888;white-space:nowrap;" title="Prix payé · plancher (payé + ${getSetting('legendResellMarginPct')} %)">payée ${e.paid} · min ${legendResellFloor(e.paid)}</span>
                 <span style="color:${col};white-space:nowrap;">${txt}${price}</span>
@@ -724,7 +737,7 @@
                     style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:9px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;">✕</button>`}
             </div>`;
         }).join('');
-        el.innerHTML = (rows || '<div style="color:#444;font-size:10px;">Aucune Légendaire gagnée à revendre pour l\'instant.</div>')
+        el.innerHTML = (rows || '<div style="color:#444;font-size:10px;">Aucun achat de la Chasse à revendre pour l\'instant.</div>')
             + (sold.length ? `<div style="font-size:9px;color:#888;margin-top:3px;">${sold.length} revendue(s) · bilan <b style="color:${gain >= 0 ? '#4ade80' : '#ef4444'};">${gain >= 0 ? '+' : ''}${gain} 💰</b></div>` : '');
         el.querySelectorAll('[data-wm-lresell-drop]').forEach(b => {
             b.onclick = () => {
@@ -1344,6 +1357,11 @@
         legendHuntMaxPrice:    'wm_legend_hunt_max',
         legendHuntWindowSec:   'wm_legend_hunt_window',
         legendHuntReserve:     'wm_legend_hunt_reserve',
+        optiHuntEnabled:       'wm_opti_hunt',
+        optiRarities:          'wm_opti_rarities',
+        optiMaxPct:            'wm_opti_max_pct',
+        optiMinGain:           'wm_opti_min_gain',
+        optiMaxBid:            'wm_opti_max_bid',
         legendResellEnabled:   'wm_legend_resell_on',
         legendResellSince:     'wm_legend_resell_since',
         legendResellMarginPct: 'wm_legend_resell_margin',
@@ -1413,6 +1431,11 @@
         legendHuntMaxPrice:    10,        // …tant que la mise reste ≤ ce montant (riposte comprise)
         legendHuntWindowSec:   20,        // …dans les N dernières secondes
         legendHuntReserve:     500,       // …sans jamais faire descendre le solde sous ce montant (0 = pas de réserve)
+        optiHuntEnabled:       false,     // Chasse opti : miser en fin d'enchère sur les cartes bien sous leur cote
+        optiRarities:          'L,UR,SR', // …raretés surveillées
+        optiMaxPct:            60,        // …tant que la mise reste ≤ ce % de la cote
+        optiMinGain:           20,        // …et au moins ce gain (cote − mise)
+        optiMaxBid:            200,       // …et jamais au-delà de ce montant, quelle que soit la cote
         legendResellEnabled:   false,     // mode « Chasse + Revente » : les L gagnées sont remises en vente
         legendResellSince:     0,         // …seulement celles gagnées après cette date (activation du mode)
         legendResellMarginPct: 50,        // …jamais sous le prix payé + ce % (plancher)
@@ -3699,7 +3722,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
 
         // 1 bis) De quoi payer la mise (et, pour la Chasse, sans entamer la réserve).
-        const reserve = contexte === 'Chasse Légendaire' ? getSetting('legendHuntReserve') : 0;
+        const reserve = (contexte === 'Chasse Légendaire' || contexte === 'Chasse opti') ? getSetting('legendHuntReserve') : 0;
         if (!balanceAllows(auction, plannedAmount, reserve)) return false;
 
         // 2) Plafond de prix global — jamais dépassé, quel que soit le mot-clé.
@@ -5831,10 +5854,88 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
     }
 
+    /* ── 🎯 CHASSE OPTI ──
+       Demande du 30/09 : « le but est de faire de l'argent » — repérer les enchères qui
+       finissent bientôt, comparer à la cote du marché, et miser si la cote est bien au-dessus.
+       Choix de l'utilisateur : raretés cochées, mise ≤ 60 % de la cote, gain ≥ 20 💰, et une
+       mise max absolue (pas d'énorme somme, quelle que soit la cote). Même moteur de tir que
+       la Chasse L (hot lane, riposte), avec un plafond PAR ENCHÈRE :
+           plafond = min(cote × %, cote − gain min, mise max).
+       La cote se lit carte par carte : au plus 12 nouvelles par passage, jamais pendant une
+       pause imposée par le site. Jamais sur mes propres ventes. */
+    function optiRarities() {
+        return String(getSetting('optiRarities') || '').toUpperCase().split(/[,\s]+/).filter(r => RARITY[r]);
+    }
+    async function discoverOpti() {
+        if (!getSetting('optiHuntEnabled') || !marketWatcherActive) return;
+        for (const [id, e] of [...legendHunt.entries()]) {
+            if (e.kind !== 'opti') continue;
+            const hit = activeHitsMap.get(id);
+            const end = hit ? auctionEndMs(hit.auction) : NaN;
+            if (!Number.isFinite(end) || serverNow() - end > 30000) forgetLegend(id);
+        }
+        const rars = optiRarities();
+        if (!rars.length) return;
+        const pct = Math.min(100, Math.max(1, getSetting('optiMaxPct'))) / 100;
+        const minGain = Math.max(0, getSetting('optiMinGain'));
+        const maxBid = Math.max(1, getSetting('optiMaxBid'));
+        const found = [];
+        for (const r of rars) {
+            for (let p = 1; p <= 2; p++) {
+                let d;
+                try { d = await fetchMarketPage(p, '', 'ending_soon', 'rarity=' + r); } catch (e) { return; }
+                const list = (d && d.auctions) || [];
+                found.push(...list);
+                if (!list.length || list.some(a => !isAuctionOver(a) && auctionEndMs(a) - serverNow() > LEGEND_LOOKAHEAD_MS)) break;
+                const more = (d && typeof d.hasMore === 'boolean') ? d.hasMore : list.length >= MARKET_PAGE_LIMIT;
+                if (!more) break;
+                await new Promise(res => setTimeout(res, MARKET_BATCH_PAUSE_MS));
+            }
+        }
+        const cands = [], seen = new Set();
+        for (const a of found) {
+            if (!a || !a.id || seen.has(a.id) || legendHunt.has(a.id)) continue;
+            seen.add(a.id);
+            const rar = (a.card?.rarity || '').toUpperCase();
+            if (!rars.includes(rar) || isAuctionOver(a)) continue;   // filtre refait ici : le site peut ignorer rarity=
+            const remaining = auctionEndMs(a) - serverNow();
+            if (!(remaining <= LEGEND_LOOKAHEAD_MS)) continue;
+            if (isSelf(a.seller?.username) || isSelf(a.seller_username)) continue;   // mes propres ventes
+            const next = minNextBid(a);
+            if (!(next <= maxBid)) continue;
+            cands.push({ a, rar, next, remaining, cardId: a.card?.id || a.card_id });
+        }
+        let budget = 12;
+        const need = cands.filter(c => c.cardId && !getCachedSales(c.cardId) && !salesFetchBlocked(c.cardId));
+        for (let i = 0; i < need.length && budget > 0; i += 4) {
+            if (Date.now() < salesEndpointCooldownUntil) break;
+            const grp = need.slice(i, i + Math.min(4, budget));
+            budget -= grp.length;
+            await Promise.all(grp.map(c => fetchCardSales(c.cardId).catch(() => null)));
+        }
+        for (const c of cands) {
+            const entry = c.cardId ? getCachedSales(c.cardId) : null;
+            if (!entry) continue;
+            const cote = entry.byRarity ? entry.byRarity[c.rar] : (entry.count > 0 ? entry.avg : null);
+            if (!Number.isFinite(cote) || cote <= 0) continue;
+            const cap = Math.min(Math.floor(cote * pct), Math.floor(cote - minGain), maxBid);
+            if (!(c.next <= cap)) continue;
+            const hadCap = autoBidMaxMap.has(c.a.id);
+            if (!hadCap) { autoBidMaxMap.set(c.a.id, cap); saveAutoBidMax(); }
+            const title = c.a.card?.wikipedia_title || '?';
+            legendHunt.set(c.a.id, { title, setCap: !hadCap, cap, kind: 'opti', rarity: c.rar, cote });
+            activeHitsMap.set(c.a.id, { auction: c.a, endAt: c.a.end_at });
+            wmLog(`🎯 Opportunité : <b>${esc(title)}</b> [${esc(c.rar)}] — mise min ${c.next} 💰 pour une cote de ${cote} 💰 · mise jusqu'à ${cap} 💰 dans les ${getSetting('legendHuntWindowSec')} dernières secondes (fin dans ${Math.round(c.remaining / 1000)} s)`);
+            warnAutoBidsPaused('la Chasse opti');
+        }
+    }
+    window.wmDiscoverOpti = () => discoverOpti();
+
     function startLegendHunt() {
         stopLegendHunt();
         const tick = async () => {
             try { await discoverLegends(); } catch (e) {}
+            try { await discoverOpti(); } catch (e) {}
             if (!marketWatcherActive) return;
             legendHuntTimer = setTimeout(tick, 15000 * marketThrottleFactor);
         };
@@ -5921,25 +6022,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 && !(legendEntry.failAt && Date.now() - legendEntry.failAt < 2000)) {
                 const remaining = endTs - serverNow();
                 const windowMs = (getSetting('legendHuntWindowSec') + 1) * 1000;
-                const maxL = getSetting('legendHuntMaxPrice');
+                // Chasse opti : plafond propre à l'enchère (calculé sur la cote) ; Chasse L : max fixe.
+                const opti = legendEntry.kind === 'opti';
+                const maxL = opti ? legendEntry.cap : getSetting('legendHuntMaxPrice');
+                const ctxL = opti ? 'Chasse opti' : 'Chasse Légendaire';
+                const icoL = opti ? '🎯' : '👑';
+                const rarL = (a.card?.rarity || legendEntry.rarity || 'L').toUpperCase();
                 if (remaining <= 0) { forgetLegend(a.id); }
                 else if (remaining <= windowMs && remaining > 1200 && !iAmLeading(a) && wikibidousBalance > 0) {
                     const bidAmount = minNextBid(a);
-                    if (bidAmount <= maxL && autoBidAllowed(a, bidAmount, 'Chasse Légendaire')) {
+                    if (bidAmount <= maxL && autoBidAllowed(a, bidAmount, ctxL)) {
                         bidLockSet.add(a.id);
                         const tL = a.card?.wikipedia_title || '?';
                         try {
-                            const r = await placeBid(a, bidAmount, 'Chasse Légendaire');
+                            const r = await placeBid(a, bidAmount, ctxL);
                             if (r.ok) {
-                                wmLog(`👑 Chasse Légendaire : <b>${esc(tL)}</b> [L] → <span style="color:#fbbf24;">${r.amount} 💰</span> (fin dans ${Math.round(remaining / 1000)} s)${bidRetryNote(r)}`);
+                                markChasseBid(a.id);   // un achat de la Chasse : la Revente pourra le reprendre
+                                wmLog(`${icoL} ${ctxL} : <b>${esc(tL)}</b> [${esc(rarL)}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${opti ? ` <span style="color:#888;font-size:9px;">(cote ${legendEntry.cote} 💰)</span>` : ''} (fin dans ${Math.round(remaining / 1000)} s)${bidRetryNote(r)}`);
                                 fetchBalance().catch(() => {});
-                                sendToDiscord("👑 Chasse Légendaire : **" + tL + "** → **" + r.amount + " 💰**", 16766720, 'market');
+                                sendToDiscord(icoL + " " + ctxL + " : **" + tL + "** → **" + r.amount + " 💰**", 16766720, 'market');
                             } else {
                                 // Pas de rafale : 2 s avant de retenter (placeBid a déjà relancé).
                                 legendEntry.failAt = Date.now();
                                 wmLog(r.blocked
-                                    ? `👑 Chasse Légendaire : <b>${esc(tL)}</b> — on s'arrête, la mise suivante (${r.amount} 💰) dépasserait ton max ou une limite.`
-                                    : `⚠️ Chasse Légendaire échouée : <b>${esc(tL)}</b> · ${esc(r.reason)}`);
+                                    ? `${icoL} ${ctxL} : <b>${esc(tL)}</b> — on s'arrête, la mise suivante (${r.amount} 💰) dépasserait ton max ou une limite.`
+                                    : `⚠️ ${ctxL} échouée : <b>${esc(tL)}</b> · ${esc(r.reason)}`);
                             }
                         } catch (e) {
                             legendEntry.failAt = Date.now();
@@ -7245,7 +7352,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         lr.status = 'no_cote';
                         if (!lr.noCoteLogged) {
                             lr.noCoteLogged = true;
-                            wmLog(`👑 Revente Légendaire : <b>${esc(title)}</b> n'a aucune vente connue en L — pas mise en vente (recontrôle toutes les heures).`);
+                            wmLog(`👑 Revente Légendaire : <b>${esc(title)}</b> n'a aucune vente connue en ${esc(rarity)} — pas mise en vente (recontrôle toutes les heures).`);
                         }
                     } else {
                         lr.retryAt = Date.now() + 5 * 60 * 1000;
@@ -7343,8 +7450,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 invalidateSalesDetail();
                 const dec = priceInfo.decay ? ` · 📉 -${priceInfo.decay.totalPct} % après ${priceInfo.decay.unsold} invendu(s)` : '';
                 wmLog(`👑 Revente Légendaire : <b>${esc(title)}</b> mise en vente ${price} 💰 <span style="color:#888;font-size:9px;">(${priceInfo.floored
-                    ? `🛡️ moy. L ${priceInfo.avg} 💰${dec} → plancher ${priceInfo.floor} 💰`
-                    : `💹 moy. L ${priceInfo.avg} 💰${dec} · plancher ${priceInfo.floor} 💰`} · payée ${lr.paid} 💰)</span>`);
+                    ? `🛡️ moy. ${esc(rarity)} ${priceInfo.avg} 💰${dec} → plancher ${priceInfo.floor} 💰`
+                    : `💹 moy. ${esc(rarity)} ${priceInfo.avg} 💰${dec} · plancher ${priceInfo.floor} 💰`} · payée ${lr.paid} 💰)</span>`);
             } else if (success) {
                 consecutiveFailures = 0;
                 sold++;
@@ -8125,7 +8232,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const ready = legendResellReady();
                 if (!ready.length) {
                     const listed = legendResell.filter(e => e.status === 'listed').length;
-                    say(`<span style="color:#888;">👑 En attente d'une Légendaire gagnée${listed ? ` · ${listed} en vente` : ''}…</span>`);
+                    say(`<span style="color:#888;">🏷️ En attente d'un achat de la Chasse${listed ? ` · ${listed} en vente` : ''}…</span>`);
                     await sleep(30000);
                     continue;
                 }
@@ -10503,6 +10610,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <input id="wm-legend-reserve" type="number" min="0" step="50" title="La Chasse ne mise jamais si la mise ferait descendre ton solde sous ce montant. 0 = pas de réserve." style="width:50px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
                         <span>💰</span>
                     </div>
+                    <div id="wm-opti-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin:-4px 0 8px;padding-left:2px;font-size:10px;color:#888;"
+                        title="Chasse opti : mise en fin d'enchère sur les cartes vendues bien sous leur cote du marché (raretés cochées), pour les revendre plus cher. Plafond par enchère = le plus petit de : cote × %, cote − gain minimum, mise max. Même fenêtre et même réserve que la Chasse L ; soumise à « Mises auto », au plafond global et à la limite par heure.">
+                        <button id="wm-opti-btn" type="button" title="Chasse opti seule : achète les bonnes affaires, ne revend rien. Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">🎯 Chasse opti</button>
+                        <button id="wm-opti-resell-btn" type="button" title="Chasse opti + Revente : achète les bonnes affaires puis les remet en vente à la cote (jamais sous le prix payé + marge). Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">🎯 Chasse opti + Revente</button>
+                        <span id="wm-opti-rars" style="display:inline-flex;gap:3px;align-items:center;"></span>
+                        <span>· si ≤</span>
+                        <input id="wm-opti-pct" type="number" min="1" max="100" step="5" style="width:36px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(34,211,238,0.35);background:#0f0f13;color:#22d3ee;font-size:9px;text-align:center;">
+                        <span>% cote · gain ≥</span>
+                        <input id="wm-opti-gain" type="number" min="0" step="5" style="width:40px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(34,211,238,0.35);background:#0f0f13;color:#22d3ee;font-size:9px;text-align:center;">
+                        <span>💰 · mise max</span>
+                        <input id="wm-opti-max" type="number" min="1" step="10" title="Jamais une mise au-delà de ce montant, quelle que soit la cote." style="width:50px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(34,211,238,0.35);background:#0f0f13;color:#22d3ee;font-size:9px;text-align:center;">
+                        <span>💰</span>
+                    </div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
                         <div class="wm-lbl" id="wm-kw-label" style="margin:0;">Mots-clés (0)</div>
@@ -10593,7 +10715,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <div id="wm-set-aside"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px;flex-wrap:wrap;">
-                        <div class="wm-lbl" style="margin:0;color:#FFD700;" title="Mode à part du Trash Seller : s'active avec le bouton « 👑 Chasse + Revente » du Market Watcher.">👑 Revente Légendaire</div>
+                        <div class="wm-lbl" style="margin:0;color:#FFD700;" title="Mode à part du Trash Seller : revend les cartes achetées par une Chasse (L ou opti). S'active avec « … + Revente » ou « 🏷️ Revente seule » dans le Market Watcher.">🏷️ Revente (achats de la Chasse)</div>
                         <label style="display:inline-flex;align-items:center;gap:3px;font-size:9px;color:#888;"
                             title="Plancher : jamais vendue sous le prix payé + ce %. Prix de départ = moyenne L du marché si elle est plus haute.">
                             jamais sous payé +
@@ -11134,6 +11256,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const legendResellBtn = document.getElementById('wm-legend-resell-btn');
         const legendMax = document.getElementById('wm-legend-max');
         const legendWin = document.getElementById('wm-legend-window');
+        const optiBtn = document.getElementById('wm-opti-btn');
+        const optiResellBtn = document.getElementById('wm-opti-resell-btn');
+        const legendResellOnlyBtn = document.getElementById('wm-legend-resellonly-btn');
+        const forgetHunt = (kind) => {
+            for (const [id, e] of [...legendHunt.entries()]) if ((e.kind === 'opti') === (kind === 'opti')) forgetLegend(id);
+        };
         function setLegendHunt(on) {
             if (on === getSetting('legendHuntEnabled')) return;
             setSetting('legendHuntEnabled', on);
@@ -11142,65 +11270,114 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 warnAutoBidsPaused('la Chasse Légendaire');
                 if (marketWatcherActive) discoverLegends().catch(() => {});
             } else {
-                for (const id of [...legendHunt.keys()]) forgetLegend(id);
+                forgetHunt('legend');
                 wmLog('👑 Chasse Légendaire désactivée.');
             }
         }
+        function setOptiHunt(on) {
+            if (on === getSetting('optiHuntEnabled')) return;
+            setSetting('optiHuntEnabled', on);
+            if (on) {
+                wmLog(`🎯 Chasse opti ACTIVÉE : ${optiRarities().join(' / ') || 'aucune rareté cochée !'} · mise si ≤ <b>${getSetting('optiMaxPct')} %</b> de la cote, gain ≥ <b>${getSetting('optiMinGain')} 💰</b>, jamais plus de <b>${getSetting('optiMaxBid')} 💰</b>.${marketWatcherActive ? '' : ' Démarre le Market Watcher pour qu\'elle tourne.'}`);
+                warnAutoBidsPaused('la Chasse opti');
+                if (marketWatcherActive) discoverOpti().catch(() => {});
+            } else {
+                forgetHunt('opti');
+                wmLog('🎯 Chasse opti désactivée.');
+            }
+        }
+        /* Cinq modes exclusifs : 'hunt' (Chasse L), 'both' (Chasse L + Revente), 'opti',
+           'optiboth' (Chasse opti + Revente), 'resell' (Revente seule, pour tous les modes).
+           Passer de l'un à l'autre ne remet la date d'activation de la revente à zéro que si
+           la revente était arrêtée : elle garde sa file et continue d'y ajouter les achats
+           de la Chasse. */
+        function currentLegendMode() {
+            const h = getSetting('legendHuntEnabled'), o = getSetting('optiHuntEnabled'), r = getSetting('legendResellEnabled');
+            if (o) return r ? 'optiboth' : 'opti';
+            if (h) return r ? 'both' : 'hunt';
+            return r ? 'resell' : 'off';
+        }
+        const RESELL_MODES = new Set(['both', 'optiboth', 'resell']);
         function paintLegendModes() {
-            const hunt = getSetting('legendHuntEnabled');
-            const resell = getSetting('legendResellEnabled');
-            const paint = (btn, on, paused) => {
+            const mode = currentLegendMode();
+            const paint = (btn, on, paused, col) => {
                 if (!btn) return;
-                btn.style.color = on ? (paused ? '#fbbf24' : '#0f0f13') : '#FFD700';
-                btn.style.background = on ? (paused ? 'rgba(251,191,36,0.12)' : '#FFD700') : 'rgba(255,215,0,0.06)';
-                btn.style.border = `1px solid ${on ? (paused ? '#fbbf24' : '#FFD700') : 'rgba(255,215,0,0.35)'}`;
+                btn.style.color = on ? (paused ? '#fbbf24' : '#0f0f13') : col;
+                btn.style.background = on ? (paused ? 'rgba(251,191,36,0.12)' : col) : 'rgba(255,255,255,0.03)';
+                btn.style.border = `1px solid ${on ? (paused ? '#fbbf24' : col) : 'rgba(255,255,255,0.18)'}`;
                 btn.style.fontWeight = on ? '700' : '400';
             };
-            const onlyBtn = document.getElementById('wm-legend-resellonly-btn');
-            const mark = legendResellRunning ? ' ✓' : ' ⏸';
-            paint(legendHuntBtn, hunt && !resell, false);
-            paint(legendResellBtn, hunt && resell, resell && !legendResellRunning);
-            paint(onlyBtn, !hunt && resell, resell && !legendResellRunning);
-            if (legendHuntBtn) legendHuntBtn.innerText = hunt && !resell ? '👑 Chasse ✓' : '👑 Chasse';
-            if (legendResellBtn) legendResellBtn.innerText = '👑 Chasse + Revente' + (hunt && resell ? mark : '');
-            if (onlyBtn) onlyBtn.innerText = '🏷️ Revente seule' + (!hunt && resell ? mark : '');
+            const mark = (m) => mode !== m ? '' : (RESELL_MODES.has(m) ? (legendResellRunning ? ' ✓' : ' ⏸') : ' ✓');
+            const paused = !legendResellRunning;
+            [[legendHuntBtn, 'hunt', '👑 Chasse', '#FFD700'], [legendResellBtn, 'both', '👑 Chasse + Revente', '#FFD700'],
+             [optiBtn, 'opti', '🎯 Chasse opti', '#22d3ee'], [optiResellBtn, 'optiboth', '🎯 Chasse opti + Revente', '#22d3ee'],
+             [legendResellOnlyBtn, 'resell', '🏷️ Revente seule', '#4ade80']].forEach(([btn, m, label, col]) => {
+                paint(btn, mode === m, RESELL_MODES.has(m) && paused, col);
+                if (btn) btn.innerText = label + mark(m);
+            });
             const st = document.getElementById('wm-lresell-status');
-            if (st && !legendResellRunning) st.innerHTML = resell
+            if (st && !legendResellRunning) st.innerHTML = getSetting('legendResellEnabled')
                 ? '<span style="color:#fbbf24;">⏸️ Revente en pause (rechargement de la page) — clique le bouton marqué ⏸ dans le Market Watcher pour reprendre.</span>'
-                : '<span style="color:#555;">Inactive — boutons « 👑 Chasse + Revente » ou « 🏷️ Revente seule » du Market Watcher.</span>';
-        }
-        /* Trois modes exclusifs : 'hunt' (Chasse), 'both' (Chasse + Revente), 'resell'
-           (Revente seule). Passer de l'un à l'autre ne remet la date d'activation de la
-           revente à zéro que si la revente était arrêtée : « Chasse + Revente » → « Revente
-           seule » garde toutes les L déjà en file ET continue d'y ajouter les suivantes. */
-        function currentLegendMode() {
-            const h = getSetting('legendHuntEnabled'), r = getSetting('legendResellEnabled');
-            return h && r ? 'both' : h ? 'hunt' : r ? 'resell' : 'off';
+                : '<span style="color:#555;">Inactive — boutons « … + Revente » ou « 🏷️ Revente seule » du Market Watcher.</span>';
         }
         function setLegendMode(mode) {
             const wantHunt = mode === 'hunt' || mode === 'both';
-            const wantResell = mode === 'resell' || mode === 'both';
+            const wantOpti = mode === 'opti' || mode === 'optiboth';
+            const wantResell = RESELL_MODES.has(mode);
             const hadResell = getSetting('legendResellEnabled');
             if (wantResell && !hadResell) setSetting('legendResellSince', Date.now()); // « à partir de maintenant »
             setSetting('legendResellEnabled', wantResell);
             if (wantResell) startLegendResell(mode === 'resell' ? 'revente seule, la Chasse n\'achète plus' : '');
-            else if (hadResell) { stopLegendResell(); wmLog('👑 Revente Légendaire arrêtée.'); }
+            else if (hadResell) { stopLegendResell(); wmLog('🏷️ Revente arrêtée.'); }
             setLegendHunt(wantHunt);
+            setOptiHunt(wantOpti);
             paintLegendModes();
         }
         function clickLegendMode(mode) {
             if (currentLegendMode() === mode) {
                 // Mode déjà actif mais revente en pause (rechargement) → le clic la relance.
-                if (mode !== 'hunt' && !legendResellRunning) { startLegendResell('reprise'); paintLegendModes(); return; }
+                if (RESELL_MODES.has(mode) && !legendResellRunning) { startLegendResell('reprise'); paintLegendModes(); return; }
                 setLegendMode('off');
                 return;
             }
             setLegendMode(mode);
         }
-        const legendResellOnlyBtn = document.getElementById('wm-legend-resellonly-btn');
         if (legendHuntBtn) legendHuntBtn.onclick = () => clickLegendMode('hunt');
         if (legendResellBtn) legendResellBtn.onclick = () => clickLegendMode('both');
+        if (optiBtn) optiBtn.onclick = () => clickLegendMode('opti');
+        if (optiResellBtn) optiResellBtn.onclick = () => clickLegendMode('optiboth');
         if (legendResellOnlyBtn) legendResellOnlyBtn.onclick = () => clickLegendMode('resell');
+        // Raretés de la Chasse opti : une case par rareté.
+        const optiRarsEl = document.getElementById('wm-opti-rars');
+        if (optiRarsEl) {
+            const on = new Set(optiRarities());
+            optiRarsEl.innerHTML = ['L', 'UR', 'SR', 'R', 'PC', 'C'].map(r =>
+                `<label style="display:inline-flex;align-items:center;gap:1px;cursor:pointer;color:${RARITY[r].color};font-weight:700;font-size:9px;">
+                    <input type="checkbox" data-wm-opti-rar="${r}" ${on.has(r) ? 'checked' : ''} style="width:11px;height:11px;margin:0;cursor:pointer;accent-color:${RARITY[r].color};">${r}</label>`).join('');
+            optiRarsEl.querySelectorAll('[data-wm-opti-rar]').forEach(cb => {
+                cb.onchange = () => {
+                    const list = [...optiRarsEl.querySelectorAll('[data-wm-opti-rar]')].filter(x => x.checked).map(x => x.getAttribute('data-wm-opti-rar'));
+                    setSetting('optiRarities', list.join(',') || ' ');
+                    wmLog(`🎯 Chasse opti : raretés ${list.join(' / ') || 'aucune'}`);
+                };
+            });
+        }
+        [['wm-opti-pct', 'optiMaxPct', 1, 100, v => `🎯 Chasse opti : mise si ≤ ${v} % de la cote`],
+         ['wm-opti-gain', 'optiMinGain', 0, 1000000, v => `🎯 Chasse opti : gain minimum ${v} 💰`],
+         ['wm-opti-max', 'optiMaxBid', 1, 100000000, v => `🎯 Chasse opti : jamais une mise au-delà de ${v} 💰`],
+        ].forEach(([id, key, min, max, msg]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.value = getSetting(key);
+            el.onchange = () => {
+                let v = parseInt(el.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS[key];
+                v = Math.min(max, Math.max(min, v));
+                el.value = v;
+                setSetting(key, v);
+                wmLog(msg(v));
+            };
+        });
         window.wmPaintLegendModes = paintLegendModes;
         const lresellMargin = document.getElementById('wm-lresell-margin');
         if (lresellMargin) {

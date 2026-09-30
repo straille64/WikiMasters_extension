@@ -47,7 +47,12 @@ const WON = [
   { id: 'w-c',   card: 'c-c',   title: 'L jamais vendue',  rar: 'L',  paid: 10,  recent: true },
   { id: 'w-e',   card: 'c-e',   title: 'L cotée en SR',    rar: 'L',  paid: 10,  recent: true },
   { id: 'w-d',   card: 'c-d',   title: 'SR gagnée',        rar: 'SR', paid: 5,   recent: true },
+  // Choix du 30/09 : seuls les achats de la CHASSE sont revendus.
+  { id: 'w-man', card: 'c-man', title: 'L achetée à la main', rar: 'L', paid: 10, recent: true },
+  { id: 'w-ur',  card: 'c-ur',  title: 'UR de la Chasse opti', rar: 'UR', paid: 100, recent: true },
 ];
+// Enchères où une Chasse a misé (toutes sauf l'achat à la main et la SR).
+const CHASSE_BIDS = ['w-old', 'w-a', 'w-b', 'w-c', 'w-e', 'w-ur'];
 const COTE = {
   'c-a': '{"summary":{"L":{"average":400}}}',
   'c-b': '{"summary":{"L":{"average":250}}}',
@@ -59,6 +64,8 @@ const COTE = {
   'c-del': '{"summary":{"L":{"average":500}}}',
   'c-dec': '{"summary":{"L":{"average":1000}}}',
   'c-flo': '{"summary":{"L":{"average":300}}}',
+  'c-man': '{"summary":{"L":{"average":400}}}',
+  'c-ur': '{"summary":{"UR":{"average":300}}}',
 };
 
 const page = await browser.newPage();
@@ -69,7 +76,8 @@ const tagWrites = [];    // écritures de tags (re-tag Trash interdit ici)
 const endedListings = new Set();
 
 await page.goto(origin + '/collection');
-await page.evaluate(() => {
+await page.evaluate((bids) => {
+  localStorage.setItem('wm_chasse_bids', JSON.stringify(bids));
   localStorage.setItem('wm_onboarding_done', '1');
   localStorage.setItem('wm_autobid_armed', '0');
   localStorage.setItem('wm_watchlist', '[]');
@@ -93,7 +101,7 @@ await page.evaluate(() => {
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   localStorage.setItem('sb-cyrxjeppjqsxxjayfrur-auth-token',
     JSON.stringify({ access_token: `eyJhbGciOiJIUzI1NiJ9.${payload}.sig` }));
-});
+}, CHASSE_BIDS);
 
 await page.route(new RegExp('^(?!' + origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')'), r => r.abort());
 await page.route('**/api/wikibidous**', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"balance":1000}' }));
@@ -199,6 +207,8 @@ if (of('c-c').length) problems.push('« L jamais vendue » mise en vente sans mo
 if (of('c-e').length) problems.push('« L cotée en SR » vendue sur une cote SR');
 if (of('c-old').length) problems.push("L gagnée AVANT l'activation remise en vente");
 if (of('c-d').length) problems.push('SR gagnée remise en vente');
+if (of('c-man').length) problems.push("L achetée à la main remise en vente (seuls les achats de la Chasse le sont)");
+if (!of('c-ur').length || of('c-ur')[0].price !== 300) problems.push(`UR achetée par la Chasse opti : ${of('c-ur').map(p => p.price).join(', ') || 'pas mise en vente'} au lieu de 300 (cote UR)`);
 if (of('c-a').length < 2) problems.push(`invendue non remise en vente (${of('c-a').length} mise(s) en vente de « L bien cotée »)`);
 else if (of('c-a')[1].price !== 400) problems.push(`remise en vente à ${of('c-a')[1].price} au lieu de 400`);
 if (!of('c-dec').length || of('c-dec')[0].price !== 900) problems.push(`3 invendus (1 palier de -10 %) : ${of('c-dec').map(p => p.price).join(', ') || 'pas mise en vente'} au lieu de 900`);
@@ -227,4 +237,4 @@ if (problems.length) {
   console.error('  — log :\n' + mid.log.split('\n').filter(l => /👑|❌|⚠/.test(l)).slice(0, 15).map(l => '      ' + l).join('\n'));
   process.exit(1);
 }
-console.log(`✅ moyenne L (400) · plancher payé +50 % (300 → 450) · sans cote / cote SR / ancienne / SR ignorées · invendue remise à 400 sans tag Trash · -10 % toutes les 2 invendues (1000 → 900) bornée au plancher (285) · restes nettoyés (vendue ailleurs, supprimée, retirée à la main) · boutons exclusifs (Revente seule garde la file)`);
+console.log(`✅ moyenne L (400) · plancher payé +50 % (300 → 450) · sans cote / cote SR / ancienne / achat à la main ignorés · UR de la Chasse opti revendue à sa cote UR · invendue remise à 400 sans tag Trash · -10 % toutes les 2 invendues (1000 → 900) bornée au plancher (285) · restes nettoyés (vendue ailleurs, supprimée, retirée à la main) · boutons exclusifs (Revente seule garde la file)`);

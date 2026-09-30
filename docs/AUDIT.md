@@ -1137,6 +1137,35 @@ plancher, elle était relistée au plancher indéfiniment.
 `tests/legend-resell.test.mjs` : 3 invendus → 1 palier → 900 (cote 1000) ; 20 invendus → borné au
 plancher 285 (payé 190 + 50 %). Mutation « pas de baisse » : échoue.
 
+### 52. 🎯 Chasse opti (achat-revente) et Revente limitée aux achats de la Chasse
+Demande du 30/09 : « le but est de faire de l'argent » — scruter les enchères qui finissent
+bientôt, comparer à la cote du marché, miser si elle est bien au-dessus ; boutons « Chasse opti »
+et « Chasse opti + Revente », « Revente seule » valable pour tous les modes. Choix de
+l'utilisateur : raretés à cocher, mise ≤ **60 %** de la cote, gain ≥ **20 💰**, et une **mise max**
+pour ne jamais engager d'énormes sommes ; la Revente ne reprend que **les achats de la Chasse**.
+
+**✅ Ajouté (1.3.13-fork.35)**
+
+- Ligne « 🎯 Chasse opti » dans le Market Watcher : deux boutons, cases L / UR / SR / R / PC / C
+  (L, UR, SR cochées par défaut), % de la cote, gain minimum, mise max (200 💰 par défaut).
+- `discoverOpti()` (toutes les 15 s avec le Market Watcher) : `rarity=X` trié par fin proche,
+  filtre de rareté refait côté bot, jamais mes propres ventes, cote de la rareté de l'annonce
+  (au plus 12 nouvelles cotes par passage, rien pendant une pause imposée par le site).
+  Plafond par enchère = min(cote × %, cote − gain, mise max) ; journal « 🎯 Opportunité ».
+- Tir et riposte : même moteur que la Chasse L (hot lane, fenêtre et réserve communes), avec le
+  plafond propre à l'enchère ; contrôles habituels (mises auto armées, solde, réserve, plafond
+  global, limite horaire).
+- Cinq modes exclusifs : Chasse, Chasse + Revente, Chasse opti, Chasse opti + Revente, Revente
+  seule.
+- Revente : ne reprend plus que les enchères où une Chasse a misé (`wm_chasse_bids`), toutes
+  raretés, à la cote de la rareté de la carte. Un achat à la main n'est jamais revendu. Section
+  renommée « 🏷️ Revente (achats de la Chasse) ».
+
+Tests : `opti-hunt` (plafond 200 : 110 → 165 puis arrêt ; SR 22 ; gain trop faible, mise max,
+ma propre vente, rareté décochée ignorés ; mutations « sans mise max », « sans filtre de
+rareté », « sans exclusion de mes ventes » : échouent) et `legend-resell` (achat à la main
+ignoré, UR de la Chasse opti revendue à sa cote UR).
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
