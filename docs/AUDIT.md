@@ -1032,6 +1032,28 @@ pour les autres, rien avant le clic, l'invendue remise à 400 sans écriture de 
 exclusifs. Mutations « plancher ignoré » et « date d'activation ignorée » : échouent. La priorité
 sur le Trash Seller n'a pas de test dédié.
 
+### 47. Revente Légendaire : des cartes plus possédées ou plus en vente restaient listées
+Retour du 30/09 (capture + logs) : « Catherine Ceylac — en vente · 203 » alors que l'utilisateur
+l'avait retirée de la vente à la main (00:19:43), et « Hélène Mercier-Arnault — à vendre » alors
+qu'il ne la possède plus. La file ne se fiait qu'à ses propres événements : un retrait manuel ou
+une vente hors du bot ne la mettait jamais à jour.
+
+**✅ Corrigé (1.3.13-fork.30)**
+
+- Retrait manuel (✕ d'une vente active) d'une vente de la revente → la carte sort de la revente.
+- `reconcileLegendResell()` (au chargement de la page, puis toutes les 2 min pendant la revente) :
+  annonce disparue → sortie ; vendue → bilan ; terminée sans acheteur → à relister ; carte « à
+  vendre » ou « sans cote » absente de `user_cards` (10 min après la victoire) → sortie.
+- La liste n'affiche plus que les statuts vivants (à vendre, en vente, pas de cote).
+
+Au passage, sur les mêmes logs :
+- « Mise trop basse (minimum 97) » : si le site annonce comme minimum le montant qu'on vient
+  d'envoyer, la relance part à +1 (il veut strictement plus) — toujours sous les plafonds ;
+- l'arrêt au max de la Chasse n'est plus journalisé comme un « échec ».
+
+`tests/legend-resell.test.mjs` rejoue les trois restes (vendue ailleurs, supprimée sur le site,
+retirée à la main) ; la version précédente échoue sur les quatre contrôles ajoutés.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

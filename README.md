@@ -76,7 +76,7 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   fin, riposte jusqu'au max puis arrêt, L trop chère ignorée, rien en pause.
 - `tests/legend-resell.test.mjs` : Revente Légendaire — L gagnées après l'activation remises
   en vente à la moyenne L, jamais sous payé + 50 %, sans cote ignorées, invendue relistée
-  sans tag Trash.
+  sans tag Trash, restes nettoyés (vendue ailleurs, vente supprimée, retrait manuel).
 - `tests/market-filters.test.mjs` : vérifie que les filtres rareté et mot-clé se
   cumulent, sont réversibles, et que le bouton de vidage vide bien la liste.
 - `tests/market-server-search.test.mjs` : vérifie que le scan interroge `q=`, suit sa
@@ -181,6 +181,7 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       prix max (audit #45)
 - [x] Revente Légendaire : les L gagnées remises en vente à la moyenne du marché, jamais
       sous le prix payé + marge ; boutons « Chasse » / « Chasse + Revente » (audit #46)
+- [x] Revente Légendaire : liste synchronisée avec le site (retraits, ventes hors bot) (audit #47)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.29
+// @version      1.3.13-fork.30
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.29';
+    const WM_VERSION = '1.3.13-fork.30';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -614,6 +614,8 @@
     const LEGEND_RESELL_KEY = 'wm_legend_resell';
     const LEGEND_NO_COTE_RECHECK_MS = 60 * 60 * 1000;
     let legendResellRunning = false;   // boucle de mise en vente active dans CET onglet
+    const LEGEND_RESELL_LIVE = new Set(['waiting', 'listed', 'no_cote']);
+    const LEGEND_OWN_GRACE_MS = 10 * 60 * 1000; // une L tout juste gagnée peut tarder à arriver
     let legendResell = [];
     try {
         const raw = JSON.parse(localStorage.getItem(LEGEND_RESELL_KEY) || '[]');
@@ -692,7 +694,7 @@
     function renderLegendResell() {
         const el = document.getElementById('wm-lresell-list');
         if (!el) return;
-        const live = legendResell.filter(e => e.status !== 'removed' && e.status !== 'sold');
+        const live = legendResell.filter(e => LEGEND_RESELL_LIVE.has(e.status));
         const sold = legendResell.filter(e => e.status === 'sold');
         const gain = sold.reduce((s, e) => s + ((e.soldPrice || 0) - (e.paid || 0)), 0);
         const label = { waiting: ['⏳ à vendre', '#fbbf24'], listed: ['🏷️ en vente', '#4ade80'], no_cote: ['📋 pas de cote', '#888'] };
@@ -3731,8 +3733,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // compte, même après ce passage.
             const curAtRefusal = a.current_bid ?? null;
             if (res && !res.ok && BID_STALE_RE.test(String(lastErr))) {
-                const told = minBidFromRefusal(data, lastErr, amt);
-                if (told > amt) learnedMinBid.set(a.id, { cur: curAtRefusal, amount: told });
+                const told = minBidFromRefusal(data, lastErr, amt - 1);
+                // « minimum 97 » alors qu'on a misé 97 : le site veut strictement plus.
+                if (told >= amt) learnedMinBid.set(a.id, { cur: curAtRefusal, amount: told > amt ? told : amt + 1 });
             }
             if (attempt === BID_RETRY_MAX) break;
 
@@ -5870,7 +5873,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             } else {
                                 // Pas de rafale : 2 s avant de retenter (placeBid a déjà relancé).
                                 legendEntry.failAt = Date.now();
-                                wmLog(`⚠️ Chasse Légendaire échouée : <b>${esc(tL)}</b> · ${esc(r.reason)}`);
+                                wmLog(r.blocked
+                                    ? `👑 Chasse Légendaire : <b>${esc(tL)}</b> — on s'arrête, la mise suivante (${r.amount} 💰) dépasserait ton max ou une limite.`
+                                    : `⚠️ Chasse Légendaire échouée : <b>${esc(tL)}</b> · ${esc(r.reason)}`);
                             }
                         } catch (e) {
                             legendEntry.failAt = Date.now();
@@ -6607,6 +6612,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     : '';
                 wmLog(`🚫 Carte retirée manuellement de la vente : <b>${label}</b>${remainingFrag}`);
                 invalidateSalesDetail(); // la vente annulée doit disparaître immédiatement
+                // Vente de la Revente Légendaire retirée à la main : c'est un choix de
+                // l'utilisateur → elle sort de la revente (sinon elle restait « en vente »).
+                const lrc = legendResellByListing(auctionId);
+                if (lrc) {
+                    lrc.status = 'removed';
+                    lrc.listedAuctionId = null;
+                    saveLegendResell();
+                    renderLegendResell();
+                    wmLog(`👑 Revente Légendaire : <b>${esc(lrc.title)}</b> retirée de la revente (tu l'as retirée de la vente — le bot ne la remettra pas).`);
+                }
                 // Purge l'entrée de sellHistory pour bloquer le retag auto
                 const before = sellHistory.length;
                 sellHistory = sellHistory.filter(s => s.auctionId !== auctionId);
@@ -7856,6 +7871,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (Date.now() - lastSync > 60000) { lastSync = Date.now(); await syncWonAuctions().catch(() => {}); }
                 await checkSellHistoryResults();
                 await reviewStaleLegendListings();
+                await reconcileLegendResell();
                 if (!legendResellRunning) break;
                 const ready = legendResellReady();
                 if (!ready.length) {
@@ -7897,6 +7913,67 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             legendResellSettled({ legend: e.wonAuctionId, price: e.listedPrice }, !back, null);
         }
     }
+    /* La liste ne doit montrer que du VRAI : une L vendue ou cédée hors du bot, ou une vente
+       supprimée sur le site, y restait indéfiniment (« à vendre », « en vente »).
+         · en vente : l'annonce existe-t-elle encore ? vendue → bilan ; disparue (retirée à la
+           main) → sort de la liste ; terminée sans acheteur → à relister ;
+         · à vendre / sans cote : la carte est-elle encore dans la collection ? (délai de grâce
+           après la victoire, le temps qu'elle arrive). */
+    let _lrReconcileAt = 0, _lrReconcileRunning = false;
+    async function reconcileLegendResell(force) {
+        if (_lrReconcileRunning) return;
+        if (!force && Date.now() - _lrReconcileAt < 2 * 60 * 1000) return;
+        if (!legendResell.some(e => LEGEND_RESELL_LIVE.has(e.status))) return;
+        const uid = currentUserId();
+        if (!uid) return;
+        _lrReconcileRunning = true;
+        _lrReconcileAt = Date.now();
+        let changed = false;
+        try {
+            const listed = legendResell.filter(e => e.status === 'listed' && e.listedAuctionId);
+            if (listed.length) {
+                const byId = await fetchAuctionsByIds(listed.map(e => e.listedAuctionId));
+                if (byId) for (const e of listed) {
+                    const row = byId.get(e.listedAuctionId);
+                    if (auctionRowStillActive(row)) continue;
+                    if (row && auctionRowSettledSold(row)) {
+                        legendResellSettled({ legend: e.wonAuctionId, price: e.listedPrice }, true, row.final_price);
+                        continue;
+                    }
+                    if (!row) {
+                        e.status = 'removed';
+                        e.listedAuctionId = null;
+                        changed = true;
+                        wmLog(`👑 Revente Légendaire : la vente de <b>${esc(e.title)}</b> n'existe plus sur le site (retirée à la main ?) — sortie de la revente.`);
+                        continue;
+                    }
+                    legendResellSettled({ legend: e.wonAuctionId, price: e.listedPrice }, false);
+                }
+            }
+            const now = Date.now();
+            const check = legendResell.filter(e => (e.status === 'waiting' || e.status === 'no_cote')
+                && now - (e.wonAt || 0) > LEGEND_OWN_GRACE_MS);
+            if (check.length) {
+                const ids = [...new Set(check.map(e => e.cardId))];
+                const rows = await supabaseSelect(`user_cards?user_id=eq.${uid}&card_id=in.(${ids.join(',')})&select=card_id`);
+                if (Array.isArray(rows)) {   // null = illisible → on ne tranche pas
+                    const owned = new Set(rows.map(r => r.card_id));
+                    for (const e of check) {
+                        if (owned.has(e.cardId)) continue;
+                        e.status = 'gone';
+                        changed = true;
+                        wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> n'est plus dans ta collection — sortie de la revente.`);
+                    }
+                }
+            }
+        } catch (e) {
+        } finally {
+            _lrReconcileRunning = false;
+            if (changed) { saveLegendResell(); renderLegendResell(); }
+        }
+    }
+    window.wmReconcileLegendResell = () => reconcileLegendResell(true);
+
     function startLegendResell(reason) {
         if (legendResellRunning) return;
         legendResellRunning = true;
@@ -10847,6 +10924,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         renderLegendResell();
         paintLegendModes();
+        // Nettoie la liste au chargement, même revente arrêtée (cartes vendues ailleurs…).
+        setTimeout(() => { reconcileLegendResell(true).catch(() => {}); }, 8000);
         [[legendMax, 'legendHuntMaxPrice', 1, 1000000, v => `👑 Chasse Légendaire : maximum ${v} 💰`],
          [legendWin, 'legendHuntWindowSec', 3, 120, v => `👑 Chasse Légendaire : fenêtre de ${v} s avant la fin`],
         ].forEach(([el, key, min, max, msg]) => {

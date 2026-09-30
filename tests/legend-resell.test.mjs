@@ -55,6 +55,8 @@ const COTE = {
   'c-e': '{"summary":{"SR":{"average":100}}}',
   'c-old': '{"summary":{"L":{"average":999}}}',
   'c-d': '{"summary":{"SR":{"average":999}}}',
+  'c-gone': '{"summary":{"L":{"average":500}}}',
+  'c-del': '{"summary":{"L":{"average":500}}}',
 };
 
 const page = await browser.newPage();
@@ -70,6 +72,15 @@ await page.evaluate(() => {
   localStorage.setItem('wm_autobid_armed', '0');
   localStorage.setItem('wm_watchlist', '[]');
   localStorage.setItem('wm_max_active_sales', '5');
+  // Restes d'une session précédente (retour du 30/09) : une L vendue hors du bot, et une
+  // vente de la revente supprimée directement sur le site.
+  localStorage.setItem('wm_legend_resell', JSON.stringify([
+    { wonAuctionId: 'w-gone', cardId: 'c-gone', title: 'L vendue ailleurs', paid: 150,
+      wonAt: Date.now() - 3600000, status: 'waiting', listings: 0 },
+    { wonAuctionId: 'w-del', cardId: 'c-del', title: 'L retirée sur le site', paid: 100,
+      wonAt: Date.now() - 3600000, status: 'listed', listedAuctionId: 'lst-del', listedPrice: 203,
+      listedAt: Date.now() - 60000, listedDuration: 180, listings: 1 },
+  ]));
   const payload = btoa(JSON.stringify({ sub: 'user-test-1', exp: 4102444800 }))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   localStorage.setItem('sb-cyrxjeppjqsxxjayfrur-auth-token',
@@ -83,6 +94,13 @@ await page.route('**/api/my-collection**', r => r.fulfill({ status: 200, content
 await page.route('**/rest/v1/**', route => {
   if (route.request().method() !== 'GET') tagWrites.push(route.request().url());
   return route.fulfill({ status: 200, contentType: 'application/json', body: '[]' });
+});
+// La collection : tout sauf « L vendue ailleurs ».
+await page.route('**/rest/v1/user_cards**', route => {
+  const m = decodeURIComponent(route.request().url()).match(/card_id=in\.\(([^)]*)\)/);
+  const ids = m ? m[1].split(',') : [];
+  return route.fulfill({ status: 200, contentType: 'application/json',
+    body: JSON.stringify(ids.filter(id => id !== 'c-gone').map(card_id => ({ card_id }))) });
 });
 await page.route('**/rest/v1/auctions**', route => {
   const url = decodeURIComponent(route.request().url());
@@ -130,11 +148,15 @@ await page.waitForTimeout(800);
 // Rien ne doit partir avant le clic.
 const before = posts.length;
 await page.evaluate(() => document.getElementById('wm-legend-resell-btn').click());
-await page.waitForTimeout(24000);
+await page.waitForTimeout(14000);
+// L'utilisateur retire à la main la vente de « L payée cher ».
+await page.evaluate(() => window.wmCancelSale('lst-c-b-0', 'L payée cher', null));
+await page.waitForTimeout(11000);
 
 const mid = await page.evaluate(() => ({
   hunt: localStorage.getItem('wm_legend_hunt'),
   resell: localStorage.getItem('wm_legend_resell_on'),
+  queue: JSON.parse(localStorage.getItem('wm_legend_resell') || '[]'),
   list: (document.getElementById('wm-lresell-list') || {}).textContent || '',
   log: [...document.querySelectorAll('.wm-log-e')].map(e => e.innerText).join('\n'),
 }));
@@ -161,6 +183,14 @@ if (of('c-old').length) problems.push("L gagnée AVANT l'activation remise en ve
 if (of('c-d').length) problems.push('SR gagnée remise en vente');
 if (of('c-a').length < 2) problems.push(`invendue non remise en vente (${of('c-a').length} mise(s) en vente de « L bien cotée »)`);
 else if (of('c-a')[1].price !== 400) problems.push(`remise en vente à ${of('c-a')[1].price} au lieu de 400`);
+const st = (id) => (mid.queue.find(e => e.wonAuctionId === id) || {}).status;
+if (of('c-gone').length) problems.push('« L vendue ailleurs » (plus dans la collection) remise en vente');
+if (st('w-gone') !== 'gone') problems.push(`« L vendue ailleurs » toujours dans la liste (${st('w-gone')})`);
+if (of('c-del').length) problems.push('vente supprimée sur le site relistée');
+if (st('w-del') !== 'removed') problems.push(`vente supprimée sur le site toujours « ${st('w-del')} »`);
+if (of('c-b').length > 1) problems.push('« L payée cher » relistée après le retrait manuel');
+if (st('w-b') !== 'removed') problems.push(`retrait manuel ignoré : « L payée cher » est « ${st('w-b')} »`);
+if (/L vendue ailleurs|L retirée sur le site|L payée cher/.test(mid.list)) problems.push(`la liste affiche encore des restes : ${mid.list.slice(0, 160)}`);
 if (tagWrites.length) problems.push(`écriture de tag pendant la revente (re-tag Trash ?) : ${tagWrites.join(', ')}`);
 if (mid.hunt !== 'true' || mid.resell !== 'true') problems.push(`« Chasse + Revente » n'active pas les deux (chasse ${mid.hunt}, revente ${mid.resell})`);
 if (after.hunt !== 'true' || after.resell !== 'false') problems.push(`« Chasse » seule : chasse ${after.hunt}, revente ${after.resell}`);
@@ -175,4 +205,4 @@ if (problems.length) {
   console.error('  — log :\n' + mid.log.split('\n').filter(l => /👑|❌|⚠/.test(l)).slice(0, 15).map(l => '      ' + l).join('\n'));
   process.exit(1);
 }
-console.log(`✅ moyenne L (400) · plancher payé +50 % (300 → 450) · sans cote / cote SR / ancienne / SR ignorées · invendue remise à 400 sans tag Trash · boutons exclusifs`);
+console.log(`✅ moyenne L (400) · plancher payé +50 % (300 → 450) · sans cote / cote SR / ancienne / SR ignorées · invendue remise à 400 sans tag Trash · restes nettoyés (vendue ailleurs, supprimée, retirée à la main) · boutons exclusifs`);
