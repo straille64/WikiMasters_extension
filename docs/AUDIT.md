@@ -1166,6 +1166,12 @@ ma propre vente, rareté décochée ignorés ; mutations « sans mise max », «
 rareté », « sans exclusion de mes ventes » : échouent) et `legend-resell` (achat à la main
 ignoré, UR de la Chasse opti revendue à sa cote UR).
 
+### 53. Log déplacé sous le Pack Opener
+Demande du 30/09 (capture) : le log, en bas du Trash Seller, était à l'étroit alors que la colonne
+Pack Opener avait de la place. **1.3.13-fork.36** : le log (et « Export logs ») occupe désormais le
+bas du Pack Opener, sur toute la hauteur libre ; le bloc « Matchs mots-clés » du Pack Opener est
+retiré (`renderPackKwHits` ne fait plus rien sans son conteneur).
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

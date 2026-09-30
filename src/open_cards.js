@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.35';
+    const WM_VERSION = '1.3.13-fork.36';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10544,11 +10544,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <button id="wm-raz-btn" style="width:100%;margin-top:8px;padding:4px;border:1px solid rgba(239,68,68,0.3);border-radius:5px;background:rgba(239,68,68,0.05);color:#666;font-size:9px;cursor:pointer;letter-spacing:1px;text-transform:uppercase;flex-shrink:0;">⟳ Reset session</button>
                     <div id="wm-alert" style="margin-top:8px;font-size:11px;font-weight:600;flex-shrink:0;"></div>
                     <div class="wm-sep" style="flex-shrink:0;"></div>
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;flex-shrink:0;">
-                        <div class="wm-lbl" style="margin:0;">Matchs mots-clés</div>
-                        <span id="wm-pack-kw-count" style="font-size:9px;color:#888;font-family:monospace;">0</span>
+                    <!-- Log : déplacé ici depuis le Trash Seller (30/09) — la colonne Pack Opener a de la
+                         place libre, le log y gagne toute la hauteur. « Matchs mots-clés » retiré. -->
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;flex-shrink:0;">
+                        <div class="wm-lbl" style="margin:0;">Log</div>
+                        <button id="wm-log-export" title="Exporter le log en .txt"
+                            style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#aaa;font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;font-family:inherit;">
+                            Export logs 💾
+                        </button>
                     </div>
-                    <div id="wm-pack-kw-hits" style="flex:1;min-height:60px;overflow-y:auto;scrollbar-width:thin;"></div>
+                    <div id="wm-log" class="wm-log" style="min-height:240px;"></div>
                 </div>
             </div>
             <div class="wm-col-resizer" data-resizer="0" title="Glisser pour redimensionner"></div>
@@ -10715,15 +10720,6 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <div class="wm-sep"></div>
                     <div class="wm-lbl">Ventes (aujourd'hui)</div>
                     <div id="wm-sell-history" style="margin-bottom:8px;"></div>
-                    <div class="wm-sep"></div>
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                        <div class="wm-lbl" style="margin:0;">Log</div>
-                        <button id="wm-log-export" title="Exporter le log en .txt"
-                            style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#aaa;font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;font-family:inherit;">
-                            Export logs 💾
-                        </button>
-                    </div>
-                    <div id="wm-log" class="wm-log"></div>
                 </div>
             </div>
         </div>
