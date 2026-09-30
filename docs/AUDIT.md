@@ -1075,6 +1075,25 @@ scan. Rejoué : 7 mises refusées sur une seule enchère en 14 s.
 `tests/low-balance.test.mjs` : solde 50 pour une mise de 60 → aucune requête ; solde lu 1000 mais
 refus du site → une seule tentative. La version précédente envoie 7 mises refusées dans les deux cas.
 
+### 49. Réserve de la Chasse et mode « Revente seule »
+Demandes du 30/09 : une **réserve** (la Chasse ne fait jamais descendre le solde sous un montant),
+et pouvoir **arrêter seulement la Chasse** en gardant la revente des L déjà gagnées.
+
+**✅ Ajouté (1.3.13-fork.32)**
+
+- Réserve `legendHuntReserve`, **500 💰** par défaut (0 = aucune), champ « réserve » de la ligne
+  Chasse. Vérifiée dans `autoBidAllowed()` pour le contexte « Chasse Légendaire », donc aussi
+  sur les relances de `placeBid` après une surenchère simultanée. Journal : « 💸 Réserve : … ».
+- 3e bouton « 🏷️ Revente seule ». Les trois modes (Chasse, Chasse + Revente, Revente seule)
+  sont exclusifs ; passer de « Chasse + Revente » à « Revente seule » arrête les achats mais
+  garde la file et la date d'activation (les prochaines L gagnées, même à la main, y entrent
+  toujours). La date n'est remise à « maintenant » que si la revente était arrêtée.
+- Pas de tag à poser : la revente suit les victoires lues en base, pas un tag de collection.
+
+Tests : `low-balance` (solde 540, mise 60, réserve 500 → pas de mise ; mutation « réserve
+ignorée » : échoue) et `legend-resell` (Chasse + Revente → Revente seule : chasse coupée, revente
+en marche, date d'activation inchangée).
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

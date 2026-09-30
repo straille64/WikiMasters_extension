@@ -5,7 +5,8 @@
 // seul « solde > 0 » était vérifié ; la mise partait, le site refusait, et la Chasse
 // retentait toutes les 2 s (le Fourbe à chaque tick) jusqu'à la fin de l'enchère.
 //   A. solde lu = 50, mise nécessaire = 60 → aucune requête, et le journal dit pourquoi ;
-//   B. solde lu = 1000 mais le site répond « solde insuffisant » → une seule tentative.
+//   B. solde lu = 1000 mais le site répond « solde insuffisant » → une seule tentative ;
+//   C. solde 540, mise 60, réserve 500 (défaut) → 480 < 500 : pas de mise.
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
@@ -87,7 +88,7 @@ async function run({ balance }) {
 }
 
 const problems = [];
-const [A, B] = await Promise.all([run({ balance: 50 }), run({ balance: 1000 })]);
+const [A, B, C] = await Promise.all([run({ balance: 50 }), run({ balance: 1000 }), run({ balance: 540 })]);
 await browser.close();
 srv.close();
 
@@ -96,11 +97,13 @@ if (!/Solde insuffisant/.test(A.log)) problems.push('A. le journal ne dit pas qu
 if (!B.posts.length) problems.push("B. aucune tentative alors que le solde lu suffisait");
 if (B.posts.length > 1) problems.push(`B. ${B.posts.length} mises refusées envoyées en rafale (${B.posts.join(', ')} s avant la fin)`);
 if (!/Le site refuse la mise/.test(B.log)) problems.push('B. le refus pour solde insuffisant n\'est pas expliqué');
-for (const r of [A, B]) for (const e of r.errors) problems.push('erreur page : ' + e);
+if (C.posts.length) problems.push(`C. réserve 500 entamée : ${C.posts.length} mise(s) avec un solde de 540 pour 60`);
+if (!/Réserve/.test(C.log)) problems.push('C. le journal ne dit pas que la réserve bloque');
+for (const r of [A, B, C]) for (const e of r.errors) problems.push('erreur page : ' + e);
 
 if (problems.length) {
   console.error('❌ solde insuffisant :');
   for (const p of problems) console.error('  · ' + p);
   process.exit(1);
 }
-console.log(`✅ solde 50 < 60 → aucune mise, raison journalisée · refus « solde insuffisant » → ${B.posts.length} tentative, mises suspendues puis solde relu`);
+console.log(`✅ solde 50 < 60 → aucune mise, raison journalisée · refus « solde insuffisant » → ${B.posts.length} tentative, mises suspendues puis solde relu · réserve 500 respectée (540 − 60 < 500 → pas de mise)`);

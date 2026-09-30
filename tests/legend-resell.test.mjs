@@ -160,6 +160,16 @@ const mid = await page.evaluate(() => ({
   list: (document.getElementById('wm-lresell-list') || {}).textContent || '',
   log: [...document.querySelectorAll('.wm-log-e')].map(e => e.innerText).join('\n'),
 }));
+// « Revente seule » : la chasse s'arrête, la revente continue avec la même date d'activation.
+const sinceBefore = await page.evaluate(() => localStorage.getItem('wm_legend_resell_since'));
+await page.evaluate(() => document.getElementById('wm-legend-resellonly-btn').click());
+await page.waitForTimeout(300);
+const only = await page.evaluate(() => ({
+  hunt: localStorage.getItem('wm_legend_hunt'),
+  resell: localStorage.getItem('wm_legend_resell_on'),
+  since: localStorage.getItem('wm_legend_resell_since'),
+  running: /✓/.test(document.getElementById('wm-legend-resellonly-btn').innerText),
+}));
 // Bouton « Chasse » seul : la revente s'arrête, la chasse reste.
 await page.evaluate(() => document.getElementById('wm-legend-hunt-btn').click());
 await page.waitForTimeout(300);
@@ -193,6 +203,8 @@ if (st('w-b') !== 'removed') problems.push(`retrait manuel ignoré : « L payée
 if (/L vendue ailleurs|L retirée sur le site|L payée cher/.test(mid.list)) problems.push(`la liste affiche encore des restes : ${mid.list.slice(0, 160)}`);
 if (tagWrites.length) problems.push(`écriture de tag pendant la revente (re-tag Trash ?) : ${tagWrites.join(', ')}`);
 if (mid.hunt !== 'true' || mid.resell !== 'true') problems.push(`« Chasse + Revente » n'active pas les deux (chasse ${mid.hunt}, revente ${mid.resell})`);
+if (only.hunt !== 'false' || only.resell !== 'true' || !only.running) problems.push(`« Revente seule » : chasse ${only.hunt}, revente ${only.resell}, en marche ${only.running}`);
+if (only.since !== sinceBefore) problems.push("« Revente seule » a remis la date d'activation à zéro (les L déjà gagnées seraient oubliées)");
 if (after.hunt !== 'true' || after.resell !== 'false') problems.push(`« Chasse » seule : chasse ${after.hunt}, revente ${after.resell}`);
 if (!/pas de cote/.test(mid.list)) problems.push("la liste n'affiche pas les L sans cote");
 if (!/aucune vente connue en L/.test(mid.log)) problems.push("l'absence de cote n'est pas expliquée dans le journal");
@@ -205,4 +217,4 @@ if (problems.length) {
   console.error('  — log :\n' + mid.log.split('\n').filter(l => /👑|❌|⚠/.test(l)).slice(0, 15).map(l => '      ' + l).join('\n'));
   process.exit(1);
 }
-console.log(`✅ moyenne L (400) · plancher payé +50 % (300 → 450) · sans cote / cote SR / ancienne / SR ignorées · invendue remise à 400 sans tag Trash · restes nettoyés (vendue ailleurs, supprimée, retirée à la main) · boutons exclusifs`);
+console.log(`✅ moyenne L (400) · plancher payé +50 % (300 → 450) · sans cote / cote SR / ancienne / SR ignorées · invendue remise à 400 sans tag Trash · restes nettoyés (vendue ailleurs, supprimée, retirée à la main) · boutons exclusifs (Revente seule garde la file)`);

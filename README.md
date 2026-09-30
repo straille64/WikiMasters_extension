@@ -75,7 +75,7 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/legend-hunt.test.mjs` : Chasse Légendaire — mise minimale dans la fenêtre de
   fin, riposte jusqu'au max puis arrêt, L trop chère ignorée, rien en pause.
 - `tests/low-balance.test.mjs` : solde insuffisant — aucune mise auto au-delà du solde,
-  et une seule tentative quand le site refuse pour manque de fonds.
+  une seule tentative quand le site refuse pour manque de fonds, réserve de la Chasse.
 - `tests/legend-resell.test.mjs` : Revente Légendaire — L gagnées après l'activation remises
   en vente à la moyenne L, jamais sous payé + 50 %, sans cote ignorées, invendue relistée
   sans tag Trash, restes nettoyés (vendue ailleurs, vente supprimée, retrait manuel).
@@ -185,6 +185,7 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
       sous le prix payé + marge ; boutons « Chasse » / « Chasse + Revente » (audit #46)
 - [x] Revente Légendaire : liste synchronisée avec le site (retraits, ventes hors bot) (audit #47)
 - [x] Mises auto : jamais au-delà du solde, pas de rafale après un refus « solde insuffisant » (audit #48)
+- [x] Chasse : réserve de solde ; bouton « Revente seule » (audit #49)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 
