@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.32
+// @version      1.3.13-fork.33
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.32';
+    const WM_VERSION = '1.3.13-fork.33';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -7663,6 +7663,190 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return shuffled.slice(0, Math.max(0, slots));
     }
 
+    /* ═══════ 💎 CARTES LES PLUS CHÈRES (ma collection) ═══════
+       Demande du 30/09 : un bouton qui charge la cote de toutes mes cartes et les classe de la
+       plus chère à la moins chère. Choix de l'utilisateur : ma collection, top 50 + valeur
+       totale, filtre par rareté, cartes sans cote comptées à part.
+       Cote = celle de la surcouche Collection : la moyenne `?scope=summary` que le site donne
+       à tous, pour la rareté de MON exemplaire. Une requête par carte, cache partagé (le
+       2e calcul est quasi immédiat). Si le site freine (403/429), on attend la fin de la pause
+       et on reprend, plutôt que d'insister. */
+    let topCardsRunning = false, topCardsStop = false, topCardsResult = null, topCardsRarity = 'ALL';
+    const TOP_CARDS_SHOWN = 50;
+    const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // Toute la collection (exemplaires), page par page. null si arrêté.
+    async function fetchAllCollectionItems(onProgress, shouldAbort) {
+        const limit = 50;
+        const url = (p) => `https://www.wiki-masters.com/api/my-collection?page=${p}&limit=${limit}&sort=rarity&pending=1`;
+        const getPage = async (p) => {
+            for (let i = 0; i < 3; i++) {
+                if (shouldAbort()) return null;
+                try {
+                    const r = await fetch(url(p), { credentials: 'include' });
+                    if (r.ok) {
+                        const d = await r.json();
+                        return { items: d.collection || [], total: parseInt(d.total, 10) };
+                    }
+                } catch (e) {}
+                await sleepMs(600 * (i + 1));
+            }
+            return null;
+        };
+        const first = await getPage(0);
+        if (!first) { if (shouldAbort()) return null; throw new Error('collection illisible'); }
+        const items = first.items.slice();
+        const total = Number.isFinite(first.total) && first.total > 0 ? first.total : null;
+        const pages = total ? Math.ceil(total / limit) : null;
+        if (onProgress) onProgress(items.length, total);
+        if (first.items.length >= limit) {
+            let p = 1, end = false;
+            const failed = [];
+            while (!end && (pages ? p < pages : p < 2000)) {
+                if (shouldAbort()) return null;
+                const batch = [];
+                for (let i = 0; i < 6 && (pages ? p < pages : true); i++) batch.push(p++);
+                const res = await Promise.all(batch.map(getPage));
+                res.forEach((r, i) => {
+                    if (!r) { failed.push(batch[i]); return; }
+                    items.push(...r.items);
+                    if (!pages && r.items.length < limit) end = true;
+                });
+                if (onProgress) onProgress(items.length, total);
+                await sleepMs(120);
+            }
+            for (const fp of failed) {           // 2e essai des pages refusées
+                if (shouldAbort()) return null;
+                const r = await getPage(fp);
+                if (r) items.push(...r.items);
+            }
+        }
+        return items;
+    }
+
+    async function computeTopCards(onStatus) {
+        const say = onStatus || (() => {});
+        say('📚 Lecture de la collection…');
+        const items = await fetchAllCollectionItems((n, total) => {
+            say(`📚 Lecture de la collection… ${n.toLocaleString('fr-FR')}${total ? ' / ' + total.toLocaleString('fr-FR') : ''} cartes`);
+        }, () => topCardsStop);
+        if (!items) return null;
+
+        // Une ligne par carte ET par rareté : deux exemplaires de raretés différentes n'ont
+        // pas la même cote.
+        const byKey = new Map();
+        for (const it of items) {
+            const id = it.card_id || it.card?.id;
+            if (!id) continue;
+            const rar = String(it.card?.rarity || it.rarity || '').toUpperCase() || '?';
+            const k = id + '|' + rar;
+            const e = byKey.get(k) || { cardId: id, title: it.card?.wikipedia_title || it.wikipedia_title || '?', rarity: rar, count: 0 };
+            e.count += Math.max(1, Number(it.count) || 1);
+            byKey.set(k, e);
+        }
+        const rows = [...byKey.values()];
+        const ids = [...new Set(rows.map(r => r.cardId))];
+        const queue = ids.filter(id => !getCachedSales(id));
+        let done = ids.length - queue.length, retried = false;
+        const failed = [];
+        while (queue.length && !topCardsStop) {
+            const wait = salesEndpointCooldownUntil - Date.now();
+            if (wait > 0) {
+                say(`🐢 Le site freine les cotes — reprise dans ${Math.ceil(wait / 1000)} s (${done}/${ids.length})…`);
+                await sleepMs(Math.min(1000, wait));
+                continue;
+            }
+            const grp = queue.splice(0, 5);
+            const res = await Promise.all(grp.map(id => fetchCardSales(id).catch(() => null)));
+            res.forEach((r, i) => { if (r) done++; else failed.push(grp[i]); });
+            say(`💹 Cotes : ${done.toLocaleString('fr-FR')} / ${ids.length.toLocaleString('fr-FR')}…`);
+            await sleepMs(200);
+            if (!queue.length && failed.length && !retried) { retried = true; queue.push(...failed.splice(0)); }
+        }
+
+        const rated = [];
+        let noCote = 0, unreadable = 0;
+        for (const r of rows) {
+            const entry = getCachedSales(r.cardId);
+            if (!entry) { unreadable += r.count; continue; }
+            const cote = entry.byRarity ? entry.byRarity[r.rarity] : (entry.count > 0 ? entry.avg : null);
+            if (Number.isFinite(cote) && cote > 0) rated.push({ ...r, cote, value: cote * r.count });
+            else noCote += r.count;
+        }
+        rated.sort((a, b) => b.cote - a.cote || b.value - a.value);
+        return { rated, noCote, unreadable, partial: topCardsStop,
+                 cards: rows.reduce((s, r) => s + r.count, 0), at: Date.now() };
+    }
+
+    function renderTopCards() {
+        const el = document.getElementById('wm-top-result');
+        if (!el) return;
+        const d = topCardsResult;
+        if (!d) { el.innerHTML = '<div style="color:#555;font-size:10px;font-style:italic;">Clique « 💎 Calculer » : le bot lit ta collection et la cote de chaque carte (quelques minutes la première fois).</div>'; return; }
+        const rars = ['ALL', 'L', 'UR', 'SR', 'R', 'PC', 'C'];
+        const list = topCardsRarity === 'ALL' ? d.rated : d.rated.filter(r => r.rarity === topCardsRarity);
+        const sum = (arr) => arr.reduce((s, r) => s + r.value, 0);
+        const pills = rars.map(r => {
+            const on = r === topCardsRarity;
+            const c = r === 'ALL' ? '#ccc' : (RARITY[r] || { color: '#888' }).color;
+            const n = r === 'ALL' ? d.rated.length : d.rated.filter(x => x.rarity === r).length;
+            return `<button data-wm-top-rar="${r}" style="font-size:9px;padding:1px 7px;border-radius:4px;cursor:pointer;border:1px solid ${on ? c : 'rgba(255,255,255,0.12)'};background:${on ? 'rgba(255,255,255,0.08)' : 'none'};color:${c};font-weight:${on ? 700 : 400};">${r === 'ALL' ? 'Toutes' : r} <span style="color:#666;">${n}</span></button>`;
+        }).join('');
+        const rows = list.slice(0, TOP_CARDS_SHOWN).map((r, i) => {
+            const rc = RARITY[r.rarity] || { color: '#888' };
+            return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;">
+                <span style="color:#555;min-width:18px;text-align:right;font-family:'JetBrains Mono',monospace;">${i + 1}</span>
+                <span style="color:${rc.color};font-weight:700;min-width:22px;">${esc(r.rarity)}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;" title="${esc(r.title)}">${esc(r.title)}${r.count > 1 ? ` <span style="color:#888;">×${r.count}</span>` : ''}</span>
+                <span style="color:#fbbf24;font-weight:700;white-space:nowrap;min-width:52px;text-align:right;" title="Cote moyenne du marché en ${esc(r.rarity)}">${r.cote.toLocaleString('fr-FR')} 💰</span>
+                ${r.count > 1 ? `<span style="color:#888;white-space:nowrap;font-size:9px;" title="${r.count} exemplaires">= ${r.value.toLocaleString('fr-FR')}</span>` : ''}
+            </div>`;
+        }).join('');
+        const when = new Date(d.at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        el.innerHTML = `
+            <div style="font-size:10px;color:#aaa;margin-bottom:4px;">
+                Valeur totale estimée : <b style="color:#fbbf24;">${sum(d.rated).toLocaleString('fr-FR')} 💰</b>
+                <span style="color:#666;">· ${d.rated.reduce((s, r) => s + r.count, 0).toLocaleString('fr-FR')} carte(s) cotée(s) sur ${d.cards.toLocaleString('fr-FR')}</span>
+                ${topCardsRarity !== 'ALL' ? `<br>En ${esc(topCardsRarity)} : <b style="color:#fbbf24;">${sum(list).toLocaleString('fr-FR')} 💰</b>` : ''}
+            </div>
+            <div style="font-size:9px;color:#666;margin-bottom:6px;">
+                ${d.noCote ? `📋 ${d.noCote.toLocaleString('fr-FR')} carte(s) sans cote (jamais vendues dans leur rareté) — hors classement` : 'Toutes les cartes ont une cote'}${d.unreadable ? ` · ⚠️ ${d.unreadable} cote(s) illisible(s) (refus du site) — relance plus tard` : ''}${d.partial ? ' · ⏹ calcul arrêté avant la fin' : ''} · calculé à ${when}
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">${pills}</div>
+            ${rows || '<div style="color:#555;font-size:10px;">Aucune carte cotée dans cette rareté.</div>'}
+            ${list.length > TOP_CARDS_SHOWN ? `<div style="font-size:9px;color:#555;margin-top:3px;">… ${list.length - TOP_CARDS_SHOWN} autre(s), moins chère(s)</div>` : ''}`;
+        el.querySelectorAll('[data-wm-top-rar]').forEach(b => {
+            b.onclick = () => { topCardsRarity = b.getAttribute('data-wm-top-rar'); renderTopCards(); };
+        });
+    }
+
+    async function runTopCards(btn) {
+        const status = document.getElementById('wm-top-status');
+        const say = (t) => { if (status) status.innerHTML = t; };
+        if (topCardsRunning) { topCardsStop = true; say('⏹ Arrêt demandé…'); return; }
+        topCardsRunning = true;
+        topCardsStop = false;
+        if (btn) { btn.innerText = '⏹ Arrêter'; }
+        try {
+            const r = await computeTopCards(say);
+            if (r) {
+                topCardsResult = r;
+                say(r.partial ? '⏹ Arrêté — résultat partiel.' : '✔ Terminé.');
+                wmLog(`💎 Cartes les plus chères : ${r.rated.length} carte(s) cotée(s), valeur totale ${r.rated.reduce((s, x) => s + x.value, 0).toLocaleString('fr-FR')} 💰${r.noCote ? ` · ${r.noCote} sans cote` : ''}.`);
+            } else {
+                say('⏹ Arrêté.');
+            }
+        } catch (e) {
+            say(`<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`);
+        } finally {
+            topCardsRunning = false;
+            topCardsStop = false;
+            if (btn) btn.innerText = '💎 Calculer';
+            renderTopCards();
+        }
+    }
+    window.wmTopCards = () => topCardsResult;
+
     /* ═══════ APERÇU DE L'ORDRE DE VENTE ═══════
        Montre, SANS rien vendre, ce que le Trash Seller ferait s'il partait maintenant :
        quelles cartes, dans quel ordre, à quel prix et pour combien de temps.
@@ -9955,6 +10139,25 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.05);
             }
 
+            /* ── Panneau Cartes les plus chères (jumeau du panneau Statistiques) ── */
+            #wm-top-panel {
+                flex-shrink:0; margin:0 10px 10px;
+                background:rgba(12,12,16,0.98); border:1px solid rgba(255,255,255,0.07);
+                border-radius:10px; overflow:hidden;
+            }
+            #wm-top-hdr {
+                padding:8px 13px; font-size:10px; font-weight:700;
+                text-transform:uppercase; letter-spacing:1px; color:#888;
+                cursor:pointer; background:rgba(255,255,255,0.02);
+                display:flex; justify-content:space-between; align-items:center;
+                user-select:none; transition:all 0.15s;
+            }
+            #wm-top-hdr:hover { background:rgba(255,255,255,0.04); color:#bbb; }
+            #wm-top-body { padding:12px 13px; border-top:1px solid rgba(255,255,255,0.06); display:none; max-height:var(--wm-top-h, 60vh); overflow-y:auto; }
+            #wm-top-body.open { display:block; }
+            #wm-top-body::-webkit-scrollbar { width:8px; }
+            #wm-top-body::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.12); border-radius:4px; }
+
             /* ── Panneau Statistiques (jumeau du panneau Paramètres) ── */
             #wm-stats-panel {
                 flex-shrink:0; margin:0 10px 10px;
@@ -10455,6 +10658,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 <div id="wm-tagger-presets" style="margin-top:4px;"></div>
                 <div id="wm-tagger-status" class="wm-set-sub" style="margin-top:8px;"></div>
                 <div id="wm-tagger-results" style="margin-top:8px;max-height:220px;overflow-y:auto;"></div>
+            </div>
+        </div>
+        <div id="wm-top-panel">
+            <div class="wm-row-resizer" data-target="wm-top-body" data-var="--wm-top-h"></div>
+            <div id="wm-top-hdr">
+                <span>💎 Cartes les plus chères</span>
+                <span id="wm-top-chevron">▴</span>
+            </div>
+            <div id="wm-top-body">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+                    <button id="wm-top-run" title="Lit ta collection et la cote du marché de chaque carte (celle de sa rareté), puis classe les cartes de la plus chère à la moins chère. Quelques minutes la première fois, bien plus rapide ensuite (cotes en cache)."
+                        style="border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.08);color:#fbbf24;font-size:10px;padding:3px 10px;border-radius:5px;cursor:pointer;white-space:nowrap;">💎 Calculer</button>
+                    <span id="wm-top-status" style="font-size:10px;color:#888;"></span>
+                </div>
+                <div id="wm-top-result"></div>
             </div>
         </div>
         <div id="wm-stats-panel">
@@ -11724,6 +11942,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             panelOpenState.settings = open;
             savePanelState();
         };
+
+        // -- Panneau Cartes les plus chères --
+        const topHdr = document.getElementById('wm-top-hdr');
+        const topBody = document.getElementById('wm-top-body');
+        const topChevron = document.getElementById('wm-top-chevron');
+        const topRunBtn = document.getElementById('wm-top-run');
+        if (topHdr && topBody) {
+            topHdr.onclick = () => {
+                const open = topBody.classList.toggle('open');
+                if (topChevron) topChevron.innerText = open ? '▾' : '▴';
+                panelOpenState.top = open;
+                savePanelState();
+                document.querySelectorAll('.wm-row-resizer').forEach(rz => {
+                    const b = document.getElementById(rz.dataset.target);
+                    if (b) rz.classList.toggle('show', b.classList.contains('open'));
+                });
+                if (open) renderTopCards();
+            };
+            if (panelOpenState.top) {
+                topBody.classList.add('open');
+                if (topChevron) topChevron.innerText = '▾';
+            }
+            renderTopCards();
+        }
+        if (topRunBtn) topRunBtn.onclick = () => runTopCards(topRunBtn);
 
         // -- Panneau Statistiques (accordéon jumeau) --
         const statsHdr     = document.getElementById('wm-stats-hdr');

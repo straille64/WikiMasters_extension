@@ -1094,6 +1094,30 @@ Tests : `low-balance` (solde 540, mise 60, réserve 500 → pas de mise ; mutati
 ignorée » : échoue) et `legend-resell` (Chasse + Revente → Revente seule : chasse coupée, revente
 en marche, date d'activation inchangée).
 
+### 50. 💎 Cartes les plus chères (nouveau panneau)
+Demande du 30/09 : un menu dépliant, comme Statistiques ou Paramètres, avec un bouton qui charge
+la cote de toutes les cartes et les classe de la plus chère à la moins chère. Choix de
+l'utilisateur : **ma collection**, **top 50 + valeur totale**, **filtre par rareté**, cartes
+**sans cote comptées à part**.
+
+**✅ Ajouté (1.3.13-fork.33)**
+
+- Panneau « 💎 Cartes les plus chères » au-dessus de Statistiques, bouton « 💎 Calculer »
+  (re-clic pendant le calcul = arrêt, résultat partiel conservé).
+- Lecture de toute la collection (`/api/my-collection`, 6 pages en parallèle, 2e essai des pages
+  refusées), regroupée par carte ET par rareté : deux exemplaires de raretés différentes n'ont
+  pas la même cote.
+- Cote = moyenne `?scope=summary` du site pour la rareté de l'exemplaire (la même que la
+  surcouche Collection ; pas de reconstruction de l'historique des ventes). Cache partagé : le
+  2e calcul est quasi immédiat. 5 requêtes à la fois ; si le site freine (403/429), attente de
+  la fin de sa pause avec compte à rebours, puis reprise ; les cotes refusées sont redemandées
+  une fois à la fin.
+- Résultat : valeur totale estimée (cote × exemplaires), top 50, filtre L / UR / SR / R / PC / C
+  (avec le total de la rareté), nombre de cartes sans cote et de cotes illisibles.
+
+`tests/top-cards.test.mjs` : collection de 2 pages ; mutations « cote sans tenir compte de la
+rareté » et « pas de 2e essai » : échouent.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
