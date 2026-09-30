@@ -1054,6 +1054,27 @@ Au passage, sur les mêmes logs :
 `tests/legend-resell.test.mjs` rejoue les trois restes (vendue ailleurs, supprimée sur le site,
 retirée à la main) ; la version précédente échoue sur les quatre contrôles ajoutés.
 
+### 48. Solde insuffisant : rafales de mises refusées
+Question du 30/09 : « que se passe-t-il quand je n'ai plus assez de wikibidous ? ». Les chemins
+de mise automatique ne vérifiaient que « solde > 0 », jamais « solde ≥ montant ». La mise
+partait, le site la refusait, et on recommençait : la Chasse toutes les 2 s, le Fourbe à chaque
+tick de la hot lane (jusqu'à plusieurs fois par seconde en fin d'enchère), l'auto-bid à chaque
+scan. Rejoué : 7 mises refusées sur une seule enchère en 14 s.
+
+**✅ Corrigé (1.3.13-fork.31)**
+
+- `autoBidAllowed()` (le passage obligé de toutes les mises auto) refuse une mise au-delà du
+  solde lu, avec une ligne de journal par enchère toutes les 5 min. Le solde lu est bien ce qui
+  reste à miser : le site retient le montant des mises en tête et le rend à la surenchère
+  (« Solde -100 » puis « +100 » dans les logs).
+- Un refus « solde insuffisant » du site (solde lu périmé) suspend les mises auto 30 s et relit
+  le solde, au lieu de réessayer.
+- Les mises manuelles ne sont pas bloquées (le site tranche).
+- Rien ne change pour la vente (Trash Seller, Revente) : elle ne dépense pas de wikibidous.
+
+`tests/low-balance.test.mjs` : solde 50 pour une mise de 60 → aucune requête ; solde lu 1000 mais
+refus du site → une seule tentative. La version précédente envoie 7 mises refusées dans les deux cas.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

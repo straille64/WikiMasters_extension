@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.30';
+    const WM_VERSION = '1.3.13-fork.31';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3621,6 +3621,30 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return true;
     }
 
+    /* ── Solde insuffisant ──
+       Avant : chaque chemin ne vérifiait que « solde > 0 ». À 50 💰 pour une mise de 97, la
+       mise partait, le site refusait… et le Fourbe retentait à chaque tick de la hot lane
+       (plusieurs fois par seconde jusqu'à la fin), la Chasse toutes les 2 s, l'auto-bid à
+       chaque scan : des rafales de requêtes refusées, de quoi déclencher l'anti-bot.
+       Désormais une mise auto n'est pas envoyée au-delà du solde disponible (le site retient
+       le montant de mes mises en tête, et le rend quand je suis surenchéri : le solde lu est
+       donc bien ce qui reste à miser), et un refus « solde insuffisant » suspend les mises
+       auto 30 s, le temps de relire le solde. */
+    let balanceRefusedUntil = 0;
+    const _lowBalanceLogged = new Map(); // auctionId → dernier log
+    function balanceAllows(auction, plannedAmount) {
+        if (Date.now() < balanceRefusedUntil) return false;
+        if (!Number.isFinite(wikibidousBalance) || plannedAmount <= wikibidousBalance) return true;
+        const id = (auction && auction.id) || '?';
+        if (Date.now() - (_lowBalanceLogged.get(id) || 0) > 5 * 60 * 1000) {
+            if (_lowBalanceLogged.size > 300) _lowBalanceLogged.clear();
+            _lowBalanceLogged.set(id, Date.now());
+            const t = (auction && auction.card && auction.card.wikipedia_title) || '?';
+            wmLog(`💸 Solde insuffisant : <b>${esc(t)}</b> demanderait ${plannedAmount.toLocaleString('fr-FR')} 💰, il te reste ${wikibidousBalance.toLocaleString('fr-FR')} 💰 — pas de mise. Les mises reprennent seules quand le solde remonte (vente, surenchère remboursée).`);
+        }
+        return false;
+    }
+
     function autoBidAllowed(auction, plannedAmount, contexte) {
         // 1) Interrupteur maître : les mises auto sont-elles armées ?
         if (!autoSnipeEnabled) {
@@ -3628,6 +3652,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             warnAutoBidsPaused(t);
             return false;
         }
+
+        // 1 bis) De quoi payer la mise.
+        if (!balanceAllows(auction, plannedAmount)) return false;
 
         // 2) Plafond de prix global — jamais dépassé, quel que soit le mot-clé.
         const globalCap = getSetting('globalBidCap');
@@ -3667,6 +3694,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     const BID_STALE_RE = /trop\s*bas|too\s*low|higher|sup[ée]rieur|minim|montant|amount|outbid|surench|insuffisant/i;
     // Refus définitifs → insister ne ferait que spammer le serveur.
     const BID_FATAL_RE = /termin|ended|closed|expir|finished|insufficient|fonds|solde|balance|propre|own|self/i;
+    // Refus pour manque de fonds (sous-ensemble des définitifs) : suspend les mises auto.
+    const BID_FUNDS_RE = /insufficient|insuffisant|not enough|pas assez|fonds|solde|balance|wikibidous? manquant/i;
 
     function bidRetryNote(r) {
         if (!r || !r.attempts || r.attempts < 2) return '';
@@ -3706,6 +3735,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 return { ok: true, amount: amt, attempts: attempt, data, auction: a };
             }
             lastErr = (data && (data.error || data.message)) || (res ? `HTTP ${res.status}` : lastErr) || 'erreur';
+            if (res && !res.ok && BID_FUNDS_RE.test(String(lastErr))) {
+                // Le site dit « pas assez » : on relit le solde et on suspend les mises auto
+                // 30 s (le solde lu était sans doute périmé) plutôt que de réessayer.
+                if (Date.now() >= balanceRefusedUntil) {
+                    wmLog(`💸 Le site refuse la mise (<span style="color:#888;">${esc(String(lastErr).slice(0, 80))}</span>) — mises auto suspendues 30 s, solde relu.`);
+                }
+                balanceRefusedUntil = Date.now() + 30000;
+                fetchBalance().catch(() => {});
+                break;
+            }
             if (BID_FATAL_RE.test(String(lastErr))) break;
             // Le site a dit « trop bas » : on retient son minimum (ou, faute de chiffre, un cran
             // au-dessus) pour ce prix-là — les prochaines mises sur cette enchère en tiendront
