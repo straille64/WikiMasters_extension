@@ -1118,6 +1118,25 @@ l'utilisateur : **ma collection**, **top 50 + valeur totale**, **filtre par rare
 `tests/top-cards.test.mjs` : collection de 2 pages ; mutations « cote sans tenir compte de la
 rareté » et « pas de 2e essai » : échouent.
 
+### 51. Revente Légendaire : baisse du prix sur invendus
+Demande du 30/09 : « on vend au prix du marché, et toutes les X mises en vente pas concluantes
+on baisse le prix de Y %, sans pouvoir descendre sous le prix payé + % minimum ». Avant, une L
+invendue repartait au même calcul (cote L, plancher payé + marge) : si la cote était sous le
+plancher, elle était relistée au plancher indéfiniment.
+
+**✅ Ajouté (1.3.13-fork.34)**
+
+- Compteur d'invendus par L (`unsold`), incrémenté à chaque vente terminée sans acheteur (suivi
+  des ventes, réconciliation, vente sans identifiant).
+- Prix = cote L × (1 − Y %)^⌊invendus / X⌋, jamais sous le plancher payé + marge.
+  Défauts : **Y = 10 %, X = 2** (réglables dans la section Revente Légendaire ; Y = 0 = pas de
+  baisse). La cote est toujours relue à chaque mise en vente.
+- Journal : « 📉 -19 % après 4 invendu(s) », compteur 🔁 dans la liste.
+- Indépendant de la baisse du Trash Seller (qui ne concerne que les cartes taguées Trash).
+
+`tests/legend-resell.test.mjs` : 3 invendus → 1 palier → 900 (cote 1000) ; 20 invendus → borné au
+plancher 285 (payé 190 + 50 %). Mutation « pas de baisse » : échoue.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

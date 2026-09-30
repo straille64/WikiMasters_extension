@@ -57,6 +57,8 @@ const COTE = {
   'c-d': '{"summary":{"SR":{"average":999}}}',
   'c-gone': '{"summary":{"L":{"average":500}}}',
   'c-del': '{"summary":{"L":{"average":500}}}',
+  'c-dec': '{"summary":{"L":{"average":1000}}}',
+  'c-flo': '{"summary":{"L":{"average":300}}}',
 };
 
 const page = await browser.newPage();
@@ -80,6 +82,12 @@ await page.evaluate(() => {
     { wonAuctionId: 'w-del', cardId: 'c-del', title: 'L retirée sur le site', paid: 100,
       wonAt: Date.now() - 3600000, status: 'listed', listedAuctionId: 'lst-del', listedPrice: 203,
       listedAt: Date.now() - 60000, listedDuration: 180, listings: 1 },
+    // Baisse par invendus (défaut : -10 % toutes les 2) : 3 invendus → 1 palier → 900 ;
+    // 20 invendus → 10 paliers → 105, mais plancher payé 190 + 50 % = 285.
+    { wonAuctionId: 'w-dec', cardId: 'c-dec', title: 'L invendue 3 fois', paid: 100,
+      wonAt: Date.now(), status: 'waiting', listings: 3, unsold: 3 },
+    { wonAuctionId: 'w-flo', cardId: 'c-flo', title: 'L invendue 20 fois', paid: 190,
+      wonAt: Date.now(), status: 'waiting', listings: 20, unsold: 20 },
   ]));
   const payload = btoa(JSON.stringify({ sub: 'user-test-1', exp: 4102444800 }))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -193,6 +201,8 @@ if (of('c-old').length) problems.push("L gagnée AVANT l'activation remise en ve
 if (of('c-d').length) problems.push('SR gagnée remise en vente');
 if (of('c-a').length < 2) problems.push(`invendue non remise en vente (${of('c-a').length} mise(s) en vente de « L bien cotée »)`);
 else if (of('c-a')[1].price !== 400) problems.push(`remise en vente à ${of('c-a')[1].price} au lieu de 400`);
+if (!of('c-dec').length || of('c-dec')[0].price !== 900) problems.push(`3 invendus (1 palier de -10 %) : ${of('c-dec').map(p => p.price).join(', ') || 'pas mise en vente'} au lieu de 900`);
+if (!of('c-flo').length || of('c-flo')[0].price !== 285) problems.push(`20 invendus : ${of('c-flo').map(p => p.price).join(', ') || 'pas mise en vente'} au lieu du plancher 285 (payé 190 + 50 %)`);
 const st = (id) => (mid.queue.find(e => e.wonAuctionId === id) || {}).status;
 if (of('c-gone').length) problems.push('« L vendue ailleurs » (plus dans la collection) remise en vente');
 if (st('w-gone') !== 'gone') problems.push(`« L vendue ailleurs » toujours dans la liste (${st('w-gone')})`);
@@ -217,4 +227,4 @@ if (problems.length) {
   console.error('  — log :\n' + mid.log.split('\n').filter(l => /👑|❌|⚠/.test(l)).slice(0, 15).map(l => '      ' + l).join('\n'));
   process.exit(1);
 }
-console.log(`✅ moyenne L (400) · plancher payé +50 % (300 → 450) · sans cote / cote SR / ancienne / SR ignorées · invendue remise à 400 sans tag Trash · restes nettoyés (vendue ailleurs, supprimée, retirée à la main) · boutons exclusifs (Revente seule garde la file)`);
+console.log(`✅ moyenne L (400) · plancher payé +50 % (300 → 450) · sans cote / cote SR / ancienne / SR ignorées · invendue remise à 400 sans tag Trash · -10 % toutes les 2 invendues (1000 → 900) bornée au plancher (285) · restes nettoyés (vendue ailleurs, supprimée, retirée à la main) · boutons exclusifs (Revente seule garde la file)`);

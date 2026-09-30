@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.33';
+    const WM_VERSION = '1.3.13-fork.34';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -651,7 +651,16 @@
         if (!entry) return { skip: true, reason: 'unreadable', floor };   // refus du site : on retentera
         const avg = entry.byRarity ? entry.byRarity.L : (entry.count > 0 ? entry.avg : null);
         if (!Number.isFinite(avg) || avg <= 0) return { skip: true, reason: 'no_cote', floor };
-        return { price: Math.max(Math.round(avg), floor), avg: Math.round(avg), floor, floored: avg < floor, source: 'legend' };
+        /* Baisse par invendus (demande du 30/09) : on part du prix du marché ; toutes les N
+           mises en vente sans acheteur, -Y % (cumulés) ; jamais sous le plancher payé + marge. */
+        const avgR = Math.round(avg);
+        const unsold = Math.max(0, Number(e.unsold) || 0);
+        const pct = Math.min(90, Math.max(0, getSetting('legendResellDecayPct')));
+        const every = Math.max(1, Math.round(getSetting('legendResellDecayEvery')) || 1);
+        const steps = pct > 0 ? Math.floor(unsold / every) : 0;
+        const market = steps ? Math.max(1, Math.round(avgR * Math.pow(1 - pct / 100, steps))) : avgR;
+        return { price: Math.max(market, floor), avg: avgR, floor, floored: market < floor, source: 'legend',
+                 decay: steps ? { steps, unsold, market, totalPct: Math.round((1 - market / avgR) * 100) } : null };
     }
     // Issue d'une vente suivie (appelée par le suivi des ventes).
     function legendResellSettled(s, sold, finalPrice) {
@@ -665,7 +674,11 @@
         } else {
             e.status = 'waiting';
             e.listedAuctionId = null;
-            wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> invendue — remise en vente au même calcul (moyenne relue, jamais sous ${legendResellFloor(e.paid)} 💰).`);
+            e.unsold = (Number(e.unsold) || 0) + 1;
+            const every = Math.max(1, Math.round(getSetting('legendResellDecayEvery')) || 1);
+            const pct = getSetting('legendResellDecayPct');
+            const next = pct > 0 && e.unsold % every === 0 ? ` · prochaine mise en vente -${pct} %` : '';
+            wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> invendue (${e.unsold}×) — remise en vente (cote relue${next}, jamais sous ${legendResellFloor(e.paid)} 💰).`);
         }
         saveLegendResell();
         renderLegendResell();
@@ -679,7 +692,8 @@
         const label = { waiting: ['⏳ à vendre', '#fbbf24'], listed: ['🏷️ en vente', '#4ade80'], no_cote: ['📋 pas de cote', '#888'] };
         const rows = live.slice().sort((a, b) => (b.wonAt || 0) - (a.wonAt || 0)).map(e => {
             const [txt, col] = label[e.status] || [e.status, '#888'];
-            const price = e.status === 'listed' && e.listedPrice ? ` · ${e.listedPrice} 💰` : '';
+            const price = (e.status === 'listed' && e.listedPrice ? ` · ${e.listedPrice} 💰` : '')
+                + (e.unsold ? ` <span style="color:#f97316;" title="Mises en vente sans acheteur">🔁${e.unsold}</span>` : '');
             return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:10px;border-bottom:1px solid rgba(255,255,255,0.04);">
                 <span style="color:#FFD700;font-weight:700;min-width:14px;">L</span>
                 <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;" title="${esc(e.title)}">${esc(e.title)}</span>
@@ -1312,6 +1326,8 @@
         legendResellEnabled:   'wm_legend_resell_on',
         legendResellSince:     'wm_legend_resell_since',
         legendResellMarginPct: 'wm_legend_resell_margin',
+        legendResellDecayPct:  'wm_legend_resell_decay',
+        legendResellDecayEvery:'wm_legend_resell_decay_every',
         sellUndercutMarket:   'wm_sell_undercut_market',
         autoTagPacksFromPresets: 'wm_autotag_packs_presets',
         autoTagSkipLegendary:  'wm_autotag_skip_legendary',
@@ -1379,6 +1395,8 @@
         legendResellEnabled:   false,     // mode « Chasse + Revente » : les L gagnées sont remises en vente
         legendResellSince:     0,         // …seulement celles gagnées après cette date (activation du mode)
         legendResellMarginPct: 50,        // …jamais sous le prix payé + ce % (plancher)
+        legendResellDecayPct:  10,        // …baisse de ce % (0 = jamais de baisse)…
+        legendResellDecayEvery: 2,        // …toutes les N mises en vente sans acheteur
         sellUndercutMarket:    true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
         autoTagPacksFromPresets: false,   // étiquette auto les cartes packées selon les recherches enregistrées
         autoTagSkipLegendary:  true,      // n'auto-étiquette PAS les Légendaires (on veut souvent les garder)
@@ -7302,9 +7320,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 renderLegendResell();
                 recordSale(item, price, 'pending', result.auctionId || null);
                 invalidateSalesDetail();
+                const dec = priceInfo.decay ? ` · 📉 -${priceInfo.decay.totalPct} % après ${priceInfo.decay.unsold} invendu(s)` : '';
                 wmLog(`👑 Revente Légendaire : <b>${esc(title)}</b> mise en vente ${price} 💰 <span style="color:#888;font-size:9px;">(${priceInfo.floored
-                    ? `🛡️ moy. L ${priceInfo.avg} 💰 &lt; plancher ${priceInfo.floor} 💰`
-                    : `💹 moy. L ${priceInfo.avg} 💰 · plancher ${priceInfo.floor} 💰`} · payée ${lr.paid} 💰)</span>`);
+                    ? `🛡️ moy. L ${priceInfo.avg} 💰${dec} → plancher ${priceInfo.floor} 💰`
+                    : `💹 moy. L ${priceInfo.avg} 💰${dec} · plancher ${priceInfo.floor} 💰`} · payée ${lr.paid} 💰)</span>`);
             } else if (success) {
                 consecutiveFailures = 0;
                 sold++;
@@ -10560,6 +10579,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             <input id="wm-lresell-margin" type="number" min="0" max="1000" step="5" style="width:40px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
                             %
                         </label>
+                        <label style="display:inline-flex;align-items:center;gap:3px;font-size:9px;color:#888;"
+                            title="Invendue : toutes les N mises en vente sans acheteur, le prix baisse de ce % (cumulé), sans jamais passer sous le plancher. 0 % = pas de baisse.">
+                            📉 -
+                            <input id="wm-lresell-decay" type="number" min="0" max="90" step="1" style="width:34px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                            % toutes les
+                            <input id="wm-lresell-decay-every" type="number" min="1" max="50" step="1" style="width:30px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                            invendue(s)
+                        </label>
                     </div>
                     <div id="wm-lresell-status" style="font-size:10px;color:#888;min-height:14px;margin-bottom:4px;"></div>
                     <div id="wm-lresell-list" style="margin-bottom:8px;"></div>
@@ -11167,6 +11194,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 renderLegendResell();
             };
         }
+        [['wm-lresell-decay', 'legendResellDecayPct', 0, 90, v => v > 0 ? `👑 Revente Légendaire : -${v} % par palier d'invendus` : '👑 Revente Légendaire : pas de baisse sur invendu'],
+         ['wm-lresell-decay-every', 'legendResellDecayEvery', 1, 50, v => `👑 Revente Légendaire : baisse toutes les ${v} mise(s) en vente sans acheteur`],
+        ].forEach(([id, key, min, max, msg]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.value = getSetting(key);
+            el.onchange = () => {
+                let v = parseInt(el.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS[key];
+                v = Math.min(max, Math.max(min, v));
+                el.value = v;
+                setSetting(key, v);
+                wmLog(msg(v));
+            };
+        });
         // Reprise après rechargement : seulement si c'est le bot qui a rechargé la page.
         if (getSetting('legendResellEnabled')) {
             let selfNav = false;

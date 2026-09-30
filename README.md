@@ -189,6 +189,7 @@ Seller, étiquetage, paramètres) est dans [upstream/README.md](upstream/README.
 - [x] Mises auto : jamais au-delà du solde, pas de rafale après un refus « solde insuffisant » (audit #48)
 - [x] Chasse : réserve de solde ; bouton « Revente seule » (audit #49)
 - [x] Panneau « 💎 Cartes les plus chères » : ma collection classée par cote (audit #50)
+- [x] Revente Légendaire : -Y % toutes les X invendues, jamais sous payé + marge (audit #51)
 - [ ] Découpage du monolithe en modules
 - [ ] Passage en extension MV3 (interception réseau + handlers = le gros du travail)
 
