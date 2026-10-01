@@ -1172,6 +1172,20 @@ Pack Opener avait de la place. **1.3.13-fork.36** : le log (et « Export logs »
 bas du Pack Opener, sur toute la hauteur libre ; le bloc « Matchs mots-clés » du Pack Opener est
 retiré (`renderPackKwHits` ne fait plus rien sans son conteneur).
 
+### 54. Chasse opti : les autres raretés étaient affamées par les Légendaires
+Logs du 30/09 : « toutes les chasses opti se font sur des Légendaires ». Sur 20 minutes, 60
+opportunités L pour 2 UR, aucune SR/R/PC malgré les cases cochées. Cause : les cotes à lire
+(au plus 12 par passage) étaient prises dans l'ordre L, UR, SR… ; les nombreuses L qui finissent
+dans les 3 minutes consommaient tout le budget, et les autres raretés n'étaient presque jamais
+évaluées avant la fin de leur enchère. Le refus 403 des cotes (pause de 5 min) aggravait l'effet.
+
+**✅ Corrigé (1.3.13-fork.37)** : les cotes sont lues **à tour de rôle par rareté** (une L, une
+UR, une SR…, puis on recommence), sans doublon de carte. Rien ne change pour le seuil : avec un
+gain minimum élevé (50 💰 chez l'utilisateur), les petites raretés restent rares à passer.
+
+`tests/opti-hunt.test.mjs` ajoute 30 L sans intérêt mais à évaluer : la version précédente ne mise
+plus ni sur l'UR ni sur la SR ; la nouvelle mise sur les deux.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.36
+// @version      1.3.13-fork.37
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.36';
+    const WM_VERSION = '1.3.13-fork.37';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -5906,7 +5906,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             cands.push({ a, rar, next, remaining, cardId: a.card?.id || a.card_id });
         }
         let budget = 12;
-        const need = cands.filter(c => c.cardId && !getCachedSales(c.cardId) && !salesFetchBlocked(c.cardId));
+        /* Cotes à lire, À TOUR DE RÔLE par rareté (retour du 30/09 : « toutes les chasses opti
+           se font sur des Légendaires »). Lues dans l'ordre L, UR, SR…, les nombreuses L qui
+           finissent bientôt consommaient tout le budget du passage : les autres raretés
+           n'étaient presque jamais évaluées avant la fin de leur enchère. */
+        const byRar = new Map();
+        for (const c of cands) {
+            if (!c.cardId || getCachedSales(c.cardId) || salesFetchBlocked(c.cardId)) continue;
+            if (!byRar.has(c.rar)) byRar.set(c.rar, []);
+            if (!byRar.get(c.rar).some(x => x.cardId === c.cardId)) byRar.get(c.rar).push(c);
+        }
+        const need = [];
+        for (let more = true; more; ) {
+            more = false;
+            for (const list of byRar.values()) if (list.length) { need.push(list.shift()); more = true; }
+        }
         for (let i = 0; i < need.length && budget > 0; i += 4) {
             if (Date.now() < salesEndpointCooldownUntil) break;
             const grp = need.slice(i, i + Math.min(4, budget));

@@ -41,7 +41,7 @@ try { browser = await chromium.launch({ executablePath: findChrome() }); }
 catch { console.log('⏭️  Chromium introuvable — test sauté'); srv.close(); process.exit(0); }
 
 
-const END = Date.now() + 30000;
+const END = Date.now() + 26000;
 // id → { rar, cote, cur, seller }
 const A = {
   'o-good': { rar: 'UR', cote: 400, cur: 100, bidder: 'rival' },          // plafond 200 : 110, riposte 165, stop à 209
@@ -51,6 +51,10 @@ const A = {
   'o-own':  { rar: 'UR', cote: 400, cur: null, bidder: null, seller: 'moi' }, // ma propre vente
   'o-r':    { rar: 'R',  cote: 400, cur: 50,  bidder: 'rival' },          // R décochée (renvoyée quand même)
 };
+// 30 L qui finissent bientôt, sans intérêt (mise min 187 > plafond 180, mais ≤ mise max 200) mais dont il faut lire
+// la cote : avant, elles épuisaient le budget de lecture (12 par passage) et la SR n'était
+// jamais évaluée à temps.
+for (let i = 1; i <= 30; i++) A['o-l' + i] = { rar: 'L', cote: 300, cur: 170, bidder: 'rival' };
 const toAuction = (id) => {
   const s = A[id];
   return { id, base_amount: 50, current_bid: s.cur, current_bidder: s.bidder ? { username: s.bidder } : null,
@@ -78,12 +82,12 @@ await page.route(new RegExp('^(?!' + origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&
 await page.route('**/api/wikibidous**', r => r.fulfill({ status: 200, contentType: 'application/json', body: '{"balance":1000}' }));
 await page.route('**/api/marketplace**', route => {
   const url = route.request().url();
-  const sales = url.match(/cards\/c-(o-[a-z]+)\/sales/);
+  const sales = url.match(/cards\/c-(o-[a-z0-9]+)\/sales/);
   if (sales) {
     const s = A[sales[1]];
     return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ summary: { [s.rar]: { average: s.cote } } }) });
   }
-  const m = url.match(/\/marketplace\/(o-[a-z]+)(\/bid)?(\?|$)/);
+  const m = url.match(/\/marketplace\/(o-[a-z0-9]+)(\/bid)?(\?|$)/);
   if (m && m[2] && route.request().method() === 'POST') {
     let amount = null;
     try { amount = JSON.parse(route.request().postData() || '{}').amount; } catch {}
