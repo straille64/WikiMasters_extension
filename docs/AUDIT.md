@@ -1192,7 +1192,7 @@ lent (médiane 4 à 6 s par requête), une page de marché sur quatre répond 50
 rajoutait beaucoup. Analyse par trois agents (balayage, `/mine`+Supabase, hot lane/Chasses),
 corrections, puis relecture adversariale par un quatrième agent.
 
-**✅ Corrigé (1.3.13-fork.38)** — sans retirer aucune fonctionnalité :
+**✅ Corrigé (1.3.13-fork.38, livré en fork.39 après relecture)** — sans retirer aucune fonctionnalité :
 
 1. **Horloge serveur** : l'en-tête `Date` est posé à la FIN du traitement du site, pas au milieu.
    L'ancien calcul (milieu de la requête) donnait un décalage entre −6 et +12 s sur ces
@@ -1233,6 +1233,33 @@ Tests : `network-efficiency` (horloge, sans mot-clé, mise manuelle, purge, Stop
 précédente échoue sur le balayage continu, la mise manuelle et la double boucle),
 `legend-hunt` (refus réel 409 `bid_too_low`, relecture lente : relance en 6 ms contre 3,2 s),
 `top-cards` (4 lectures de cote simultanées au plus ; avant : 5).
+
+**Relecture adversariale (agent relecteur) → corrigé dans 1.3.13-fork.39** — fork.38 n'a jamais
+été livré :
+
+1. **Plafond d'un autre réglage supprimé** : en lâchant une enchère hors de portée, la Chasse
+   retirait « son » plafond… même s'il avait été remplacé entre-temps (Chasseur ciblé, Hunter,
+   plafond tapé à la main) → auto-bid libéré jusqu'au plafond global (reproduit : riposte à 275
+   au lieu de l'arrêt à 200). La chasse mémorise la valeur posée et ne retire que celle-là ; le
+   changement du max de la Chasse L ne touche plus que ses propres plafonds.
+2. **Pause des cotes jamais allongée** : une réponse 200 revenue d'une rafale en partie refusée
+   remettait le palier à zéro. Remise à zéro seulement après 10 min sans refus.
+3. **Relance immédiate sur ma propre mise** : si le minimum annoncé correspond à MA dernière
+   mise + 10 % (autre onglet, mise à la main simultanée), pas de relance à l'aveugle — relecture
+   de l'enchère (chemin qui vérifie « je mène déjà »). L'intercepteur retient aussi le montant
+   des mises faites à la main sur le site.
+4. **Lecture de cote sans limite de temps** : 4 lectures bloquées auraient gelé toute la file.
+   Abandon au bout de 12 s.
+5. **Trash Seller pendant une pause des cotes** : vendait au prix minimum du tableau ; la carte est
+   désormais reportée tant que sa cote est illisible.
+6. Sans mot-clé : cadence de 20 s tenue aussi quand aucune enchère n'est affichée ; une relecture
+   ratée d'une enchère encore vivante la garde à l'écran ; chaque démarrage du Market Watcher
+   refait le balayage complet. Moniteur des ventes : pas de « VENDU » renvoyé après un
+   rechargement si la lecture de démarrage a échoué.
+
+Test ajouté : `hunt-cap-safety` (Chasse L max 10, plafond utilisateur 200, rival à 250) — fork.38
+riposte à 275 et efface le plafond de 200 ; fork.39 s'arrête et le conserve. `network-efficiency`
+renforcé : l'enchère purgée passe désormais par le suivi ciblé, avec le bon gagnant au journal.
 
 ## 🟠 Fragilités structurelles
 

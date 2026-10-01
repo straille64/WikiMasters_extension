@@ -78,6 +78,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   mise max), riposte puis arrêt, raretés décochées et propres ventes ignorées.
 - `tests/network-efficiency.test.mjs` : horloge serveur juste malgré un site lent, suivi ciblé
   sans mot-clé, mise manuelle captée, purge prudente, une seule boucle après Stop/Start.
+- `tests/hunt-cap-safety.test.mjs` : une Chasse qui lâche une enchère n'efface pas le plafond
+  posé par un autre réglage (auto-bid, Chasseur ciblé).
 - `tests/top-cards.test.mjs` : 💎 Cartes les plus chères — collection entière, cote de la
   rareté de chaque exemplaire, sans cote à part, filtre par rareté.
 - `tests/low-balance.test.mjs` : solde insuffisant — aucune mise auto au-delà du solde,

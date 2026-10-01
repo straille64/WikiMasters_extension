@@ -92,7 +92,8 @@ async function scenarioNoKeyword() {
   const { page, errors } = await open('/', {
     wm_watchlist: '[]',
     wm_username_override: 'moi',
-    // m-1 vivante · m-2 terminée (relue terminée → purgée) · m-3 vivante mais relecture en 404.
+    // m-1 vivante · m-2 vivante au démarrage, finie 10 s plus tard (relue terminée → purgée
+    // par le SUIVI CIBLÉ, avec le bon gagnant) · m-3 vivante mais relecture en 404.
     wm_my_bids: JSON.stringify(['m-1', 'm-2', 'm-3']),
   });
   const listCalls = [];   // horodatage des pages de marché (balayage)
@@ -106,12 +107,12 @@ async function scenarioNoKeyword() {
     const one = url.match(/\/marketplace\/(m-\d|x-\d)(\?|$)/);
     if (one) {
       if (one[1] === 'm-3') return json(route, { error: 'introuvable' }, 404);
-      if (one[1] === 'm-2') return json(route, { auction: auction('m-2', -60000, 'rival') });
+      if (one[1] === 'm-2') return json(route, { auction: auction('m-2', 10000, 'rival') });
       return json(route, { auction: auction(one[1], 600000, 'moi') });
     }
     if (/[?&]page=/.test(url)) {
       listCalls.push(Date.now() - t0);
-      return json(route, { auctions: [auction('m-1', 600000, 'moi'), auction('m-3', 600000, 'moi')], page: 1, limit: 50, hasMore: false });
+      return json(route, { auctions: [auction('m-1', 600000, 'moi'), auction('m-2', 10000, 'moi'), auction('m-3', 600000, 'moi')], page: 1, limit: 50, hasMore: false });
     }
     return json(route, { auctions: [] });
   });
@@ -126,6 +127,7 @@ async function scenarioNoKeyword() {
   const st = await page.evaluate(() => ({
     bids: JSON.parse(localStorage.getItem('wm_my_bids') || '[]'),
     status: (document.querySelector('#wm-market-status') || document.body).innerText,
+    log: [...document.querySelectorAll('.wm-log-e')].map(e => e.innerText).join('\n'),
   }));
   await page.close();
   return { listCalls, ...st, errors };
@@ -173,6 +175,7 @@ if (lateSweeps.length) problems.push(`B. ${lateSweeps.length} page(s) de marché
 if (!B.listCalls.length) problems.push('B. aucun balayage au démarrage (repérage des mises faites ailleurs perdu)');
 if (!B.bids.includes('x-9')) problems.push('B. mise faite à la main sur le site non suivie');
 if (B.bids.includes('m-2')) problems.push('B. enchère terminée (relue) jamais purgée');
+else if (!/Enchère perdue[^\n]*Carte m-2[^\n]*rival/.test(B.log)) problems.push('B. m-2 purgée sans le journal « Enchère perdue … rival » (état final relu)');
 if (!B.bids.includes('m-1')) problems.push('B. enchère vivante purgée à tort');
 if (!B.bids.includes('m-3')) problems.push('B. enchère purgée sur une simple relecture ratée (404)');
 if (C.after.length > 4) problems.push(`C. ${C.after.length} lectures /mine en 31 s après Stop/Start (deux boucles ?) : ${C.after.map(t => Math.round(t / 1000)).join(', ')} s`);

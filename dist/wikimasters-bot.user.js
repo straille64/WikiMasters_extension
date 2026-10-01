@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.38
+// @version      1.3.13-fork.39
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.38';
+    const WM_VERSION = '1.3.13-fork.39';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1141,6 +1141,7 @@
     }
     // Pause progressive après un refus 403/429 : 1, 2, 4 puis 5 min (avant : 5 min d'emblée).
     let salesRefusalStreak = 0;
+    let salesLastRefusalAt = 0;
 
     // Récupère et met en cache l'historique d'une carte (une requête)
     async function fetchCardSales(cardId, opts) {
@@ -1162,10 +1163,19 @@
             // fetch d'origine : notre intercepteur capte les cotes demandées par le SITE ; il
             // stockait aussi une 2e fois celles du bot (et réécrivait tout le cache en local).
             const rawFetch = window.wmOriginalFetch || fetch;
-            const res = await rawFetch(
-                `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales?scope=summary`,
-                { credentials: "include" }
-            );
+            // 12 s maximum : la file n'a que 4 places, une lecture bloquée les gèlerait toutes
+            // (Chasse, Revente, Trash Seller, surcouche). Abandon = « pas lu », retenté plus tard.
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 12000);
+            let res;
+            try {
+                res = await rawFetch(
+                    `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales?scope=summary`,
+                    { credentials: "include", signal: ctrl.signal }
+                );
+            } finally {
+                clearTimeout(timer);
+            }
             if (!res.ok) {
                 // Trace l'échec dans le cache (cf. SALES_FAIL_TTL) pour ne pas redemander
                 // cette carte à chaque scan. `failed` la rend invisible à getCachedSales,
@@ -1179,6 +1189,7 @@
                 if (res.status === 403 || res.status === 429) {
                     // Plusieurs lectures en vol peuvent revenir refusées ensemble : une seule
                     // pause (et un seul palier de plus) par épisode de refus.
+                    salesLastRefusalAt = Date.now();
                     if (Date.now() >= salesEndpointCooldownUntil) {
                         salesRefusalStreak++;
                         const pauseMs = Math.min(5 * 60 * 1000, 60 * 1000 * Math.pow(2, salesRefusalStreak - 1));
@@ -1191,7 +1202,10 @@
                 }
                 return null;
             }
-            salesRefusalStreak = 0;
+            // Palier remis à zéro seulement après 10 min sans aucun refus : une réponse 200 qui
+            // revient d'une rafale en partie refusée ne prouve pas que le site a cessé de freiner
+            // (relecture du 01/10 : la pause restait bloquée à 1 min).
+            if (Date.now() - salesLastRefusalAt > 10 * 60 * 1000) salesRefusalStreak = 0;
             return storeSalesEntry(cardId, await res.json());
         } catch(e) { return null; }
     }
@@ -3519,9 +3533,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     if (!isAuctionOver(a)) auctions.push(a);
                     return;
                 }
-                // Relecture ratée (404/500 intermittents) : sans fin connue, aucune conclusion.
+                // Relecture ratée (404/500 intermittents) : sans fin connue, aucune conclusion ;
+                // encore vivante d'après son dernier état → on la garde affichée (sinon la liste
+                // clignotait d'un passage à l'autre).
                 const last = activeHitsMap.get(id);
                 if (!(last && last.auction && last.auction.end_at)) incomplete = true;
+                else if (!isAuctionOver(last.auction)) auctions.push(last.auction);
             });
         }
         lastScanPageCount = 1;
@@ -3941,8 +3958,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const told = minBidFromRefusal(data, lastErr, amt - 1);
                 // « minimum 97 » alors qu'on a misé 97 : le site veut strictement plus.
                 if (told >= amt) {
-                    quickNext = told > amt ? told : amt + 1;
-                    learnedMinBid.set(a.id, { cur: curAtRefusal, amount: quickNext });
+                    const need = told > amt ? told : amt + 1;
+                    if (learnedMinBid.size > 500) learnedMinBid.clear();
+                    learnedMinBid.set(a.id, { cur: curAtRefusal, amount: need });
+                    // Minimum = ma dernière mise + 10 % : c'est sans doute MOI qui mène (autre
+                    // onglet, mise faite à la main en même temps). Pas de relance à l'aveugle —
+                    // on relit l'enchère (chemin lent, qui vérifie « je mène déjà »).
+                    const mine = myLastBidMap.get(a.id);
+                    if (!(Number.isFinite(mine) && need <= bidIncrement(mine))) quickNext = need;
                 }
             }
             /* Le site a DONNÉ son minimum (réponse 409 {"code":"bid_too_low","min":79}) : on
@@ -4945,7 +4968,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     marketAlertEl.innerHTML = `<div style="color:#555;font-size:11px;text-align:center;padding:4px 0;">
                         Aucune carte recherchée en vente</div>`;
                 }
-                return;
+                // Suivi ciblé (aucun mot-clé) : même cadence de 20 s que plus bas.
+                return scan.trackedOnly ? 20000 * marketThrottleFactor : undefined;
             }
 
             // Sépare nouveaux hits des connus — uniquement les hits MOTS-CLÉS déclenchent son/Discord/auto-snipe
@@ -5942,7 +5966,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const e = legendHunt.get(id);
         if (!e) return;
         legendHunt.delete(id);
-        if (e.setCap && autoBidMaxMap.has(id)) { autoBidMaxMap.delete(id); saveAutoBidMax(); }
+        // Le plafond posé par la chasse n'est retiré que s'il est TOUJOURS le sien : entre-temps,
+        // un Chasseur ciblé, le Hunter ou l'utilisateur a pu en poser un autre sur la même
+        // enchère — le supprimer libérait l'auto-bid jusqu'au seul plafond global (relecture
+        // du 01/10, reproduit : riposte à 275 au lieu de l'arrêt à 200).
+        if (e.setCap && autoBidMaxMap.has(id)
+            && (e.capValue === undefined || autoBidMaxMap.get(id) === e.capValue)) {
+            autoBidMaxMap.delete(id); saveAutoBidMax();
+        }
     }
 
     async function discoverLegends() {
@@ -6009,7 +6040,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!(next <= max)) continue;
             const hadCap = autoBidMaxMap.has(a.id);
             if (!hadCap) { autoBidMaxMap.set(a.id, max); saveAutoBidMax(); }
-            legendHunt.set(a.id, { title: a.card?.wikipedia_title || '?', setCap: !hadCap });
+            legendHunt.set(a.id, { title: a.card?.wikipedia_title || '?', setCap: !hadCap, capValue: max });
             // Connue de la hot lane : elle resserre son sondage à l'approche de la fin.
             activeHitsMap.set(a.id, { auction: a, endAt: a.end_at });
             wmLog(`👑 Légendaire repérée : <b>${esc(a.card?.wikipedia_title || '?')}</b> — mise minimale ${next} 💰, fin dans ${Math.round(remaining / 1000)} s · mise si ≤ ${max} 💰 dans les ${getSetting('legendHuntWindowSec')} dernières secondes`);
@@ -6104,7 +6135,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Le temps restant est remesuré : la lecture des cotes a pu prendre plusieurs secondes.
             const left = auctionEndMs(c.a) - serverNow();
             if (left < OPPORTUNITY_MIN_LEFT_MS) { if (!hadCap) { autoBidMaxMap.delete(c.a.id); saveAutoBidMax(); } continue; }
-            legendHunt.set(c.a.id, { title, setCap: !hadCap, cap, kind: 'opti', rarity: c.rar, cote });
+            legendHunt.set(c.a.id, { title, setCap: !hadCap, capValue: cap, cap, kind: 'opti', rarity: c.rar, cote });
             activeHitsMap.set(c.a.id, { auction: c.a, endAt: c.a.end_at });
             wmLog(`🎯 Opportunité : <b>${esc(title)}</b> [${esc(c.rar)}] — mise min ${c.next} 💰 pour une cote de ${cote} 💰 · mise jusqu'à ${cap} 💰 dans les ${getSetting('legendHuntWindowSec')} dernières secondes (fin dans ${Math.round(left / 1000)} s)`);
             warnAutoBidsPaused('la Chasse opti');
@@ -6367,6 +6398,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         sessionStorage.setItem('wm_watcher_active', '1');
         stopMarketWatcher();
         marketWatcherActive = true;
+        lastNoKeywordFullSweep = 0;   // sans mot-clé : balayage complet à chaque démarrage
         lastMarketHits.clear();
         activeHitsMap.clear();
         clearAllOutbid();
@@ -7581,6 +7613,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     continue;
                 }
             } else {
+                // Cote inconnue et lecture impossible pour l'instant (pause imposée par le site) :
+                // on reporte la carte au lieu de la vendre au prix minimum du tableau.
+                if (getSetting('sellUseMarketPrice') && !getCachedSales(cardId) && Date.now() < salesEndpointCooldownUntil) {
+                    skipped++;
+                    if (Date.now() - (sellBatch._pauseLogTs || 0) > 60000) {
+                        sellBatch._pauseLogTs = Date.now();
+                        wmLog(`⏸️ Cote de <b>${esc(title)}</b> illisible pour l'instant (le site a mis les cotes en pause) — mise en vente reportée plutôt qu'au prix minimum.`);
+                    }
+                    continue;
+                }
                 // Prix de base : marché (moyenne × %) si activé & historique dispo, sinon tableau
                 priceInfo = await resolveSellBasePrice(rarity, cardId);
             }
@@ -11672,7 +11714,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 setSetting(key, v);
                 // Le max change → les plafonds posés par la chasse suivent.
                 if (key === 'legendHuntMaxPrice') {
-                    for (const [id, e] of legendHunt) if (e.setCap) autoBidMaxMap.set(id, v);
+                    // Chasse L seulement, et seulement les plafonds encore posés par elle.
+                    for (const [id, e] of legendHunt) {
+                        if (e.kind === 'opti' || !e.setCap || autoBidMaxMap.get(id) !== e.capValue) continue;
+                        autoBidMaxMap.set(id, v);
+                        e.capValue = v;
+                    }
                     saveAutoBidMax();
                 }
                 wmLog(msg(v));
@@ -13919,12 +13966,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Une passe à la fois : la requête (lourde, 3 à 7 s sur la capture du 01/10) pouvait encore
     // tourner quand l'intervalle suivant tombait.
     let _checkRecentSalesRunning = false;
+    // Faux tant que les ventes déjà connues n'ont pas été mémorisées : si la lecture de
+    // démarrage a échoué, la 1re passe réussie mémorise sans notifier (sinon, avec la fenêtre
+    // de 5 min, un rechargement renverrait des « VENDU » déjà annoncés).
+    let _salesMonitorPrimed = false;
     async function checkRecentSales() {
         if (_checkRecentSalesRunning) return;
         _checkRecentSalesRunning = true;
         try {
             const recentSales = await fetchSoldFromDb(30);
             if (!Array.isArray(recentSales)) return;
+            if (!_salesMonitorPrimed) {
+                recentSales.forEach(sale => knownSoldIds.add(sale.id));
+                _salesMonitorPrimed = true;
+                return;
+            }
 
             for (const sale of recentSales) {
                 if (knownSoldIds.has(sale.id)) continue;
@@ -13965,7 +14021,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Pré-remplit les IDs connus pour ne pas notifier les anciennes ventes au démarrage.
         // Le setInterval part dans tous les cas (succès ou échec), comme avant.
         fetchSoldFromDb(50)
-            .then(rows => { (rows || []).forEach(h => knownSoldIds.add(h.id)); })
+            .then(rows => {
+                if (!Array.isArray(rows)) return;
+                rows.forEach(h => knownSoldIds.add(h.id));
+                _salesMonitorPrimed = true;
+            })
             .catch(() => {})
             // 60 s (avant 30 s) : simple notification Discord des ventes faites hors du bot ;
             // les ventes du bot sont suivies, elles, par checkSellHistoryResults.
@@ -14625,6 +14685,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             let isMarketplaceCreate = false;
             let isMarketplaceDelete = false;
             let bidAuctionId = null;   // POST /api/marketplace/{id}/bid (site OU bot)
+            let bidAmount = null;      // montant de cette mise, lu dans le corps de la requête
             let isCollectionFetch = false;
             let siteSalesCardId = null;
             try {
@@ -14645,7 +14706,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // que par le balayage complet du marché (désormais espacé sans mot-clé).
                 if (method === 'POST') {
                     const bm = url.match(/\/api\/marketplace\/([^/?#]+)\/bid/);
-                    if (bm) bidAuctionId = decodeURIComponent(bm[1]);
+                    if (bm) {
+                        bidAuctionId = decodeURIComponent(bm[1]);
+                        try {
+                            const b = args[1] && typeof args[1].body === 'string' ? JSON.parse(args[1].body) : null;
+                            if (b && Number.isFinite(Number(b.amount))) bidAmount = Number(b.amount);
+                        } catch(e) {}
+                    }
                 }
                 // Le site charge lui-même sa collection : on lit la réponse au passage pour
                 // alimenter l'index titre → card_id de la surcouche Collection. Le DOM du
@@ -14696,8 +14763,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
 
             // Mise acceptée → l'enchère est suivie (surenchères, hot lane, liste « mes enchères »).
+            // Le montant est retenu comme « ma dernière mise » : iAmLeading s'en sert, et une
+            // relance du bot ne surenchérit pas sur ma propre mise faite à la main.
+            // (Pas markAuctionAsMine : il compterait la mise dans la limite horaire des mises auto.)
             if (bidAuctionId) {
-                p.then(res => { if (res && res.ok) { try { trackMyBid(bidAuctionId); } catch(e) {} } }).catch(() => {});
+                p.then(res => {
+                    if (!res || !res.ok) return;
+                    try {
+                        trackMyBid(bidAuctionId);
+                        if (Number.isFinite(bidAmount)) myLastBidMap.set(bidAuctionId, bidAmount);
+                    } catch(e) {}
+                }).catch(() => {});
             }
 
             if (isMarketplaceCreate) {
