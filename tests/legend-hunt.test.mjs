@@ -87,9 +87,12 @@ async function run({ armed, strict = false }) {
       if (strict) {
         const required = st.cur + (m[1] === 'l-cheap' ? 3 : 2);
         const ok = amount >= required;
-        bids.push({ id: m[1], amount, remainingS: Math.round((st.end - Date.now()) / 1000), ok });
-        if (!ok) return route.fulfill({ status: 400, contentType: 'application/json',
-          body: JSON.stringify({ error: m[1] === 'l-cheap' ? `Mise minimale : ${required} 💰` : 'Montant trop bas' }) });
+        bids.push({ id: m[1], amount, remainingS: Math.round((st.end - Date.now()) / 1000), ok, t: Date.now() });
+        // l-cheap : le refus RÉEL du site (capture du 01/10) — 409 {"code":"bid_too_low","min":N}.
+        if (!ok) return route.fulfill({ status: m[1] === 'l-cheap' ? 409 : 400, contentType: 'application/json',
+          body: JSON.stringify(m[1] === 'l-cheap'
+            ? { error: `Mise trop basse (minimum ${required} wikibidous)`, code: 'bid_too_low', min: required }
+            : { error: 'Montant trop bas' }) });
         st.cur = amount; st.bidder = 'moi';
         return route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
       }
@@ -103,7 +106,13 @@ async function run({ armed, strict = false }) {
       }
       return route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
     }
-    if (m) return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ auction: toAuction(m[1]) }) });
+    if (m) {
+      // Mode strict : relire l'enchère coûte 3 s (le site réel : 3 à 8 s). Une relance qui
+      // attend cette relecture arrive trop tard face aux autres enchérisseurs.
+      if (strict && m[1] === 'l-cheap') return new Promise(res => setTimeout(res, 3000)).then(() =>
+        route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ auction: toAuction(m[1]) }) }));
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ auction: toAuction(m[1]) }) });
+    }
     if (/\/mine/.test(url)) return route.fulfill({ status: 200, contentType: 'application/json', body: '{"won":[],"auctions":[]}' });
     if (/\/cards\//.test(url)) return route.fulfill({ status: 200, contentType: 'application/json', body: '{"summary":{}}' });
     // Le site honore le filtre de rareté : uniquement des L.
@@ -150,6 +159,11 @@ const sCheap = strict.bids.filter(b => b.id === 'l-cheap');
 const sMute = strict.bids.filter(b => b.id === 'l-mute');
 if (!sCheap.some(b => b.ok && b.amount === 8)) problems.push(`minimum annoncé par le site (8) non repris : ${JSON.stringify(sCheap)}`);
 if (sCheap.filter(b => !b.ok && b.amount === 6).length > 1) problems.push(`montant refusé (6) renvoyé plusieurs fois : ${JSON.stringify(sCheap)}`);
+// Le site a donné son minimum (min: 8) : la relance part tout de suite, sans relire l'enchère (3 s).
+const refused = sCheap.find(b => !b.ok), retried = refused && sCheap.find(b => b.t > refused.t);
+const rebidGap = refused && retried ? retried.t - refused.t : null;
+if (rebidGap == null) problems.push('pas de relance après le refus « bid_too_low »');
+else if (rebidGap > 1500) problems.push(`relance ${rebidGap} ms après le refus : l'enchère a été relue (3 s) au lieu d'utiliser le minimum donné par le site`);
 if (!sMute.some(b => b.ok)) problems.push(`refus « trop bas » sans chiffre : jamais passé (${JSON.stringify(sMute)})`);
 if (strict.bids.some(b => b.amount > 10)) problems.push(`règle stricte : mise au-delà du max de 10 (${JSON.stringify(strict.bids)})`);
 
@@ -162,4 +176,4 @@ if (problems.length) {
   console.error('  — mises (armé) : ' + JSON.stringify(armed.bids));
   process.exit(1);
 }
-console.log(`✅ mise dans la fenêtre (${cheap[0].remainingS} s) · riposte ${cheap.map(b => b.amount).join(' → ')} puis arrêt au max · L trop chère ignorée · rien en pause · minimum du site repris (${sCheap.map(b => b.amount + (b.ok ? '✓' : '✗')).join(' → ')} ; sans chiffre ${sMute.map(b => b.amount + (b.ok ? '✓' : '✗')).join(' → ')})`);
+console.log(`✅ mise dans la fenêtre (${cheap[0].remainingS} s) · riposte ${cheap.map(b => b.amount).join(' → ')} puis arrêt au max · L trop chère ignorée · rien en pause · minimum du site repris en ${rebidGap} ms (${sCheap.map(b => b.amount + (b.ok ? '✓' : '✗')).join(' → ')} ; sans chiffre ${sMute.map(b => b.amount + (b.ok ? '✓' : '✗')).join(' → ')})`);

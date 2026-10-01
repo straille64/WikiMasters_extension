@@ -1186,6 +1186,54 @@ gain minimum élevé (50 💰 chez l'utilisateur), les petites raretés restent 
 `tests/opti-hunt.test.mjs` ajoute 30 L sans intérêt mais à évaluer : la version précédente ne mise
 plus ni sur l'UR ni sur la SR ; la nouvelle mise sur les deux.
 
+### 55. Optimisation réseau (captures F12 du 01/10)
+Deux captures réseau (147 requêtes en 110 s, puis 83 en 52 s) et les logs associés. Le site est
+lent (médiane 4 à 6 s par requête), une page de marché sur quatre répond 500, et le bot en
+rajoutait beaucoup. Analyse par trois agents (balayage, `/mine`+Supabase, hot lane/Chasses),
+corrections, puis relecture adversariale par un quatrième agent.
+
+**✅ Corrigé (1.3.13-fork.38)** — sans retirer aucune fonctionnalité :
+
+1. **Horloge serveur** : l'en-tête `Date` est posé à la FIN du traitement du site, pas au milieu.
+   L'ancien calcul (milieu de la requête) donnait un décalage entre −6 et +12 s sur ces
+   captures ; mesuré à l'arrivée des en-têtes (+0,5 s pour la troncature à la seconde), il tient
+   entre +0,1 et +1,1 s. Toutes les décisions de fin d'enchère en dépendent.
+2. **Mise refusée « trop basse »** : le site répond `409 {"code":"bid_too_low","min":79}`. Le bot
+   relisait l'enchère (3 à 8 s) avant de remiser — et arrivait de nouveau trop bas (71 → 79 → 87).
+   Il remise désormais **immédiatement** au minimum donné (6 ms au lieu de 3,2 s en test), sous
+   les mêmes garde-fous ; au-delà du plafond, c'est un arrêt normal (« on s'arrête »), plus un
+   « échec ». Le plafond propre à une Chasse est revérifié à chaque relance ; une chasse dont la
+   mise suivante dépasse son plafond est abandonnée (elle gardait la hot lane à 150 ms).
+3. **Aucun mot-clé** : chaque scan lisait tout le marché (~270 pages, 5 à 24 s chacune, 25 % de 500),
+   en continu. Sans mot-clé, ce balayage ne sert qu'à repérer les enchères où je mène sans que le
+   bot le sache. Désormais : relecture des seules enchères suivies toutes les 20 s (en
+   réutilisant les lectures de la hot lane), balayage complet au démarrage puis toutes les
+   15 min, et les mises faites à la main sur le site (même onglet) sont captées par
+   l'intercepteur. Une relecture ratée sans fin connue rend le scan partiel : rien n'est purgé.
+4. **État des ventes partagé** : `/mine` + recomptage en base (3 à 7 s) était demandé ~11 fois en
+   93 s par trois modules. Requête en vol partagée, génération invalidée à chaque création /
+   annulation de vente (bot ou site), cache de 25 s pour le seul affichage. `syncWonAuctions` ne
+   rappelle plus `/mine` pour rien ; la Revente partage la porte « une fois par minute » (avec
+   une lecture immédiate à son démarrage).
+5. **Cotes : file unique** : surcouche Collection, Chasse opti, Revente et Trash Seller lisaient
+   les cotes chacun de leur côté (jusqu'à 9 en vol → 403 → toutes les cotes en pause 5 min).
+   Au plus 4 lectures en vol, Chasse/Revente d'abord ; pause progressive 1, 2, 4 puis 5 min ; les
+   cotes du bot ne repassent plus par son propre intercepteur (stockage en double).
+6. **Opportunités** sous 3 s restantes ignorées avant toute lecture de cote (logs « fin dans 0 s »).
+7. **Lecture d'une enchère** limitée à 10 s (la hot lane attendait la plus lente).
+8. **Purge** : une enchère suivie reste vivante jusqu'à 15 s après sa fin connue (heure serveur) —
+   une relecture ratée près de la fin ne conclut plus « perdue / gagnée » sur un état incomplet.
+9. **Boucles Trash Seller / Revente** : un Stop puis Start pendant une pause laissait deux boucles
+   (mises en vente en double) ; l'ancienne boucle du Trash Seller, en finissant, arrêtait même la
+   nouvelle. Jeton de génération.
+10. **Moniteur des ventes** (notifications des ventes hors bot) : une passe à la fois, toutes les
+    60 s, fenêtre de 5 min.
+
+Tests : `network-efficiency` (horloge, sans mot-clé, mise manuelle, purge, Stop/Start — la version
+précédente échoue sur le balayage continu, la mise manuelle et la double boucle),
+`legend-hunt` (refus réel 409 `bid_too_low`, relecture lente : relance en 6 ms contre 3,2 s),
+`top-cards` (4 lectures de cote simultanées au plus ; avant : 5).
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

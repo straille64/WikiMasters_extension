@@ -67,6 +67,8 @@ const errors = [];
 page.on('pageerror', e => errors.push(e.message));
 const pagesRead = new Set();
 let refused = 0;
+// Lectures de cote en vol au même moment (file unique : jamais plus de 4).
+let inflight = 0, maxInflight = 0;
 await page.goto(origin + '/collection');
 await page.evaluate(() => {
   localStorage.setItem('wm_onboarding_done', '1');
@@ -86,10 +88,14 @@ await page.route('**/api/marketplace**', route => {
   const url = route.request().url();
   const m = url.match(/cards\/([^/?]+)\/sales/);
   if (m) {
-    if (m[1] === 'c-403' && refused === 0) { refused++; return route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"ko"}' }); }
-    const summary = {};
-    for (const [r, v] of Object.entries(COTE[m[1]] || {})) summary[r] = { average: v };
-    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ summary }) });
+    inflight++; maxInflight = Math.max(maxInflight, inflight);
+    return new Promise(res => setTimeout(res, 150)).then(() => {
+      inflight--;
+      if (m[1] === 'c-403' && refused === 0) { refused++; return route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"ko"}' }); }
+      const summary = {};
+      for (const [r, v] of Object.entries(COTE[m[1]] || {})) summary[r] = { average: v };
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ summary }) });
+    });
   }
   if (/\/mine/.test(url)) return route.fulfill({ status: 200, contentType: 'application/json', body: '{"sellingCount":0,"maxConcurrentAuctions":5}' });
   return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ auctions: [], page: 1, limit: 50, hasMore: false }) });
@@ -130,6 +136,7 @@ else {
   if (!/3 carte\(s\) sans cote/.test(res.text)) problems.push("les cartes sans cote ne sont pas annoncées");
   if (!/Joyau/.test(onlyL) || /Rare UR|Commune/.test(onlyL)) problems.push('le filtre L ne montre pas que les Légendaires');
 }
+if (maxInflight > 4) problems.push(`${maxInflight} lectures de cote simultanées (file unique : 4 au plus — au-delà, le site répond 403)`);
 for (const e of errors) problems.push('erreur page : ' + e);
 
 if (problems.length) {
@@ -138,4 +145,4 @@ if (problems.length) {
   if (res) console.error('  — top : ' + JSON.stringify(res.rated.slice(0, 6)) + ' · statut : ' + res.status);
   process.exit(1);
 }
-console.log(`✅ 2 pages lues · Joyau 900 > Rare UR 300 > Double rareté 50 · cote par rareté (même carte SR 50 / C 5) · ×2 compté · cote refusée redemandée · 3 sans cote à part · total ${res.total} 💰 · filtre L`);
+console.log(`✅ 2 pages lues · Joyau 900 > Rare UR 300 > Double rareté 50 · cote par rareté (même carte SR 50 / C 5) · ×2 compté · cote refusée redemandée · 3 sans cote à part · total ${res.total} 💰 · filtre L · ${maxInflight} lecture(s) de cote simultanée(s) au plus`);
