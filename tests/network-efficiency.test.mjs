@@ -4,7 +4,7 @@
 // Trois scénarios en parallèle, chacun dans son onglet :
 //   A. Horloge : le site date sa réponse à la FIN de son traitement. Une réponse de 6 s ne
 //      doit plus décaler l'estimation de 3 s (l'ancien calcul prenait le milieu de la requête).
-//   B. Aucun mot-clé : après le balayage complet du démarrage, plus de pages de marché — seules
+//   B. Aucun mot-clé : AUCUNE page de marché, même au démarrage (fork.40) — seules
 //      les enchères suivies sont relues. Une mise faite à la main sur le site est suivie ; une
 //      enchère relue terminée est purgée ; une relecture ratée ne purge rien.
 //   C. Trash Seller arrêté puis relancé pendant une pause : une seule boucle (avant : deux
@@ -60,7 +60,8 @@ async function open(pathname, storage) {
 
 // ── A. Horloge
 async function scenarioClock() {
-  const { page, errors } = await open('/', { wm_watchlist: '[]' });
+  // Un mot-clé : c'est la recherche (pages de marché) qui répond lentement ici.
+  const { page, errors } = await open('/', { wm_watchlist: JSON.stringify([{ kw: 'rien', mode: 'manuel' }]) });
   await page.route('**/api/marketplace**', async route => {
     const url = route.request().url();
     if (/\/mine/.test(url)) return json(route, { sellingCount: 0, maxConcurrentAuctions: 5 });
@@ -98,6 +99,9 @@ async function scenarioNoKeyword() {
   });
   const listCalls = [];   // horodatage des pages de marché (balayage)
   const t0 = Date.now();
+  // Sans page de marché, l'horloge serveur se recale sur la lecture du solde (serveur +3 s).
+  await page.route('**/api/wikibidous**', r => json(r, { balance: 1000 }, 200,
+    { date: new Date(Date.now() + 3000).toUTCString(), 'access-control-expose-headers': 'date' }));
   await page.route('**/api/marketplace**', route => {
     const url = route.request().url();
     const method = route.request().method();
@@ -125,6 +129,7 @@ async function scenarioNoKeyword() {
     headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ amount: 70 }) }));
   await page.waitForTimeout(40000);
   const st = await page.evaluate(() => ({
+    offset: window.wmClockOffset ? window.wmClockOffset() : NaN,
     bids: JSON.parse(localStorage.getItem('wm_my_bids') || '[]'),
     status: (document.querySelector('#wm-market-status') || document.body).innerText,
     log: [...document.querySelectorAll('.wm-log-e')].map(e => e.innerText).join('\n'),
@@ -170,9 +175,9 @@ srv.close();
 
 const problems = [];
 if (!(A.offset >= 2000 && A.offset <= 4200)) problems.push(`A. décalage d'horloge estimé ${A.offset} ms pour un serveur en avance de 3 000 ms (réponse de 6 s)`);
-const lateSweeps = B.listCalls.filter(t => t > 15000);
-if (lateSweeps.length) problems.push(`B. ${lateSweeps.length} page(s) de marché lue(s) après le balayage du démarrage (à ${lateSweeps.map(t => Math.round(t / 1000) + ' s').join(', ')})`);
-if (!B.listCalls.length) problems.push('B. aucun balayage au démarrage (repérage des mises faites ailleurs perdu)');
+if (!(B.offset >= 2000 && B.offset <= 4200)) problems.push(`B. horloge non recalée sans page de marché (décalage estimé ${B.offset} ms pour un serveur en avance de 3 000 ms)`);
+if (B.listCalls.length) problems.push(`B. ${B.listCalls.length} page(s) de marché lue(s) sans mot-clé (à ${B.listCalls.map(t => Math.round(t / 1000) + ' s').join(', ')}) — balayage inutile`);
+if (!/enchère\(s\) suivie\(s\)/.test(B.status)) problems.push(`B. statut du suivi ciblé absent : « ${B.status.slice(0, 120)} »`);
 if (!B.bids.includes('x-9')) problems.push('B. mise faite à la main sur le site non suivie');
 if (B.bids.includes('m-2')) problems.push('B. enchère terminée (relue) jamais purgée');
 else if (!/Enchère perdue[^\n]*Carte m-2[^\n]*rival/.test(B.log)) problems.push('B. m-2 purgée sans le journal « Enchère perdue … rival » (état final relu)');
@@ -186,4 +191,4 @@ if (problems.length) {
   for (const p of problems) console.error('  · ' + p);
   process.exit(1);
 }
-console.log(`✅ horloge ${Math.round(A.offset)} ms (vrai : 3000) malgré une réponse de 6 s · sans mot-clé : ${B.listCalls.length} page(s) au démarrage puis suivi ciblé seulement · mise manuelle suivie · terminée purgée, 404 conservée · Stop/Start : une seule boucle (${C.after.length} /mine en 31 s)`);
+console.log(`✅ horloge ${Math.round(A.offset)} ms (vrai : 3000) malgré une réponse de 6 s · sans mot-clé : aucune page de marché, suivi ciblé seulement · mise manuelle suivie · terminée purgée, 404 conservée · Stop/Start : une seule boucle (${C.after.length} /mine en 31 s)`);

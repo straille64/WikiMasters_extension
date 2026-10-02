@@ -77,7 +77,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/opti-hunt.test.mjs` : 🎯 Chasse opti — mise sous le plafond min(cote × 60 %, cote − 20,
   mise max), riposte puis arrêt, raretés décochées et propres ventes ignorées.
 - `tests/network-efficiency.test.mjs` : horloge serveur juste malgré un site lent, suivi ciblé
-  sans mot-clé, mise manuelle captée, purge prudente, une seule boucle après Stop/Start.
+  sans mot-clé (aucune page de marché lue), mise manuelle captée, purge prudente qu'une
+  enchère illisible ne bloque plus, une seule boucle après Stop/Start.
 - `tests/hunt-cap-safety.test.mjs` : une Chasse qui lâche une enchère n'efface pas le plafond
   posé par un autre réglage (auto-bid, Chasseur ciblé).
 - `tests/top-cards.test.mjs` : 💎 Cartes les plus chères — collection entière, cote de la

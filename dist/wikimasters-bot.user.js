@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.39
+// @version      1.3.13-fork.40
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.39';
+    const WM_VERSION = '1.3.13-fork.40';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -2315,6 +2315,8 @@
         try {
             const d = res && res.headers && res.headers.get && res.headers.get('date');
             if (!d) return;
+            // Réponse servie par un cache (CDN) : son Date est celui de la réponse d'origine.
+            if (parseInt(res.headers.get('age') || '0', 10) > 0) return;
             const serverMs = Date.parse(d);
             if (!Number.isFinite(serverMs)) return;
             /* Instant de référence = ARRIVÉE des en-têtes (appelé juste après `await fetch`).
@@ -2550,7 +2552,12 @@
 
     async function fetchBalance() {
         try {
-            const res = await fetch("https://www.wiki-masters.com/api/wikibidous", { credentials: "include" });
+            // no-store : un solde doit être frais — et une réponse servie depuis le cache
+            // porterait un en-tête Date ancien, qui fausserait l'horloge serveur.
+            const res = await fetch("https://www.wiki-masters.com/api/wikibidous", { credentials: "include", cache: "no-store" });
+            // Lu à chaque passage du Market Watcher : sans mot-clé (aucune page de marché lue),
+            // c'est la source qui garde l'horloge serveur à jour.
+            syncServerClockFromResponse(res);
             if (!res.ok) return;
             const data = await res.json();
             const newBalance = data.balance ?? data.amount ?? data.wikibidous ?? Infinity;
@@ -3485,31 +3492,37 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                  incomplete: refusedKeywords > 0 };
     }
 
-    /* ── Aucun mot-clé : suivi ciblé au lieu du balayage complet ──
+    /* ── Aucun mot-clé : suivi ciblé, JAMAIS de balayage complet ──
        Capture réseau du 01/10 : sans mot-clé, chaque scan lisait TOUT le marché (~270 pages,
        5 à 24 s chacune, 1 page sur 4 refusée en 500) en continu — l'essentiel du trafic du
-       bot, qui ralentissait aussi les Chasses et la Revente. Sans mot-clé, ce balayage ne
-       sert qu'à repérer les enchères où je suis meneur sans que le bot le sache (mise faite
-       à la main dans un autre onglet ou sur un autre appareil). Tout le reste (affichage de
-       mes enchères, surenchères, auto-bid, purge des enchères finies) n'a besoin que des
-       enchères SUIVIES. Donc :
-         · scan courant = relecture des seules enchères suivies (celles que la hot lane vient
-           de lire, il y a < 15 s, ne sont pas relues) ;
-         · balayage complet conservé, mais une fois toutes les 15 min (et au démarrage) ;
+       bot, qui ralentissait aussi les Chasses et la Revente. Sans mot-clé, la liste du
+       Market Watcher n'affiche QUE mes enchères : tout (affichage, surenchères, auto-bid,
+       purge des enchères finies) n'a besoin que des enchères SUIVIES. Donc :
+         · scan = relecture des seules enchères suivies (celles que la hot lane vient de lire,
+           il y a < 15 s, ne sont pas relues) ; aucune enchère suivie → aucune requête ;
          · les mises faites à la main dans CET onglet sont captées directement (intercepteur).
+       fork.40 : le balayage complet « au démarrage puis toutes les 15 min » de fork.38 est
+       supprimé. Il repartait à CHAQUE rechargement de page (la Revente en provoque) et
+       défilait des centaines de pages pour un seul usage : repérer une mise faite depuis un
+       AUTRE appareil — les gains, eux, sont de toute façon relevés par syncWonAuctions.
        Une enchère relue terminée sort de la liste (purge + journal « perdue / gagnée » avec
        son état final) ; une relecture ratée sans fin connue rend le scan « partiel » : rien
        n'est purgé sur une absence non prouvée. */
-    const NO_KEYWORD_FULL_SWEEP_MS = 15 * 60 * 1000;
-    let lastNoKeywordFullSweep = 0;
     function hasEnabledKeywords() {
         return WATCHLIST.some(e => e.enabled !== false && e.kw);
     }
+    // Enchère suivie dont la relecture échoue sans fin connue : depuis quand (ms local).
+    const trackedFailSince = new Map();
+    const TRACKED_GIVE_UP_MS = 10 * 60 * 1000;
     async function fetchTrackedAuctions(scanGen) {
         const ids = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet,
             ...hunterFourbeMap.keys(), ...autoBidMaxMap.keys()])];
         const auctions = [];
-        let incomplete = false;
+        // Relectures ratées sans fin connue : gardées telles quelles (comptées « vivantes »
+        // pour la purge) — mais elles ne bloquent plus la purge des AUTRES enchères. Avant
+        // fork.40, une seule enchère illisible rendait tout le scan « partiel » à vie (le
+        // balayage complet du démarrage masquait le problème).
+        const keepIds = [];
         const fresh = (id) => {
             const e = activeHitsMap.get(id);
             return e && e.at && Date.now() - e.at < 15000 && e.auction && e.auction.id ? e.auction : null;
@@ -3528,6 +3541,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const id = grp[k];
                 const a = r.status === 'fulfilled' ? r.value : null;
                 if (a && a.id) {
+                    trackedFailSince.delete(id);
                     // Dernier état connu (gagnant, prix final) : c'est lui que la purge journalise.
                     if (a.end_at) activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
                     if (!isAuctionOver(a)) auctions.push(a);
@@ -3537,12 +3551,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // encore vivante d'après son dernier état → on la garde affichée (sinon la liste
                 // clignotait d'un passage à l'autre).
                 const last = activeHitsMap.get(id);
-                if (!(last && last.auction && last.auction.end_at)) incomplete = true;
+                if (!(last && last.auction && last.auction.end_at)) {
+                    // Illisible depuis 10 min d'affilée : l'enchère n'existe plus (soldée et
+                    // retirée par le site). On cesse de la garder → la purge la retire.
+                    if (!trackedFailSince.has(id)) trackedFailSince.set(id, Date.now());
+                    if (Date.now() - trackedFailSince.get(id) < TRACKED_GIVE_UP_MS) keepIds.push(id);
+                    else trackedFailSince.delete(id);
+                }
                 else if (!isAuctionOver(last.auction)) auctions.push(last.auction);
             });
         }
         lastScanPageCount = 1;
-        return { auctions, total: auctions.length, totalPages: 1, keywordMode: true, trackedOnly: true, incomplete };
+        return { auctions, total: auctions.length, totalPages: 1, keywordMode: true, trackedOnly: true, incomplete: false, keepIds };
     }
 
     // Fetch TOUTES les pages et retourne tous les auctions
@@ -4693,9 +4713,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 return 20000 * marketThrottleFactor;
             }
             if (isScanStale(scanGen)) return null;
-            // Aucun mot-clé : suivi ciblé, et balayage complet seulement toutes les 15 min.
-            const noKeywords = !hasEnabledKeywords();
-            if (!scan && noKeywords && lastNoKeywordFullSweep && Date.now() - lastNoKeywordFullSweep < NO_KEYWORD_FULL_SWEEP_MS) {
+            // Aucun mot-clé : suivi ciblé seulement, jamais de balayage complet du marché.
+            if (!scan && !hasEnabledKeywords()) {
                 scan = await fetchTrackedAuctions(scanGen);
             }
             if (!scan) {
@@ -4703,7 +4722,6 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     marketStatusEl.innerHTML =
                         `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ p.${page}/${total} · ${found} annonces</span>`;
                 });
-                if (noKeywords && scan && !scan.aborted) lastNoKeywordFullSweep = Date.now();
             }
             // Liste de mots-clés changée (ou STOP) pendant le scan : ces résultats
             // répondent à une question qu'on ne pose plus. On ne les affiche pas.
@@ -4713,8 +4731,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const now = new Date().toLocaleTimeString("fr-FR",
                 { hour:"2-digit", minute:"2-digit", second:"2-digit" });
             if (scan.trackedOnly) {
-                const nextFull = Math.max(0, Math.round((lastNoKeywordFullSweep + NO_KEYWORD_FULL_SWEEP_MS - Date.now()) / 60000));
-                marketStatusEl.innerHTML = `<span style="color:#555;font-size:10px;white-space:nowrap;" title="Aucun mot-clé : seules les enchères suivies sont relues ; balayage complet du marché toutes les 15 min (prochain dans ~${nextFull} min).">✅ ${now} · ${total} enchère(s) suivie(s) · marché complet dans ~${nextFull} min</span>`;
+                marketStatusEl.innerHTML = `<span style="color:#555;font-size:10px;white-space:nowrap;" title="Aucun mot-clé : le marché n'est pas parcouru, seules tes enchères en cours sont relues (toutes les 20 s). Ajoute un mot-clé pour chercher des cartes.">✅ ${now} · ${total} enchère(s) suivie(s) · aucun mot-clé, marché non parcouru</span>`;
             } else marketStatusEl.innerHTML = incomplete
                 ? `<span style="color:#fbbf24;font-size:10px;white-space:nowrap;">⚠️ ${now} · ${total} annonces · scan partiel (refus serveur)</span>`
                 : `<span style="color:#555;font-size:10px;white-space:nowrap;">✅ ${now} · ${total} annonces · ${totalPages} pages</span>`;
@@ -4729,6 +4746,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Un scan PARTIEL (mot-clé refusé par le serveur) ne prouve rien sur ce qui
             // manque : purger sur cette base déclarerait terminées des enchères vivantes.
             const liveIds = new Set(auctions.map(a => a.id));
+            // Suivi ciblé : relectures ratées sans fin connue → présumées vivantes (rien n'est
+            // purgé sur une absence non prouvée), sans bloquer la purge des autres.
+            if (scan.keepIds) for (const id of scan.keepIds) liveIds.add(id);
             let prunedAny = false;
             for (const id of (incomplete ? [] : [...myBidsSet])) {
                 if (liveIds.has(id)) continue;
@@ -6398,7 +6418,6 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         sessionStorage.setItem('wm_watcher_active', '1');
         stopMarketWatcher();
         marketWatcherActive = true;
-        lastNoKeywordFullSweep = 0;   // sans mot-clé : balayage complet à chaque démarrage
         lastMarketHits.clear();
         activeHitsMap.clear();
         clearAllOutbid();

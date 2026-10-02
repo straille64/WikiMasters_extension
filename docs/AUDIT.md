@@ -1261,6 +1261,35 @@ Test ajouté : `hunt-cap-safety` (Chasse L max 10, plafond utilisateur 200, riva
 riposte à 275 et efface le plafond de 200 ; fork.39 s'arrête et le conserve. `network-efficiency`
 renforcé : l'enchère purgée passe désormais par le suivi ciblé, avec le bon gagnant au journal.
 
+### #56 — Sans mot-clé, le Market Watcher parcourait encore tout le marché (fork.39)
+
+**Constat (captures du 02/10, mode « Revente seule », aucun mot-clé)** : le compteur à gauche du
+STOP défilait (p.210/210 · 9 930 annonces → p.228/228 · 10 784 annonces en 10 s). Le balayage
+complet « au démarrage puis toutes les 15 min » de fork.38 repartait à **chaque rechargement de
+page** (le minuteur n'était pas conservé), et la Revente recharge la page (retour sur
+`/collection`). Sans mot-clé, la liste n'affiche pourtant que MES enchères : ce balayage de
+~270 pages servait uniquement à repérer une mise faite depuis un autre appareil (les gains sont
+de toute façon relevés par `syncWonAuctions`).
+
+**✅ Corrigé (1.3.13-fork.40)** :
+
+1. Sans mot-clé, **aucune page de marché n'est lue**, jamais : seules les enchères suivies sont
+   relues toutes les 20 s (aucune suivie → aucune requête). Statut : « N enchère(s) suivie(s) ·
+   aucun mot-clé, marché non parcouru ». Avec un mot-clé, rien ne change.
+2. **Horloge serveur** : elle se recalait sur les pages de marché ; elle se recale aussi sur la
+   lecture du solde (faite à chaque passage), pour ne jamais rester sans référence. Solde lu en
+   `cache: no-store`, et une réponse servie par un cache (en-tête `Age` > 0) ne recale jamais
+   l'horloge (son `Date` serait celui de la réponse d'origine).
+3. **Bug masqué par le balayage** : une seule enchère suivie illisible (404 répété, aucune fin
+   connue) rendait chaque scan « partiel » → plus AUCUNE purge, pour toutes les enchères, à vie.
+   Désormais elle est seulement présumée vivante (gardée) sans bloquer la purge des autres, et
+   abandonnée après 10 min d'échecs consécutifs (l'enchère n'existe plus).
+
+Test : `network-efficiency` B — 0 page de marché sans mot-clé (fork.39 : 1 dès la 1re seconde,
+puis tout le marché), horloge recalée via le solde (+3 s simulées, mesuré ≈ 3,2 s), enchère
+terminée purgée malgré une voisine en 404 permanent (qui, elle, est conservée). Abandon après
+10 min vérifié sur une copie dont le délai est réduit à 20 s.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement
