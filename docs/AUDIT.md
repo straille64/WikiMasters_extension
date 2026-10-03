@@ -1290,6 +1290,38 @@ puis tout le marché), horloge recalée via le solde (+3 s simulées, mesuré �
 terminée purgée malgré une voisine en 404 permanent (qui, elle, est conservée). Abandon après
 10 min vérifié sur une copie dont le délai est réduit à 20 s.
 
+### #57 — « Vérification anti-bot requise » : le bot insistait (fork.40)
+
+**Constat (logs + capture F12 du 03/10)** : le site refuse des mises par
+`403 {"error":"Vérification anti-bot requise.","code":"human_verification_required"}`. Sa
+vérification s'affiche 1 à 2 s puis se fait seule. La Chasse opti renvoyait pourtant la même
+mise toutes les 4 à 5 s pendant plus de 3 min (6 refus en 20 s sur la capture), chaque refus
+journalisé « échouée ».
+
+**✅ Corrigé (1.3.13-fork.41)** — le bot ne contourne PAS la vérification, il la laisse se faire :
+
+- au premier refus de ce type : aucune nouvelle tentative, **toutes les mises automatiques en
+  pause 10 s** (Chasses, Hunter, auto-bid, Fourbe) ; la Revente et les mises manuelles continuent ;
+- refus de nouveau juste après la reprise : pause 30 s, puis 1, 2, 5 min ; retour à 10 s après une
+  mise acceptée ou 15 min sans refus ;
+- alertes au choix dans Paramètres (toutes cochées par défaut) : bandeau rouge avec compte à
+  rebours dans le Market Watcher, son, notification Windows (permission demandée au clic sur
+  START ou sur un mode de Chasse). Une ligne de journal au début et à la fin de chaque pause.
+
+### #58 — Prix manuel dans la Revente (demande du 03/10)
+
+Bouton ✏️ sur chaque carte de « Revente (achats de la Chasse) ». Choix de l'utilisateur : le prix
+manuel est **libre, même à perte** (avertissement au journal), et **fixe** (pas de baisse sur
+invendu) jusqu'à ce qu'il soit effacé (saisie vide = retour au prix automatique). Il permet aussi
+de vendre une carte « pas de cote ». Carte déjà en vente à un autre prix : confirmation → la vente
+est retirée (tant que personne n'a misé) et repart au nouveau prix ; sinon le prix s'applique à la
+prochaine mise en vente.
+
+Test : `antibot-manual-price` — fork.40 renvoie la mise 3 fois en 2,4 s pendant la vérification,
+sans bandeau ; fork.41 : 1 refus, reprise 10,1 s après. Prix manuel : 150 sous un payé de 300
+(et encore 150 après un invendu), 500 sans cote, vente à 1 754 retirée puis remise à 400, retour à
+la cote (400) après effacement.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

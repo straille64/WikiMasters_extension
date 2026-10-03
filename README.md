@@ -79,6 +79,9 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/network-efficiency.test.mjs` : horloge serveur juste malgré un site lent, suivi ciblé
   sans mot-clé (aucune page de marché lue), mise manuelle captée, purge prudente qu'une
   enchère illisible ne bloque plus, une seule boucle après Stop/Start.
+- `tests/antibot-manual-price.test.mjs` : vérification anti-bot du site respectée (pause de
+  10 s des mises auto, bandeau, reprise), prix manuel de la Revente (sous le payé, sans cote,
+  fixe sur invendu, vente en cours retirée puis remise, retour au prix auto).
 - `tests/hunt-cap-safety.test.mjs` : une Chasse qui lâche une enchère n'efface pas le plafond
   posé par un autre réglage (auto-bid, Chasseur ciblé).
 - `tests/top-cards.test.mjs` : 💎 Cartes les plus chères — collection entière, cote de la

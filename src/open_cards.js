@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.40';
+    const WM_VERSION = '1.3.13-fork.41';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -661,6 +661,12 @@
     }
     // Prix : moyenne du marché en L (relue à chaque mise en vente), relevée au plancher.
     async function resolveLegendResellPrice(e) {
+        /* Prix manuel (demande du 03/10) : utilisé tel quel, même sous le prix payé, sans
+           baisse sur invendu et sans lire la cote — jusqu'à ce qu'il soit effacé. */
+        const manual = Number(e.manualPrice);
+        if (Number.isFinite(manual) && manual > 0) {
+            return { price: Math.round(manual), manual: true, floor: legendResellFloor(e.paid), source: 'legend' };
+        }
         const fresh = await fetchCardSales(e.cardId, { priority: SALES_PRIO.urgent });
         const entry = fresh || getCachedSales(e.cardId);
         const floor = legendResellFloor(e.paid);
@@ -694,7 +700,9 @@
             const every = Math.max(1, Math.round(getSetting('legendResellDecayEvery')) || 1);
             const pct = getSetting('legendResellDecayPct');
             const next = pct > 0 && e.unsold % every === 0 ? ` · prochaine mise en vente -${pct} %` : '';
-            wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> invendue (${e.unsold}×) — remise en vente (cote relue${next}, jamais sous ${legendResellFloor(e.paid)} 💰).`);
+            wmLog(e.manualPrice > 0
+                ? `👑 Revente Légendaire : <b>${esc(e.title)}</b> invendue (${e.unsold}×) — remise en vente à ton prix manuel (${e.manualPrice} 💰).`
+                : `👑 Revente Légendaire : <b>${esc(e.title)}</b> invendue (${e.unsold}×) — remise en vente (cote relue${next}, jamais sous ${legendResellFloor(e.paid)} 💰).`);
         }
         saveLegendResell();
         renderLegendResell();
@@ -710,17 +718,28 @@
             const [txt, col] = label[e.status] || [e.status, '#888'];
             const price = (e.status === 'listed' && e.listedPrice ? ` · ${e.listedPrice} 💰` : '')
                 + (e.unsold ? ` <span style="color:#f97316;" title="Mises en vente sans acheteur">🔁${e.unsold}</span>` : '');
+            const manual = e.manualPrice > 0
+                ? `<span style="color:#c084fc;white-space:nowrap;" title="Prix manuel : utilisé tel quel à chaque mise en vente (pas de baisse, pas de plancher).">✋ ${e.manualPrice} 💰</span>` : '';
             return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:10px;border-bottom:1px solid rgba(255,255,255,0.04);">
                 <span style="color:${(RARITY[e.rarity || 'L'] || { color: '#888' }).color};font-weight:700;min-width:18px;">${esc(e.rarity || 'L')}</span>
                 <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;" title="${esc(e.title)}">${esc(e.title)}</span>
                 <span style="color:#888;white-space:nowrap;" title="Prix payé · plancher (payé + ${getSetting('legendResellMarginPct')} %)">payée ${e.paid} · min ${legendResellFloor(e.paid)}</span>
                 <span style="color:${col};white-space:nowrap;">${txt}${price}</span>
+                ${manual}
+                <button data-wm-lresell-price="${esc(e.wonAuctionId)}" title="Prix manuel : fixe toi-même le prix de vente (vide = retour au prix automatique)."
+                    style="background:none;border:1px solid rgba(192,132,252,0.35);color:#c084fc;font-size:9px;line-height:1;padding:1px 4px;border-radius:3px;cursor:pointer;">✏️</button>
                 ${e.status === 'listed' ? '' : `<button data-wm-lresell-drop="${esc(e.wonAuctionId)}" title="La garder : elle sort de la Revente Légendaire (rien n'est modifié sur le site)."
                     style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:9px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;">✕</button>`}
             </div>`;
         }).join('');
         el.innerHTML = (rows || '<div style="color:#444;font-size:10px;">Aucun achat de la Chasse à revendre pour l\'instant.</div>')
             + (sold.length ? `<div style="font-size:9px;color:#888;margin-top:3px;">${sold.length} revendue(s) · bilan <b style="color:${gain >= 0 ? '#4ade80' : '#ef4444'};">${gain >= 0 ? '+' : ''}${gain} 💰</b></div>` : '');
+        el.querySelectorAll('[data-wm-lresell-price]').forEach(b => {
+            b.onclick = () => {
+                const e = legendResell.find(x => x.wonAuctionId === b.getAttribute('data-wm-lresell-price'));
+                if (e) setLegendManualPrice(e).catch(() => {});
+            };
+        });
         el.querySelectorAll('[data-wm-lresell-drop]').forEach(b => {
             b.onclick = () => {
                 const e = legendResell.find(x => x.wonAuctionId === b.getAttribute('data-wm-lresell-drop'));
@@ -731,6 +750,62 @@
                 renderLegendResell();
             };
         });
+    }
+    /* Prix manuel d'une carte de la Revente. Vide = retour au prix automatique (cote, baisse,
+       plancher). Carte déjà en vente à un autre prix : on propose de retirer la vente tout de
+       suite (possible seulement tant que personne n'a misé) ; sinon le prix s'appliquera à la
+       prochaine mise en vente. */
+    async function setLegendManualPrice(e) {
+        if (!LEGEND_RESELL_LIVE.has(e.status)) return;
+        const cur = e.manualPrice > 0 ? String(e.manualPrice) : '';
+        const raw = window.prompt(`Prix de vente manuel pour « ${e.title} » (payée ${e.paid} 💰).\n`
+            + `Utilisé tel quel à chaque mise en vente, sans baisse ni plancher.\n`
+            + `Laisse vide pour revenir au prix automatique.`, cur);
+        if (raw === null) return;   // Annuler
+        const txt = raw.trim();
+        let v = null;
+        if (txt) {
+            v = parseInt(txt.replace(/[\s\u202f.]/g, ''), 10);
+            if (!Number.isFinite(v) || v <= 0) { wmLog(`✏️ Prix manuel ignoré : « ${esc(txt)} » n'est pas un nombre positif.`); return; }
+        }
+        if ((v || null) === (e.manualPrice > 0 ? e.manualPrice : null)) return;
+        e.manualPrice = v;
+        if (e.status === 'no_cote') { e.status = 'waiting'; e.retryAt = 0; }   // plus besoin de cote
+        if (e.status === 'waiting') e.retryAt = 0;
+        saveLegendResell();
+        renderLegendResell();
+        wmLog(v
+            ? `✏️ Revente Légendaire : <b>${esc(e.title)}</b> → prix manuel <b>${v} 💰</b>${v < e.paid ? ` <span style="color:#ef4444;">(sous le prix payé ${e.paid} 💰 : perte de ${e.paid - v} 💰)</span>` : ''}.`
+            : `✏️ Revente Légendaire : <b>${esc(e.title)}</b> → retour au prix automatique (cote, jamais sous ${legendResellFloor(e.paid)} 💰).`);
+        if (e.status !== 'listed' || !e.listedAuctionId) return;
+        if (v && v === e.listedPrice) return;
+        const later = v ? `${v} 💰` : 'au prix automatique';
+        if (!window.confirm(`« ${e.title} » est en vente à ${e.listedPrice} 💰.\n\n`
+            + `OK : retirer cette vente maintenant et la remettre ${v ? 'à ' : ''}${later}.\n`
+            + `Annuler : laisser la vente en cours ; le nouveau prix s'appliquera à la prochaine mise en vente.`)) return;
+        const auctionId = e.listedAuctionId;
+        let ok = false;
+        try {
+            const res = await fetch(`https://www.wiki-masters.com/api/marketplace/${auctionId}`, { method: 'DELETE', credentials: 'include' });
+            ok = res.ok;
+        } catch (err) {}
+        if (!ok) {
+            wmLog(`✏️ Revente Légendaire : impossible de retirer la vente de <b>${esc(e.title)}</b> (quelqu'un a peut-être déjà misé) — le nouveau prix s'appliquera à la prochaine mise en vente.`);
+            return;
+        }
+        // Vente retirée : ni vendue ni invendue — elle repart simplement au nouveau prix.
+        if (e.listedAuctionId === auctionId && e.status === 'listed') {
+            e.status = 'waiting';
+            e.listedAuctionId = null;
+            e.retryAt = 0;
+        }
+        const before = sellHistory.length;
+        sellHistory = sellHistory.filter(x => x.auctionId !== auctionId);
+        if (sellHistory.length !== before) saveSellHistory();
+        invalidateSalesDetail();
+        saveLegendResell();
+        renderLegendResell();
+        wmLog(`✏️ Revente Légendaire : vente de <b>${esc(e.title)}</b> retirée — remise en vente ${v ? `à ${v} 💰` : 'au prix automatique'} au prochain passage de la Revente.`);
     }
     function totalRetagCount() {
         return Object.values(retagCounts).reduce((s, e) => s + (e.count || 0), 0);
@@ -1410,6 +1485,9 @@
         legendResellMarginPct: 'wm_legend_resell_margin',
         legendResellDecayPct:  'wm_legend_resell_decay',
         legendResellDecayEvery:'wm_legend_resell_decay_every',
+        antiBotBanner:         'wm_antibot_banner',
+        antiBotSound:          'wm_antibot_sound',
+        antiBotNotif:          'wm_antibot_notif',
         sellUndercutMarket:   'wm_sell_undercut_market',
         autoTagPacksFromPresets: 'wm_autotag_packs_presets',
         autoTagSkipLegendary:  'wm_autotag_skip_legendary',
@@ -1484,6 +1562,9 @@
         legendResellMarginPct: 50,        // …jamais sous le prix payé + ce % (plancher)
         legendResellDecayPct:  10,        // …baisse de ce % (0 = jamais de baisse)…
         legendResellDecayEvery: 2,        // …toutes les N mises en vente sans acheteur
+        antiBotBanner:         true,      // vérification anti-bot du site : bandeau rouge dans le Market Watcher
+        antiBotSound:          true,      // …son d'alerte
+        antiBotNotif:          true,      // …notification du navigateur (Windows)
         sellUndercutMarket:    true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
         autoTagPacksFromPresets: false,   // étiquette auto les cartes packées selon les recherches enregistrées
         autoTagSkipLegendary:  true,      // n'auto-étiquette PAS les Légendaires (on veut souvent les garder)
@@ -2628,6 +2709,7 @@
         if (type === 'pack')      return getSetting('soundPackOpen');
         if (type === 'legendary') return getSetting('soundLegendary');
         if (type === 'won')       return getSetting('soundWon');
+        if (type === 'antibot')   return getSetting('antiBotSound');
         // Son générique : joué si au moins un des sons est activé
         return getSetting('soundNewHit') || getSetting('soundOutbid');
     }
@@ -2696,6 +2778,19 @@
                 fgain.gain.exponentialRampToValueAtTime(0.001, ft + 0.6);
                 fosc.start(ft);
                 fosc.stop(ft + 0.65);
+            } else if (type === "antibot") {
+                // Vérification anti-bot : deux bips graves, bien distincts des autres sons
+                [440, 330].forEach((freq, i) => {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.connect(gain); gain.connect(ctx.destination);
+                    osc.frequency.value = freq; osc.type = "square";
+                    const t = ctx.currentTime + i * 0.25;
+                    gain.gain.setValueAtTime(0.08, t);
+                    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+                    osc.start(t);
+                    osc.stop(t + 0.22);
+                });
             } else if (type === "won") {
                 // Enchère gagnée : arpège "cha-ching" claire, do-sol-do', volume moyen
                 [659, 988, 1319].forEach((freq, i) => {
@@ -3842,7 +3937,76 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return false;
     }
 
+    /* ── Vérification anti-bot du site ──
+       Le site refuse parfois une mise : 403 {"error":"Vérification anti-bot requise.",
+       "code":"human_verification_required"} (capture du 03/10). Sa vérification s'affiche
+       1 à 2 s puis se fait toute seule. Le bot NE la contourne PAS : il cesse de miser,
+       laisse la vérification se faire, et reprend après une pause. Avant, il réessayait
+       toutes les 4 à 5 s pendant plus de 3 minutes (même enchère, toujours refusée).
+       Pause : 10 s, puis 30 s, 1 min, 2 min, 5 min si le site redemande la vérification
+       juste après la reprise ; retour à 10 s après une mise acceptée (ou 15 min sans refus).
+       Seules les mises AUTOMATIQUES sont suspendues : la Revente (mises en vente) et les
+       mises manuelles continuent. */
+    const HUMAN_CHECK_RE = /human_verification|anti-?bot|captcha|v[ée]rification humaine/i;
+    const HUMAN_CHECK_PAUSES_MS = [10000, 30000, 60000, 120000, 300000];
+    let humanCheckUntil = 0, humanCheckStreak = 0, humanCheckLastAt = 0;
+    let humanCheckTimer = null, humanCheckTick = null;
+    function humanCheckActive() { return Date.now() < humanCheckUntil; }
+    function isHumanCheckRefusal(data, err) {
+        return !!((data && data.code === 'human_verification_required') || HUMAN_CHECK_RE.test(String(err || '')));
+    }
+    function renderHumanCheckBanner() {
+        const el = document.getElementById('wm-antibot-banner');
+        if (!el) return;
+        const left = Math.ceil((humanCheckUntil - Date.now()) / 1000);
+        if (left <= 0 || !getSetting('antiBotBanner')) { el.style.display = 'none'; el.innerHTML = ''; return; }
+        el.style.display = 'block';
+        el.innerHTML = `🛡️ <b>Vérification anti-bot du site</b> — mises automatiques en pause, reprise dans <b>${left} s</b>. La Revente continue.`;
+    }
+    function notifyHumanCheck(body) {
+        if (!getSetting('antiBotNotif')) return;
+        try {
+            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                new Notification('WikiMasters — vérification anti-bot', { body, tag: 'wm-antibot' });
+            }
+        } catch(e) {}
+    }
+    // La permission de notifier ne peut être demandée que sur un clic de l'utilisateur.
+    function ensureNotifPermission() {
+        try {
+            if (getSetting('antiBotNotif') && typeof Notification !== 'undefined' && Notification.permission === 'default') {
+                Notification.requestPermission().catch(() => {});
+            }
+        } catch(e) {}
+    }
+    window.wmEnsureNotifPermission = ensureNotifPermission;
+    function onHumanCheckRequired(contexte, title) {
+        if (humanCheckActive()) return;   // déjà en pause : une seule alerte par pause
+        if (Date.now() - humanCheckLastAt > 15 * 60 * 1000) humanCheckStreak = 0;
+        const ms = HUMAN_CHECK_PAUSES_MS[Math.min(humanCheckStreak, HUMAN_CHECK_PAUSES_MS.length - 1)];
+        humanCheckStreak++;
+        humanCheckLastAt = Date.now();
+        humanCheckUntil = Date.now() + ms;
+        const pause = ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Math.round(ms / 1000)} s`;
+        wmLog(`🛡️ Le site demande une <b>vérification anti-bot</b> (${esc(contexte || 'mise')} · <b>${esc(title || '?')}</b>) — mises automatiques en pause <b>${pause}</b>${humanCheckStreak > 1 ? ` (${humanCheckStreak}ᵉ fois d'affilée)` : ''}. La Revente continue.`);
+        playSound('antibot');
+        notifyHumanCheck(`Mises automatiques en pause ${pause}. Elles reprendront toutes seules.`);
+        renderHumanCheckBanner();
+        if (humanCheckTick) clearInterval(humanCheckTick);
+        humanCheckTick = setInterval(renderHumanCheckBanner, 1000);
+        if (humanCheckTimer) clearTimeout(humanCheckTimer);
+        humanCheckTimer = setTimeout(() => {
+            if (humanCheckTick) { clearInterval(humanCheckTick); humanCheckTick = null; }
+            humanCheckTimer = null;
+            renderHumanCheckBanner();
+            wmLog('🛡️ Fin de la pause anti-bot — mises automatiques reprises.');
+        }, ms + 50);
+    }
+
     function autoBidAllowed(auction, plannedAmount, contexte) {
+        // 0) Vérification anti-bot du site en cours : on laisse le site faire, sans miser.
+        if (humanCheckActive()) return false;
+
         // 1) Interrupteur maître : les mises auto sont-elles armées ?
         if (!autoSnipeEnabled) {
             const t = (auction && auction.card && auction.card.wikipedia_title) || contexte || 'la mise auto';
@@ -3933,10 +4097,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 lastErr = (e && e.message) || 'réseau';
             }
             if (res && res.ok) {
+                humanCheckStreak = 0;   // mise acceptée : la prochaine pause anti-bot repart à 10 s
                 markAuctionAsMine(a.id, amt, a);
                 return { ok: true, amount: amt, attempts: attempt, data, auction: a };
             }
             lastErr = (data && (data.error || data.message)) || (res ? `HTTP ${res.status}` : lastErr) || 'erreur';
+            // Vérification anti-bot demandée : on ne réessaie PAS — pause de toutes les mises auto.
+            if (res && !res.ok && isHumanCheckRefusal(data, lastErr)) {
+                onHumanCheckRequired(contexte, a.card && a.card.wikipedia_title);
+                return { ok: false, amount: amt, reason: lastErr, humanCheck: true, auction: a };
+            }
             if (res && !res.ok && BID_FUNDS_RE.test(String(lastErr))) {
                 // Le site dit « pas assez » : on relit le solde et on suspend les mises auto
                 // 30 s (le solde lu était sans doute périmé) plutôt que de réessayer.
@@ -5080,7 +5250,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         // autoBidAllowed() a déjà dit pourquoi quand ça méritait de l'être
                         // (plafond dépassé, limite horaire). Interrupteur en pause → on se
                         // tait, sinon chaque annonce trouvée produirait une ligne de log.
-                        if (autoSnipeEnabled) {
+                        if (autoSnipeEnabled && !humanCheckActive()) {
                             wmLog(`🎯 <b>${esc(title)}</b> [${rar}] trouvé — pas de mise (mise minimale ${bidAmount.toLocaleString('fr-FR')} 💰 refusée par les limites)`);
                         }
                         continue;
@@ -6261,7 +6431,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             } else {
                                 // Pas de rafale : 2 s avant de retenter (placeBid a déjà relancé).
                                 legendEntry.failAt = Date.now();
-                                wmLog(r.blocked
+                                if (!r.humanCheck) wmLog(r.blocked
                                     ? `${icoL} ${ctxL} : <b>${esc(tL)}</b> — on s'arrête, la mise suivante (${r.amount} 💰) dépasserait ton max ou une limite.`
                                     : `⚠️ ${ctxL} échouée : <b>${esc(tL)}</b> · ${esc(r.reason)}`);
                             }
@@ -7707,7 +7877,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 recordSale(item, price, 'pending', result.auctionId || null);
                 invalidateSalesDetail();
                 const dec = priceInfo.decay ? ` · 📉 -${priceInfo.decay.totalPct} % après ${priceInfo.decay.unsold} invendu(s)` : '';
-                wmLog(`👑 Revente Légendaire : <b>${esc(title)}</b> mise en vente ${price} 💰 <span style="color:#888;font-size:9px;">(${priceInfo.floored
+                wmLog(priceInfo.manual
+                    ? `👑 Revente Légendaire : <b>${esc(title)}</b> mise en vente ${price} 💰 <span style="color:#888;font-size:9px;">(✋ prix manuel · payée ${lr.paid} 💰)</span>`
+                    : `👑 Revente Légendaire : <b>${esc(title)}</b> mise en vente ${price} 💰 <span style="color:#888;font-size:9px;">(${priceInfo.floored
                     ? `🛡️ moy. ${esc(rarity)} ${priceInfo.avg} 💰${dec} → plancher ${priceInfo.floor} 💰`
                     : `💹 moy. ${esc(rarity)} ${priceInfo.avg} 💰${dec} · plancher ${priceInfo.floor} 💰`} · payée ${lr.paid} 💰)</span>`);
             } else if (success) {
@@ -10867,6 +11039,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     </div>
                 </div>
                 <div class="wm-pb">
+                    <div id="wm-antibot-banner" style="display:none;margin-bottom:8px;padding:6px 8px;border:1px solid #ef4444;border-radius:6px;background:rgba(239,68,68,.15);color:#fca5a5;font-size:11px;"></div>
                     <div style="display:flex;gap:6px;margin-bottom:8px;">
                         <button id="wm-autosnipe-btn" class="wm-btn wm-gh" style="flex:1;">⚡ Hunter OFF</button>
                     </div>
@@ -11212,6 +11385,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <input type="checkbox" id="wm-set-notifications-enabled">
                         <span>Badge de notifications sur le bouton ⚙ (compteur d'événements)</span>
                     </label>
+                    <div class="wm-set-sub" style="margin-top:10px;">🛡️ Vérification anti-bot du site (mises auto en pause quelques secondes) : me prévenir par…</div>
+                    <label class="wm-toggle">
+                        <input type="checkbox" id="wm-set-antibot-banner">
+                        <span>Bandeau rouge dans le Market Watcher</span>
+                    </label>
+                    <label class="wm-toggle">
+                        <input type="checkbox" id="wm-set-antibot-sound">
+                        <span>Son</span>
+                    </label>
+                    <label class="wm-toggle">
+                        <input type="checkbox" id="wm-set-antibot-notif">
+                        <span>Notification Windows (même onglet en arrière-plan)</span>
+                    </label>
                     <div class="wm-set-sub" style="margin-top:10px;">Cooldown entre les packs</div>
                     <label class="wm-toggle"><input type="radio" name="wm-set-pack-cd" value="180"><span>3 minutes (compte abonné)</span></label>
                     <label class="wm-toggle"><input type="radio" name="wm-set-pack-cd" value="600"><span>10 minutes (compte gratuit)</span></label>
@@ -11490,6 +11676,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         marketBtn.onclick = () => {
             if (!marketWatcherActive) {
+                ensureNotifPermission();   // clic de l'utilisateur : seul moment où le navigateur accepte de demander
                 marketWatcherActive = true;
                 marketBtn.className = "wm-btn wm-r wm-sm"; marketBtn.innerText = "⏹ STOP";
                 document.getElementById('dot-market').classList.add('on');
@@ -11609,6 +11796,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             paintLegendModes();
         }
         function clickLegendMode(mode) {
+            ensureNotifPermission();
             if (currentLegendMode() === mode) {
                 // Mode déjà actif mais revente en pause (rechargement) → le clic la relance.
                 if (RESELL_MODES.has(mode) && !legendResellRunning) { startLegendResell('reprise'); paintLegendModes(); return; }
@@ -13278,6 +13466,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (soundWonChk.checked) playSound('won'); // aperçu du son au réglage
             wmLog(soundWonChk.checked ? '🔊 Son « enchère gagnée » activé' : '🔇 Son « enchère gagnée » coupé');
         };
+
+        // -- Alertes de vérification anti-bot --
+        [['wm-set-antibot-banner', 'antiBotBanner', 'bandeau'],
+         ['wm-set-antibot-sound', 'antiBotSound', 'son'],
+         ['wm-set-antibot-notif', 'antiBotNotif', 'notification Windows'],
+        ].forEach(([id, key, label]) => {
+            const cb = document.getElementById(id);
+            if (!cb) return;
+            cb.checked = getSetting(key);
+            cb.onchange = () => {
+                setSetting(key, cb.checked);
+                if (key === 'antiBotNotif' && cb.checked) ensureNotifPermission();
+                if (key === 'antiBotBanner') renderHumanCheckBanner();
+                wmLog(`🛡️ Alerte anti-bot (${label}) ${cb.checked ? 'activée' : 'désactivée'}.`);
+            };
+        });
 
         // -- Badge de notifications --
         notifsChk.onchange = () => {
