@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.0
+// @version      1.3.13-fork.44
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,9 +22,65 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.0';
+    const WM_VERSION = '1.3.13-fork.44';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
+
+    /* ===================== PAUSE RÉSEAU DU BOT ===================== */
+
+    /* Pendant une pause « vérification anti-bot » (cf. onHumanCheckRequired), le bot ne fait
+       PLUS AUCUNE requête : demande de l'utilisateur du 03/10 — avant, seules les mises
+       s'arrêtaient, scans, cotes, voie rapide, ventes… continuaient d'interroger le site.
+       Tout le code du bot appelle `fetch(...)` : cette fonction, déclarée dans la portée du
+       script, passe donc avant window.fetch. Les requêtes du SITE (window.fetch, dont sa
+       propre vérification) ne sont jamais retenues. Une requête du bot lancée pendant la
+       pause attend sa fin (ou son propre délai d'abandon, s'il en a un). */
+    const botNet = { pausedUntil: 0 };
+    function botNetPaused() { return Date.now() < botNet.pausedUntil; }
+    function waitBotNetResume(signal) {
+        if (!botNetPaused()) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            let t = null;
+            const onAbort = () => { if (t) clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')); };
+            const check = () => {
+                if (signal && signal.aborted) return onAbort();
+                const left = botNet.pausedUntil - Date.now();
+                if (left <= 0) {
+                    if (signal) signal.removeEventListener('abort', onAbort);
+                    return resolve();
+                }
+                t = setTimeout(check, Math.min(left + 20, 5000));
+            };
+            if (signal) signal.addEventListener('abort', onAbort, { once: true });
+            check();
+        });
+    }
+    function fetch(input, init) {
+        if (!botNetPaused()) return window.fetch(input, init);
+        return waitBotNetResume(init && init.signal).then(() => window.fetch(input, init));
+    }
+
+    /* ===================== ÉCHAPPEMENT HTML ===================== */
+
+    // Échappe toute donnée venant du serveur (titres Wikipédia, messages d'erreur
+    // d'API, pseudos) avant injection dans de l'innerHTML. Un titre contenant `"`
+    // cassait l'attribut englobant, un `<` injectait du HTML dans la page.
+    // Les 5 caractères couvrent à la fois le contenu texte et les attributs
+    // délimités par " ou '.
+    const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+    function esc(v) {
+        if (v === null || v === undefined) return '';
+        return String(v).replace(/[&<>"']/g, (c) => ESC_MAP[c]);
+    }
+
+    // Idem pour une URL injectée dans un href : on refuse les schémas exécutables
+    // (javascript:, data:) avant d'échapper, sinon un lien suffit à exécuter du code.
+    function escUrl(v) {
+        const raw = String(v === null || v === undefined ? '' : v).trim();
+        if (!raw) return '';
+        if (/^[a-z0-9.+-]*:/i.test(raw) && !/^(https?|mailto):/i.test(raw)) return '';
+        return esc(raw);
+    }
 
     /* ===================== CONFIG ===================== */
 
@@ -43,7 +99,20 @@
     const MARKET_REFRESH_MS = 10000;
     const MARKET_API_BASE = "https://www.wiki-masters.com/api/marketplace";
     const MARKET_PAGE_LIMIT = 50;
-    const MARKET_PAGE_CONCURRENCY = 5; // pages chargées en parallèle par lot
+    /* Débit du scan. Ces valeurs étaient calibrées pour un scan d'UNE page : le site
+       ne voyait que ~6 requêtes/min. Depuis que la pagination fonctionne (136 pages sur
+       un marché à 5 500 annonces), le même réglage produit des centaines de requêtes par
+       minute — et le site répond 403, y compris sur l'ouverture de paquets. On étale
+       donc le scan, et surtout on espace les scans PROPORTIONNELLEMENT à leur coût. */
+    const MARKET_PAGE_CONCURRENCY = 3;  // pages en parallèle par lot
+    const MARKET_BATCH_PAUSE_MS = 350;  // souffle entre deux lots
+    const MARKET_MS_PER_PAGE = 700;     // budget de temps par page scannée, entre 2 scans
+    /* Plafond dur de pagination (300 × 50 = 15 000 annonces). La boucle s'arrête
+       normalement d'elle-même sur une page incomplète ; ce plafond n'est qu'un filet
+       si l'API répond n'importe quoi. Il était à 60 (3 000 annonces) : comme le scan
+       trie par `ending_soon`, ce sont les annonces qui durent le plus longtemps qui
+       tombaient hors du scan — donc précisément celles qu'on a le temps de gagner. */
+    const MARKET_MAX_PAGES = 300;
     const MARKET_MIN_GAP_MS = 1500;    // souffle minimal entre 2 scans
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -83,6 +152,11 @@
         try { localStorage.setItem(SELL_CONFIG_KEY, JSON.stringify(cfg)); } catch(e) {}
     }
     function getSellPrice(rarity)    { return getSellConfig()[rarity]?.price    ?? 10; }
+    // % de la cote appliqué pour cette rareté. Non réglé → le % global (Paramètres).
+    function getSellPct(rarity) {
+        const v = getSellConfig()[String(rarity || '').toUpperCase()]?.pct;
+        return Number.isFinite(v) && v > 0 ? v : getSetting('sellMarketPricePct');
+    }
     function getSellDuration(rarity) { return getSellConfig()[rarity]?.duration ?? 10; }
 
     // Migration : si un sellDuration global existait, on l'applique à toutes les raretés
@@ -112,6 +186,9 @@
 
     let running = false;
     let packLoopEpoch = 0; // jeton de génération : invalide toute boucle Pack Opener précédente
+    // Renseigné par createUI. Permet à la loop (scope module) d'arrêter proprement
+    // le module sur erreur fatale : bouton remis en ▶ START, timer stoppé, dot éteint.
+    let packOpenerStopFn = null;
     let totalPacks = 0;
     let totalCards = 0;
     let cardStats = {};
@@ -297,6 +374,7 @@
        fichier, qui dépasserait largement le problème signalé. */
     const FETCH_TIMEOUT_MS = 15000;
     async function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+        await waitBotNetResume();   // le délai court à partir de l'envoi réel, pas pendant la pause
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
@@ -322,11 +400,11 @@
     // Récupère les enchères gagnées et crédite les nouveaux achats à la session courante.
     // `preFetched` : réponse /mine déjà en main (évite une requête de plus).
     async function syncWonAuctions(preFetched) {
-        const data = preFetched || await fetchMine();
-        if (!data) return;
-        // /mine ne porte plus `won` : on lit les enchères gagnées en base. La branche historique
-        // est conservée au cas où le champ réapparaîtrait.
-        let won = Array.isArray(data?.won) ? data.won : null;
+        // /mine ne porte plus `won` : on lit les enchères gagnées en base. L'appel /mine qui
+        // précédait ne servait plus qu'à vérifier que le site répondait (capture du 01/10 :
+        // une requête de 3 à 9 s pour rien) — fetchWonFromDb renvoie déjà null en cas d'échec.
+        // La branche historique (champ `won` fourni par l'appelant) est conservée.
+        let won = Array.isArray(preFetched?.won) ? preFetched.won : null;
         if (!won) won = await fetchWonFromDb(100);
         if (!Array.isArray(won)) return;
 
@@ -335,6 +413,9 @@
         let archived = 0;
         won.forEach(w => { if (recordPurchase(w)) archived++; });
         if (archived > 0) saveBuyHistory();
+        // Revente Légendaire : à chaque passage, 1er compris (le filtre par date d'activation
+        // écarte les anciennes victoires).
+        won.forEach(w => { try { enqueueLegendResell(w); } catch(e) {} });
 
         // Premier passage de la session : on mémorise les achats déjà existants sans les
         // compter (ils datent d'avant — ils ne doivent pas gonfler la session courante).
@@ -360,7 +441,7 @@
             const title = w.card?.wikipedia_title || '?';
             const rar = (w.snapshot_rarity || w.card?.rarity || '').toUpperCase();
             newWins.push({ title, rar, price });
-            wmLog(`🏆 Enchère gagnée : <b>${title}</b> [${rar}] → <span style="color:#ef4444;">${price} 💰</span>`);
+            wmLog(`🏆 Enchère gagnée : <b>${esc(title)}</b> [${rar}] → <span style="color:#ef4444;">${price} 💰</span>`);
 
             // Chasseur ciblé — auto-pause : cette enchère avait été armée par une chasse avec
             // `autoDisable` actif et vient d'être gagnée → on la met en pause toute seule.
@@ -482,6 +563,306 @@
     function getRetagCount(cardId) {
         return (cardId && retagCounts[cardId]) ? retagCounts[cardId].count : 0;
     }
+    function resetRetagCount(cardId) {
+        if (!cardId || !retagCounts[cardId]) return;
+        delete retagCounts[cardId];
+        saveRetagCounts();
+    }
+
+    /* ── Cartes mises de côté ──
+       Au-delà de N invendus, une carte n'a visiblement pas d'acheteur au prix qu'on peut en
+       tirer : la relancer en boucle occupe un créneau pour rien. Elle sort de la file de
+       vente (son tag est conservé) et s'affiche dans le panneau, où l'utilisateur décide :
+       la remettre en vente repart de zéro (compteur d'invendus remis à 0). Local et
+       réversible : rien n'est modifié côté site. */
+    const SET_ASIDE_KEY = 'wm_sell_set_aside';
+    let setAsideCards = {};
+    try { setAsideCards = JSON.parse(localStorage.getItem(SET_ASIDE_KEY) || '{}') || {}; } catch(e) { setAsideCards = {}; }
+    function saveSetAside() {
+        try { localStorage.setItem(SET_ASIDE_KEY, JSON.stringify(setAsideCards)); } catch(e) {}
+    }
+    // Vrai si la carte doit rester hors de la file. L'enregistre au passage (pour l'afficher).
+    function isSetAside(cardId, title, rarity) {
+        if (!cardId) return false;
+        if (setAsideCards[cardId]) return true;
+        const limit = getSetting('sellSetAsideAfter');
+        const n = getRetagCount(cardId);
+        if (!(limit > 0 && n >= limit)) return false;
+        setAsideCards[cardId] = { title: title || retagCounts[cardId]?.title || '?',
+                                  rarity: (rarity || retagCounts[cardId]?.rarity || '').toUpperCase(),
+                                  unsold: n, ts: Date.now() };
+        saveSetAside();
+        wmLog(`🗃️ Mise de côté après <b>${n}</b> invendus : <b>${esc(setAsideCards[cardId].title)}</b> — elle ne repart plus en vente toute seule (panneau Trash Seller → « Mises de côté »).`);
+        if (typeof renderSetAside === 'function') renderSetAside();
+        return true;
+    }
+    function renderSetAside() {
+        const el = document.getElementById('wm-set-aside');
+        if (!el) return;
+        const ids = Object.keys(setAsideCards);
+        if (!ids.length) { el.innerHTML = ''; return; }
+        const rows = ids
+            .sort((a, b) => (setAsideCards[b].ts || 0) - (setAsideCards[a].ts || 0))
+            .map(id => {
+                const c = setAsideCards[id];
+                const rc = RARITY[c.rarity] || { color: '#888' };
+                return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:10px;border-bottom:1px solid rgba(255,255,255,0.04);">
+                    <span style="color:${rc.color};font-weight:700;min-width:22px;">${esc(c.rarity || '?')}</span>
+                    <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;" title="${esc(c.title)}">${esc(c.title)}</span>
+                    <span style="color:#888;white-space:nowrap;" title="Invendue ${c.unsold} fois">🔁${c.unsold}</span>
+                    <button data-wm-restore="${esc(id)}" title="La remettre dans la file de vente, compteur d'invendus remis à zéro (elle repart au prix de départ)."
+                        style="font-size:9px;color:#4ade80;background:rgba(74,222,128,0.08);border:1px solid rgba(74,222,128,0.35);border-radius:4px;padding:1px 6px;cursor:pointer;white-space:nowrap;">↩️ Remettre</button>
+                </div>`;
+            }).join('');
+        el.innerHTML = `
+            <details style="margin-bottom:8px;">
+                <summary style="cursor:pointer;font-size:9px;color:#fbbf24;text-transform:uppercase;letter-spacing:1px;">
+                    🗃️ Mises de côté (${ids.length}) — ne repartent plus en vente toutes seules
+                </summary>
+                <div style="margin-top:4px;">${rows}</div>
+            </details>`;
+        el.querySelectorAll('[data-wm-restore]').forEach(b => {
+            b.onclick = () => restoreSetAside(b.getAttribute('data-wm-restore'));
+        });
+    }
+
+    function restoreSetAside(cardId) {
+        if (!setAsideCards[cardId]) return;
+        const t = setAsideCards[cardId].title;
+        delete setAsideCards[cardId];
+        saveSetAside();
+        resetRetagCount(cardId); // repart de zéro : sinon elle serait remise de côté aussitôt
+        wmLog(`↩️ Remise en vente : <b>${esc(t)}</b> — compteur d'invendus remis à zéro.`);
+        if (typeof renderSetAside === 'function') renderSetAside();
+    }
+
+    /* ── 👑 Revente Légendaire ──
+       Mode à part (ni Trash Seller, ni Chasse Légendaire) : les Légendaires GAGNÉES aux enchères
+       sont remises en vente. Choix de l'utilisateur (29/09) :
+         · seulement celles gagnées APRÈS l'activation du mode, quelle que soit la façon de miser ;
+         · prix = moyenne réelle du marché de CETTE carte en L, jamais sous le prix payé + marge
+           (50 % par défaut) ;
+         · pas de moyenne en L → pas de vente (« en attente », recontrôlée toutes les heures) ;
+         · invendue → remise en vente au même calcul (la moyenne est relue à chaque fois) ;
+         · priorité sur le Trash Seller pour les créneaux de vente.
+       Statuts : waiting (à lister) · listed · no_cote · sold · removed. */
+    const LEGEND_RESELL_KEY = 'wm_legend_resell';
+    const LEGEND_NO_COTE_RECHECK_MS = 60 * 60 * 1000;
+    let legendResellRunning = false;   // boucle de mise en vente active dans CET onglet
+    // Génération de la boucle : un Stop puis Start pendant une de ses pauses (5 à 60 s)
+    // laissait l'ancienne boucle repartir à son réveil → deux boucles, mises en vente en double.
+    let legendResellGen = 0;
+    /* Enchères où une Chasse (L ou opti) a misé. Choix du 30/09 : la Revente ne remet en vente
+       QUE ces achats-là — une carte achetée à la main n'est jamais revendue par le bot. */
+    const CHASSE_BIDS_KEY = 'wm_chasse_bids';
+    let chasseBidIds = new Set();
+    try {
+        const raw = JSON.parse(localStorage.getItem(CHASSE_BIDS_KEY) || '[]');
+        if (Array.isArray(raw)) chasseBidIds = new Set(raw);
+    } catch(e) {}
+    function markChasseBid(auctionId) {
+        if (!auctionId || chasseBidIds.has(auctionId)) return;
+        chasseBidIds.add(auctionId);
+        try { localStorage.setItem(CHASSE_BIDS_KEY, JSON.stringify([...chasseBidIds].slice(-500))); } catch(e) {}
+    }
+    const LEGEND_RESELL_LIVE = new Set(['waiting', 'listed', 'no_cote']);
+    const LEGEND_OWN_GRACE_MS = 10 * 60 * 1000; // une L tout juste gagnée peut tarder à arriver
+    let legendResell = [];
+    try {
+        const raw = JSON.parse(localStorage.getItem(LEGEND_RESELL_KEY) || '[]');
+        if (Array.isArray(raw)) legendResell = raw.filter(e => e && e.wonAuctionId);
+    } catch(e) {}
+    function saveLegendResell() {
+        try { localStorage.setItem(LEGEND_RESELL_KEY, JSON.stringify(legendResell.slice(-300))); } catch(e) {}
+    }
+    function legendResellFloor(paid) {
+        const m = Math.max(0, getSetting('legendResellMarginPct'));
+        return Math.max(1, Math.ceil((Number(paid) || 0) * (1 + m / 100) - 1e-9));
+    }
+    // Appelé pour chaque enchère gagnée lue en base. true si elle entre dans la file.
+    function enqueueLegendResell(w) {
+        if (!getSetting('legendResellEnabled') || !w || !w.id) return false;
+        const rar = (w.snapshot_rarity || w.card?.rarity || '').toUpperCase();
+        if (!chasseBidIds.has(w.id)) return false;   // pas un achat de la Chasse → jamais revendu
+        const ts = w.settled_at ? new Date(w.settled_at).getTime()
+                 : w.end_at ? new Date(w.end_at).getTime() : NaN;
+        if (!(ts >= (getSetting('legendResellSince') || 0))) return false;   // gagnée avant l'activation
+        if (legendResell.some(e => e.wonAuctionId === w.id)) return false;
+        const cardId = w.card?.id || w.card_id;
+        if (!cardId) return false;
+        const paid = Math.max(0, Number(w.final_price ?? w.current_bid ?? 0) || 0);
+        const e = { wonAuctionId: w.id, cardId, title: w.card?.wikipedia_title || '?', paid,
+                    rarity: rar || 'L', wonAt: ts, status: 'waiting', listings: 0 };
+        legendResell.push(e);
+        saveLegendResell();
+        wmLog(`🏷️ Achat de la Chasse → Revente : <b>${esc(e.title)}</b> [${esc(e.rarity)}] · payée ${paid} 💰 · jamais sous ${legendResellFloor(paid)} 💰${legendResellRunning ? '' : ' <span style="color:#fbbf24;">(revente en pause — clique le bouton marqué ⏸ du Market Watcher pour reprendre)</span>'}`);
+        renderLegendResell();
+        return true;
+    }
+    // Entrées prêtes à partir. Une « sans cote » est recontrôlée au bout d'une heure.
+    function legendResellReady() {
+        const now = Date.now();
+        let changed = false;
+        for (const e of legendResell) {
+            if (e.status === 'no_cote' && now - (e.checkedAt || 0) > LEGEND_NO_COTE_RECHECK_MS) { e.status = 'waiting'; changed = true; }
+        }
+        if (changed) saveLegendResell();
+        return legendResell.filter(e => e.status === 'waiting' && !(e.retryAt && now < e.retryAt));
+    }
+    function legendResellItem(e) {
+        return { card_id: e.cardId, card: { id: e.cardId, wikipedia_title: e.title, rarity: e.rarity || 'L' }, _legendResell: e };
+    }
+    function legendResellByListing(auctionId) {
+        return auctionId ? legendResell.find(e => e.listedAuctionId === auctionId) : null;
+    }
+    // Prix : moyenne du marché en L (relue à chaque mise en vente), relevée au plancher.
+    async function resolveLegendResellPrice(e) {
+        /* Prix manuel (demande du 03/10) : utilisé tel quel, même sous le prix payé, sans
+           baisse sur invendu et sans lire la cote — jusqu'à ce qu'il soit effacé. */
+        const manual = Number(e.manualPrice);
+        if (Number.isFinite(manual) && manual > 0) {
+            return { price: Math.round(manual), manual: true, floor: legendResellFloor(e.paid), source: 'legend' };
+        }
+        const fresh = await fetchCardSales(e.cardId, { priority: SALES_PRIO.urgent });
+        const entry = fresh || getCachedSales(e.cardId);
+        const floor = legendResellFloor(e.paid);
+        if (!entry) return { skip: true, reason: 'unreadable', floor };   // refus du site : on retentera
+        const avg = entry.byRarity ? entry.byRarity[e.rarity || 'L'] : (entry.count > 0 ? entry.avg : null);
+        if (!Number.isFinite(avg) || avg <= 0) return { skip: true, reason: 'no_cote', floor };
+        /* Baisse par invendus (demande du 30/09) : on part du prix du marché ; toutes les N
+           mises en vente sans acheteur, -Y % (cumulés) ; jamais sous le plancher payé + marge. */
+        const avgR = Math.round(avg);
+        const unsold = Math.max(0, Number(e.unsold) || 0);
+        const pct = Math.min(90, Math.max(0, getSetting('legendResellDecayPct')));
+        const every = Math.max(1, Math.round(getSetting('legendResellDecayEvery')) || 1);
+        const steps = pct > 0 ? Math.floor(unsold / every) : 0;
+        const market = steps ? Math.max(1, Math.round(avgR * Math.pow(1 - pct / 100, steps))) : avgR;
+        return { price: Math.max(market, floor), avg: avgR, floor, floored: market < floor, source: 'legend',
+                 decay: steps ? { steps, unsold, market, totalPct: Math.round((1 - market / avgR) * 100) } : null };
+    }
+    // Issue d'une vente suivie (appelée par le suivi des ventes).
+    function legendResellSettled(s, sold, finalPrice) {
+        const e = legendResell.find(x => x.wonAuctionId === s.legend);
+        if (!e || e.status !== 'listed') return;
+        if (sold) {
+            e.status = 'sold';
+            e.soldPrice = Number.isFinite(finalPrice) ? finalPrice : (s.price || null);
+            const gain = Number.isFinite(e.soldPrice) ? e.soldPrice - e.paid : null;
+            wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> vendue ${e.soldPrice ?? '?'} 💰 (payée ${e.paid} 💰${gain != null ? ` · <span style="color:${gain >= 0 ? '#4ade80' : '#ef4444'};">${gain >= 0 ? '+' : ''}${gain} 💰</span>` : ''})`);
+        } else {
+            e.status = 'waiting';
+            e.listedAuctionId = null;
+            e.unsold = (Number(e.unsold) || 0) + 1;
+            const every = Math.max(1, Math.round(getSetting('legendResellDecayEvery')) || 1);
+            const pct = getSetting('legendResellDecayPct');
+            const next = pct > 0 && e.unsold % every === 0 ? ` · prochaine mise en vente -${pct} %` : '';
+            wmLog(e.manualPrice > 0
+                ? `👑 Revente Légendaire : <b>${esc(e.title)}</b> invendue (${e.unsold}×) — remise en vente à ton prix manuel (${e.manualPrice} 💰).`
+                : `👑 Revente Légendaire : <b>${esc(e.title)}</b> invendue (${e.unsold}×) — remise en vente (cote relue${next}, jamais sous ${legendResellFloor(e.paid)} 💰).`);
+        }
+        saveLegendResell();
+        renderLegendResell();
+    }
+    function renderLegendResell() {
+        const el = document.getElementById('wm-lresell-list');
+        if (!el) return;
+        const live = legendResell.filter(e => LEGEND_RESELL_LIVE.has(e.status));
+        const sold = legendResell.filter(e => e.status === 'sold');
+        const gain = sold.reduce((s, e) => s + ((e.soldPrice || 0) - (e.paid || 0)), 0);
+        const label = { waiting: ['⏳ à vendre', '#fbbf24'], listed: ['🏷️ en vente', '#4ade80'], no_cote: ['📋 pas de cote', '#888'] };
+        const rows = live.slice().sort((a, b) => (b.wonAt || 0) - (a.wonAt || 0)).map(e => {
+            const [txt, col] = label[e.status] || [e.status, '#888'];
+            const price = (e.status === 'listed' && e.listedPrice ? ` · ${e.listedPrice} 💰` : '')
+                + (e.unsold ? ` <span style="color:#f97316;" title="Mises en vente sans acheteur">🔁${e.unsold}</span>` : '');
+            const manual = e.manualPrice > 0
+                ? `<span style="color:#c084fc;white-space:nowrap;" title="Prix manuel : utilisé tel quel à chaque mise en vente (pas de baisse, pas de plancher).">✋ ${e.manualPrice} 💰</span>` : '';
+            return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;font-size:10px;border-bottom:1px solid rgba(255,255,255,0.04);">
+                <span style="color:${(RARITY[e.rarity || 'L'] || { color: '#888' }).color};font-weight:700;min-width:18px;">${esc(e.rarity || 'L')}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;" title="${esc(e.title)}">${esc(e.title)}</span>
+                <span style="color:#888;white-space:nowrap;" title="Prix payé · plancher (payé + ${getSetting('legendResellMarginPct')} %)">payée ${e.paid} · min ${legendResellFloor(e.paid)}</span>
+                <span style="color:${col};white-space:nowrap;">${txt}${price}</span>
+                ${manual}
+                <button data-wm-lresell-price="${esc(e.wonAuctionId)}" title="Prix manuel : fixe toi-même le prix de vente (vide = retour au prix automatique)."
+                    style="background:none;border:1px solid rgba(192,132,252,0.35);color:#c084fc;font-size:9px;line-height:1;padding:1px 4px;border-radius:3px;cursor:pointer;">✏️</button>
+                ${e.status === 'listed' ? '' : `<button data-wm-lresell-drop="${esc(e.wonAuctionId)}" title="La garder : elle sort de la Revente Légendaire (rien n'est modifié sur le site)."
+                    style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:9px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;">✕</button>`}
+            </div>`;
+        }).join('');
+        el.innerHTML = (rows || '<div style="color:#444;font-size:10px;">Aucun achat de la Chasse à revendre pour l\'instant.</div>')
+            + (sold.length ? `<div style="font-size:9px;color:#888;margin-top:3px;">${sold.length} revendue(s) · bilan <b style="color:${gain >= 0 ? '#4ade80' : '#ef4444'};">${gain >= 0 ? '+' : ''}${gain} 💰</b></div>` : '');
+        el.querySelectorAll('[data-wm-lresell-price]').forEach(b => {
+            b.onclick = () => {
+                const e = legendResell.find(x => x.wonAuctionId === b.getAttribute('data-wm-lresell-price'));
+                if (e) setLegendManualPrice(e).catch(() => {});
+            };
+        });
+        el.querySelectorAll('[data-wm-lresell-drop]').forEach(b => {
+            b.onclick = () => {
+                const e = legendResell.find(x => x.wonAuctionId === b.getAttribute('data-wm-lresell-drop'));
+                if (!e) return;
+                e.status = 'removed';
+                saveLegendResell();
+                wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> retirée — tu la gardes.`);
+                renderLegendResell();
+            };
+        });
+    }
+    /* Prix manuel d'une carte de la Revente. Vide = retour au prix automatique (cote, baisse,
+       plancher). Carte déjà en vente à un autre prix : on propose de retirer la vente tout de
+       suite (possible seulement tant que personne n'a misé) ; sinon le prix s'appliquera à la
+       prochaine mise en vente. */
+    async function setLegendManualPrice(e) {
+        if (!LEGEND_RESELL_LIVE.has(e.status)) return;
+        const cur = e.manualPrice > 0 ? String(e.manualPrice) : '';
+        const raw = window.prompt(`Prix de vente manuel pour « ${e.title} » (payée ${e.paid} 💰).\n`
+            + `Utilisé tel quel à chaque mise en vente, sans baisse ni plancher.\n`
+            + `Laisse vide pour revenir au prix automatique.`, cur);
+        if (raw === null) return;   // Annuler
+        const txt = raw.trim();
+        let v = null;
+        if (txt) {
+            v = parseInt(txt.replace(/[\s\u202f.]/g, ''), 10);
+            if (!Number.isFinite(v) || v <= 0) { wmLog(`✏️ Prix manuel ignoré : « ${esc(txt)} » n'est pas un nombre positif.`); return; }
+        }
+        if ((v || null) === (e.manualPrice > 0 ? e.manualPrice : null)) return;
+        e.manualPrice = v;
+        if (e.status === 'no_cote') { e.status = 'waiting'; e.retryAt = 0; }   // plus besoin de cote
+        if (e.status === 'waiting') e.retryAt = 0;
+        saveLegendResell();
+        renderLegendResell();
+        wmLog(v
+            ? `✏️ Revente Légendaire : <b>${esc(e.title)}</b> → prix manuel <b>${v} 💰</b>${v < e.paid ? ` <span style="color:#ef4444;">(sous le prix payé ${e.paid} 💰 : perte de ${e.paid - v} 💰)</span>` : ''}.`
+            : `✏️ Revente Légendaire : <b>${esc(e.title)}</b> → retour au prix automatique (cote, jamais sous ${legendResellFloor(e.paid)} 💰).`);
+        if (e.status !== 'listed' || !e.listedAuctionId) return;
+        if (v && v === e.listedPrice) return;
+        const later = v ? `${v} 💰` : 'au prix automatique';
+        if (!window.confirm(`« ${e.title} » est en vente à ${e.listedPrice} 💰.\n\n`
+            + `OK : retirer cette vente maintenant et la remettre ${v ? 'à ' : ''}${later}.\n`
+            + `Annuler : laisser la vente en cours ; le nouveau prix s'appliquera à la prochaine mise en vente.`)) return;
+        const auctionId = e.listedAuctionId;
+        let ok = false;
+        try {
+            const res = await fetch(`https://www.wiki-masters.com/api/marketplace/${auctionId}`, { method: 'DELETE', credentials: 'include' });
+            ok = res.ok;
+        } catch (err) {}
+        if (!ok) {
+            wmLog(`✏️ Revente Légendaire : impossible de retirer la vente de <b>${esc(e.title)}</b> (quelqu'un a peut-être déjà misé) — le nouveau prix s'appliquera à la prochaine mise en vente.`);
+            return;
+        }
+        // Vente retirée : ni vendue ni invendue — elle repart simplement au nouveau prix.
+        if (e.listedAuctionId === auctionId && e.status === 'listed') {
+            e.status = 'waiting';
+            e.listedAuctionId = null;
+            e.retryAt = 0;
+        }
+        const before = sellHistory.length;
+        sellHistory = sellHistory.filter(x => x.auctionId !== auctionId);
+        if (sellHistory.length !== before) saveSellHistory();
+        invalidateSalesDetail();
+        saveLegendResell();
+        renderLegendResell();
+        wmLog(`✏️ Revente Légendaire : vente de <b>${esc(e.title)}</b> retirée — remise en vente ${v ? `à ${v} 💰` : 'au prix automatique'} au prochain passage de la Revente.`);
+    }
     function totalRetagCount() {
         return Object.values(retagCounts).reduce((s, e) => s + (e.count || 0), 0);
     }
@@ -564,6 +945,8 @@
     // Cache prix marketplace par card_id
     let marketPriceCache = {}; // { card_id: avgPrice }
     let marketWatcherActive = false;
+    let marketScanGen = 0;   // génération de scan (cf. requestMarketRescan)
+    let marketLoopGen = 0;   // génération de la boucle de scan (une seule vivante)
     let lastMarketHits = new Set();
     let marketCountdownInterval = null;
 
@@ -642,6 +1025,19 @@
     // Filtre de recherche live du Market Watcher (transitoire, non persisté)
     let marketSearchQuery = '';
     // Masquer les enchères dont je possède déjà la carte (persisté)
+    /* Filtres d'affichage des résultats. Persistés : on ne veut pas les reposer à chaque
+       rechargement de page, comme le tri et la vue. `marketRarityFilter` vide = toutes
+       les raretés ; `marketKeywordFilter` vide = tous les mots-clés. */
+    const MARKET_RARITY_FILTER_KEY = 'wm_market_rarity_filter';
+    const MARKET_KEYWORD_FILTER_KEY = 'wm_market_keyword_filter';
+    let marketRarityFilter = new Set();
+    let marketKeywordFilter = '';
+    try {
+        const raw = localStorage.getItem(MARKET_RARITY_FILTER_KEY);
+        if (raw) marketRarityFilter = new Set(JSON.parse(raw));
+    } catch(e) {}
+    try { marketKeywordFilter = localStorage.getItem(MARKET_KEYWORD_FILTER_KEY) || ''; } catch(e) {}
+
     const MARKET_HIDE_OWNED_KEY = 'wm_market_hide_owned';
     let marketHideOwned = false;
     try { marketHideOwned = localStorage.getItem(MARKET_HIDE_OWNED_KEY) === '1'; } catch(e) {}
@@ -674,6 +1070,8 @@
     // L'historique bouge sur des jours/semaines, donc un TTL long évite de refetcher inutilement.
     const SALES_CACHE_KEY = 'wm_sales_cache';
     const SALES_CACHE_TTL = 12 * 3600 * 1000; // 12h
+    // « Aucune vente » se périme plus vite : une première vente peut arriver à tout moment.
+    const SALES_EMPTY_TTL = 60 * 60 * 1000; // 1h
     let salesCache = {};
     try { salesCache = JSON.parse(localStorage.getItem(SALES_CACHE_KEY) || '{}') || {}; } catch(e) { salesCache = {}; }
     function saveSalesCache() {
@@ -698,13 +1096,41 @@
     function getCachedSales(cardId) {
         const entry = salesCache[cardId];
         if (!entry) return null;
-        if (Date.now() - entry.fetchedAt > SALES_CACHE_TTL) return null; // périmé
+        // Une entrée d'ÉCHEC n'est pas une donnée : invisible ici (l'affichage reste
+        // « en chargement », jamais un faux « aucune vente »), mais bien vue par
+        // queueSalesFetch, qui n'insiste pas.
+        if (entry.failed) return null;
+        const ttl = entry.count === 0 ? SALES_EMPTY_TTL : SALES_CACHE_TTL;
+        if (Date.now() - entry.fetchedAt > ttl) return null; // périmé
         // Invalide les entrées de l'ancien format (avant l'ajout de avg/min/max/last)
         if (entry.count > 0 && entry.avg === undefined) return null;
         // Normalise les médianes à demi-entier des anciennes entrées (cache d'avant l'arrondi)
         if (Number.isFinite(entry.median) && entry.median % 1 !== 0) entry.median = Math.round(entry.median);
         return entry;
     }
+    /* Échec de récupération d'un historique : il DOIT être mémorisé. Sans ça,
+       getCachedSales() reste vide pour cette carte, queueSalesFetch() la remet en file
+       au scan suivant, et une carte refusée en 403 est redemandée indéfiniment — à
+       chaque scan, pour chaque carte refusée. C'est ce qui saturait l'API et faisait
+       tomber /api/packs/open en 403 par ricochet, sans rapport avec le Pack Opener.
+       On ne bloque que 10 min : un refus est transitoire, on retente plus tard. */
+    /* Blocage PROGRESSIF après un refus : 1 min, puis 2, 4… plafonné à 30 min. Un
+       blocage plat de 10 min laissait un « ? » affiché bien après que le site eut
+       recommencé à répondre. */
+    const SALES_FAIL_BASE_MS = 60 * 1000;
+    const SALES_FAIL_MAX_MS = 30 * 60 * 1000;
+    function salesFailTtl(entry) {
+        const n = Math.max(1, (entry && entry.failCount) || 1);
+        return Math.min(SALES_FAIL_BASE_MS * Math.pow(2, n - 1), SALES_FAIL_MAX_MS);
+    }
+    let salesEndpointCooldownUntil = 0;
+    let _salesCooldownLogged = 0;
+
+    function salesFetchBlocked(cardId) {
+        const e = salesCache[cardId];
+        return !!(e && e.failed && Date.now() - e.fetchedAt < salesFailTtl(e));
+    }
+
     // File d'attente des cartes à fetcher (étalée pour ne pas flooder l'API)
     const salesFetchQueue = [];
     const salesFetchQueued = new Set(); // évite les doublons dans la file
@@ -719,55 +1145,222 @@
         return Math.round(m);
     }
 
-    // Récupère et met en cache l'historique d'une carte (une requête)
-    async function fetchCardSales(cardId) {
-        try {
-            const res = await fetch(
-                `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales`,
-                { credentials: "include" }
-            );
-            if (!res.ok) return null;
-            const data = await res.json();
-            const sales = (data.sales || []).filter(s => Number.isFinite(s.final_price));
-            const prices = sales.map(s => s.final_price);
-            // "recent" est trié du plus récent au plus ancien côté API ; sinon on trie nous-mêmes
-            const recent = (data.recent && data.recent.length ? data.recent : sales)
-                .filter(s => Number.isFinite(s.final_price))
-                .slice()
-                .sort((a, b) => new Date(b.settled_at) - new Date(a.settled_at));
+    /* Transforme une réponse /sales en entrée de cache. Extrait de fetchCardSales pour
+       que l'INTERCEPTEUR puisse en faire autant : quand le site récupère lui-même la cote
+       d'une carte (c'est ce qu'il fait en ouvrant « Mettre aux enchères », où il affiche
+       MOYENNE), le bot la capte au passage. Zéro requête, et ça contourne un refus
+       éventuel sur notre propre appel. */
+    function storeSalesEntry(cardId, data, rarityHint) {
+        if (!cardId || !data) return null;
+
+        /* Deux formes de réponse cohabitent : la liste complète des ventes, et le
+           RÉSUMÉ que renvoie `?scope=summary` (celui que le site utilise pour afficher
+           sa MOYENNE). Sans ce second cas, un résumé se lisait « aucune vente » — un
+           tableau `sales` vide donne bien un compte de zéro. Les noms de champs du
+           résumé ne sont pas documentés : on sonde les plus plausibles, et on trace
+           une fois les clés reçues pour repérer un renommage futur. */
+        /* Forme RÉSUMÉ, celle que renvoie `?scope=summary` et qu'utilise le site :
+             {"wikipedia_title":"Game Boy Advance","summary":{"SR":{"average":668}},"isPro":false}
+           La moyenne est imbriquée SOUS LA RARETÉ, pas à la racine — une même carte a
+           une cote différente selon sa rareté. On garde donc toutes les raretés, et
+           c'est l'affichage qui choisit celle de l'exemplaire concerné. */
+        if (data.summary && typeof data.summary === 'object' && !Array.isArray(data.sales)) {
+            const byRarity = {};
+            for (const [rar, v] of Object.entries(data.summary)) {
+                const n = v && (v.average != null ? v.average : v.avg != null ? v.avg : v.median);
+                const num = typeof n === 'string' ? Number(n) : n;
+                if (Number.isFinite(num)) byRarity[String(rar).toUpperCase()] = Math.round(num);
+            }
+            const values = Object.values(byRarity);
+            /* Résumé VIDE ({"summary":{}}) = la carte ne s'est jamais vendue. Ne rien
+               mémoriser laissait le badge sur « ⋯ » indéfiniment, et la carte était
+               redemandée à chaque passage. C'est une vraie réponse : on la garde. */
+            if (!values.length) {
+                const empty = { median: 0, avg: null, count: 0, last: null, min: null, max: null,
+                                byRarity: {}, summary: true, fetchedAt: Date.now() };
+                salesCache[cardId] = empty;
+                saveSalesCache();
+                return empty;
+            }
+            const fallback = rarityHint && byRarity[String(rarityHint).toUpperCase()] != null
+                ? byRarity[String(rarityHint).toUpperCase()]
+                : values[0];
             const entry = {
-                median: median(prices),
-                count: prices.length,
-                last: recent.length ? recent[0].final_price : null,
-                avg: prices.length ? Math.round(prices.reduce((s, p) => s + p, 0) / prices.length) : null,
-                min: prices.length ? Math.min(...prices) : null,
-                max: prices.length ? Math.max(...prices) : null,
-                fetchedAt: Date.now()
+                median: fallback, avg: fallback,
+                count: 1,            // > 0, sinon l'affichage dirait « aucune vente »
+                last: null, min: null, max: null,
+                byRarity, summary: true, fetchedAt: Date.now(),
             };
             salesCache[cardId] = entry;
             saveSalesCache();
             return entry;
+        }
+
+        if (!Array.isArray(data.sales)) {
+            if (!storeSalesEntry._unknownLogged) {
+                storeSalesEntry._unknownLogged = true;
+                wmLog(`🔬 Cote : réponse non reconnue <span style="color:#888;font-size:9px;">${esc(Object.keys(data).join(', ') || '(vide)')}</span>`);
+            }
+            return null;
+        }
+
+        const sales = (data.sales || []).filter(s => Number.isFinite(s.final_price));
+        const prices = sales.map(s => s.final_price);
+        // "recent" est trié du plus récent au plus ancien côté API ; sinon on trie nous-mêmes
+        const recent = (data.recent && data.recent.length ? data.recent : sales)
+            .filter(s => Number.isFinite(s.final_price))
+            .slice()
+            .sort((a, b) => new Date(b.settled_at) - new Date(a.settled_at));
+        const entry = {
+            median: median(prices),
+            count: prices.length,
+            last: recent.length ? recent[0].final_price : null,
+            avg: prices.length ? Math.round(prices.reduce((s, p) => s + p, 0) / prices.length) : null,
+            min: prices.length ? Math.min(...prices) : null,
+            max: prices.length ? Math.max(...prices) : null,
+            fetchedAt: Date.now()
+        };
+        salesCache[cardId] = entry; // écrase une éventuelle entrée d'échec
+        saveSalesCache();
+        return entry;
+    }
+
+    /* ── File UNIQUE des lectures de cote ──
+       Capture réseau du 01/10 : la surcouche Collection (lots de 5), la Chasse opti, la
+       Revente et le Trash Seller lisaient les cotes chacun de leur côté ; jusqu'à 9 requêtes
+       simultanées, et le site a répondu 403 → toutes les cotes en pause 5 min, Chasse opti
+       aveugle pendant ce temps. Désormais : au plus 4 lectures en vol pour tout le bot, les
+       plus urgentes d'abord (Chasse / Revente > Trash / calculs > surcouche Collection), et
+       aucune lecture lancée pendant une pause imposée par le site. */
+    const SALES_MAX_INFLIGHT = 4;
+    const SALES_PRIO = { overlay: 0, normal: 1, urgent: 2 };
+    let salesInflight = 0;
+    const salesWaiters = [];   // { resolve, prio } — trié par priorité, FIFO à priorité égale
+    function acquireSalesSlot(prio) {
+        if (salesInflight < SALES_MAX_INFLIGHT) { salesInflight++; return Promise.resolve(); }
+        return new Promise(resolve => {
+            let i = salesWaiters.length;
+            while (i > 0 && salesWaiters[i - 1].prio < prio) i--;
+            salesWaiters.splice(i, 0, { resolve, prio });
+        });
+    }
+    function releaseSalesSlot() {
+        const next = salesWaiters.shift();
+        if (next) next.resolve();          // la place passe directement au suivant
+        else salesInflight = Math.max(0, salesInflight - 1);
+    }
+    // Pause progressive après un refus 403/429 : 1, 2, 4 puis 5 min (avant : 5 min d'emblée).
+    let salesRefusalStreak = 0;
+    let salesLastRefusalAt = 0;
+
+    // Récupère et met en cache l'historique d'une carte (une requête)
+    async function fetchCardSales(cardId, opts) {
+        const prio = (opts && Number.isFinite(opts.priority)) ? opts.priority : SALES_PRIO.overlay;
+        await acquireSalesSlot(prio);
+        try {
+            // Le site vient d'imposer une pause : on ne relance rien (null = « pas lu »).
+            if (Date.now() < salesEndpointCooldownUntil) return null;
+            return await _fetchCardSalesRaw(cardId);
+        } finally {
+            releaseSalesSlot();
+        }
+    }
+    async function _fetchCardSalesRaw(cardId) {
+        try {
+            /* `?scope=summary` : c'est EXACTEMENT ce que le site demande (relevé dans
+               l'onglet Réseau, 200 OK), alors que notre appel sans paramètre se faisait
+               refuser en 403. Autant emprunter le chemin dont on sait qu'il répond. */
+            // fetch d'origine : notre intercepteur capte les cotes demandées par le SITE ; il
+            // stockait aussi une 2e fois celles du bot (et réécrivait tout le cache en local).
+            const rawFetch = window.wmOriginalFetch || fetch;
+            await waitBotNetResume();   // fetch d'origine : la pause réseau doit être attendue ici
+            // 12 s maximum : la file n'a que 4 places, une lecture bloquée les gèlerait toutes
+            // (Chasse, Revente, Trash Seller, surcouche). Abandon = « pas lu », retenté plus tard.
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 12000);
+            let res;
+            try {
+                res = await rawFetch(
+                    `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales?scope=summary`,
+                    { credentials: "include", signal: ctrl.signal }
+                );
+            } finally {
+                clearTimeout(timer);
+            }
+            if (!res.ok) {
+                // Trace l'échec dans le cache (cf. SALES_FAIL_TTL) pour ne pas redemander
+                // cette carte à chaque scan. `failed` la rend invisible à getCachedSales,
+                // donc l'affichage reste « en cours de chargement », pas une fausse donnée.
+                const prevFails = (salesCache[cardId] && salesCache[cardId].failCount) || 0;
+                salesCache[cardId] = { median: 0, count: 0, last: null, avg: null,
+                                       min: null, max: null, failed: true,
+                                       failCount: prevFails + 1,
+                                       status: res.status, fetchedAt: Date.now() };
+                saveSalesCache();
+                if (res.status === 403 || res.status === 429) {
+                    // Plusieurs lectures en vol peuvent revenir refusées ensemble : une seule
+                    // pause (et un seul palier de plus) par épisode de refus.
+                    salesLastRefusalAt = Date.now();
+                    if (Date.now() >= salesEndpointCooldownUntil) {
+                        salesRefusalStreak++;
+                        const pauseMs = Math.min(5 * 60 * 1000, 60 * 1000 * Math.pow(2, salesRefusalStreak - 1));
+                        salesEndpointCooldownUntil = Date.now() + pauseMs;
+                        if (Date.now() - _salesCooldownLogged > 60 * 1000) {
+                            _salesCooldownLogged = Date.now();
+                            wmLog(`🐢 Le site refuse l'historique des ventes (HTTP ${res.status}) — récupération des cotes en pause ${Math.round(pauseMs / 60000)} min. Ça libère du débit pour l'ouverture de paquets.`);
+                        }
+                    }
+                }
+                return null;
+            }
+            // Palier remis à zéro seulement après 10 min sans aucun refus : une réponse 200 qui
+            // revient d'une rafale en partie refusée ne prouve pas que le site a cessé de freiner
+            // (relecture du 01/10 : la pause restait bloquée à 1 min).
+            if (Date.now() - salesLastRefusalAt > 10 * 60 * 1000) salesRefusalStreak = 0;
+            return storeSalesEntry(cardId, await res.json());
         } catch(e) { return null; }
     }
 
-    // Traite la file d'attente, une carte à la fois avec délai aléatoire (anti-flood)
+    /* Traite la file par petits LOTS PARALLÈLES. C'était une carte toutes les 2 à 4 s :
+       sur une page de collection, remplir 40 cotes demandait plusieurs minutes, ce qui
+       rendait l'affichage inutilisable. Le site lui-même en tire des dizaines en
+       parallèle au chargement de la page — ce rythme est donc celui qu'il tolère. Le
+       garde-fou reste `salesEndpointCooldownUntil` : au premier refus, tout s'arrête. */
+    const SALES_BATCH = 5;
+    const SALES_BATCH_PAUSE_MS = 200;
+
     async function processSalesQueue(onUpdate) {
         if (salesFetchRunning) return;
         salesFetchRunning = true;
-        while (salesFetchQueue.length > 0) {
-            const cardId = salesFetchQueue.shift();
-            salesFetchQueued.delete(cardId);
-            if (getCachedSales(cardId)) continue; // déjà en cache valide entre-temps
-            await fetchCardSales(cardId);
-            if (onUpdate) onUpdate();
-            // Délai aléatoire 2-4s entre chaque requête pour étaler la charge
-            await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
+        try {
+            while (salesFetchQueue.length > 0) {
+                // Le site refuse l'endpoint en ce moment : on vide la file sans requêter,
+                // plutôt que de continuer à taper pour rien.
+                if (Date.now() < salesEndpointCooldownUntil) {
+                    salesFetchQueue.length = 0;
+                    salesFetchQueued.clear();
+                    break;
+                }
+                const batch = [];
+                while (batch.length < SALES_BATCH && salesFetchQueue.length > 0) {
+                    const cardId = salesFetchQueue.shift();
+                    salesFetchQueued.delete(cardId);
+                    if (getCachedSales(cardId) || salesFetchBlocked(cardId)) continue;
+                    batch.push(cardId);
+                }
+                if (!batch.length) continue;
+                await Promise.all(batch.map(id => fetchCardSales(id).catch(() => null)));
+                if (onUpdate) onUpdate();
+                await new Promise(r => setTimeout(r, SALES_BATCH_PAUSE_MS));
+            }
+        } finally {
+            salesFetchRunning = false;
         }
-        salesFetchRunning = false;
     }
 
     function queueSalesFetch(cardId) {
         if (!cardId || salesFetchQueued.has(cardId) || getCachedSales(cardId)) return;
+        if (salesFetchBlocked(cardId)) return; // refusée il y a peu → on ne réinsiste pas
         salesFetchQueued.add(cardId);
         salesFetchQueue.push(cardId);
     }
@@ -868,7 +1461,7 @@
                 border-radius:4px;background:linear-gradient(to right, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.03) 60%, ${r.color}66 100%);
                 border:1px solid ${r.color}33;font-size:10px;">
                 <span style="color:#666;font-family:monospace;font-size:9px;min-width:32px;white-space:nowrap;" title="${d.toLocaleString('fr-FR')}">${label}</span>
-                <span style="color:#fff;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${h.title}">${h.title}</span>
+                <span style="color:#fff;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(h.title)}">${esc(h.title)}</span>
                 ${badge(h.rarity)}
                 <span style="color:#00FFFF;font-size:9px;opacity:0.7;
                     background:rgba(0,255,255,0.1);padding:1px 4px;border-radius:3px;
@@ -892,6 +1485,8 @@
         autoSnipeMode:         'wm_autosnipe_mode',
         autoSnipeAdaptiveRatio:'wm_autosnipe_adaptive_ratio',
         minBalanceForAutoSnipe: 'wm_autosnipe_min_balance',
+        globalBidCap:          'wm_global_bid_cap',      // prix max d'UNE mise auto
+        maxBidsPerHour:        'wm_max_bids_per_hour',   // nb max de mises auto / heure
         autoRetagEnabled:      'wm_autoretag_enabled',
         sellTagName:           'wm_sell_tag_name',
         packCooldown:          'wm_pack_cooldown',
@@ -927,8 +1522,30 @@
         sellMarketPricePct:    'wm_sell_market_pct',
         sellMarketFloor:       'wm_sell_market_floor',
         sellOnlyIfSoleTag:     'wm_sell_only_if_sole_tag',
+        sellAutoResume:        'wm_sell_auto_resume',
         sellDegressive:        'wm_sell_degressive',
-        sellUndercutMarket:    'wm_sell_undercut_market',
+        sellFloorTries:        'wm_sell_floor_tries',
+        sellDecayStepPct:      'wm_sell_decay_step',
+        sellDecayMinPct:       'wm_sell_decay_min',
+        sellSetAsideAfter:     'wm_sell_set_aside_after',
+        legendHuntEnabled:     'wm_legend_hunt',
+        legendHuntMaxPrice:    'wm_legend_hunt_max',
+        legendHuntWindowSec:   'wm_legend_hunt_window',
+        legendHuntReserve:     'wm_legend_hunt_reserve',
+        optiHuntEnabled:       'wm_opti_hunt',
+        optiRarities:          'wm_opti_rarities',
+        optiMaxPct:            'wm_opti_max_pct',
+        optiMinGain:           'wm_opti_min_gain',
+        optiMaxBid:            'wm_opti_max_bid',
+        legendResellEnabled:   'wm_legend_resell_on',
+        legendResellSince:     'wm_legend_resell_since',
+        legendResellMarginPct: 'wm_legend_resell_margin',
+        legendResellDecayPct:  'wm_legend_resell_decay',
+        legendResellDecayEvery:'wm_legend_resell_decay_every',
+        antiBotBanner:         'wm_antibot_banner',
+        antiBotSound:          'wm_antibot_sound',
+        antiBotNotif:          'wm_antibot_notif',
+        sellUndercutMarket:   'wm_sell_undercut_market',
         autoTagPacksFromPresets: 'wm_autotag_packs_presets',
         autoTagSkipLegendary:  'wm_autotag_skip_legendary',
         snipeSecondsBefore:    'wm_snipe_seconds',
@@ -946,6 +1563,8 @@
         autoSnipeMode:         'fixed',   // 'fixed' = seuil fixe · 'adaptive' = sous la médiane marché
         autoSnipeAdaptiveRatio: 0.85,     // en mode adaptatif : snipe si prix <= ratio × médiane
         minBalanceForAutoSnipe: 2000,
+        globalBidCap:          500,       // 0 = pas de plafond (déconseillé)
+        maxBidsPerHour:        10,        // 0 = pas de limite (déconseillé)
         autoRetagEnabled:      true,
         sellTagName:           'Trash',
         packCooldown:          180,
@@ -976,11 +1595,33 @@
         scheduleTrashEnabled:  false,     // horaire propre au Trash Seller
         scheduleTrashStart:    '09:00',
         scheduleTrashEnd:      '23:00',
-        sellUseMarketPrice:    false,     // Trash Seller : prix = moyenne des ventes × % (repli tableau)
+        sellUseMarketPrice:    true,      // Trash Seller : prix = moyenne du marché (repli : tableau par rareté)
         sellMarketPricePct:    100,       // % appliqué au prix moyen du marché
         sellMarketFloor:       true,      // prix marché : jamais sous le prix du tableau (plancher)
         sellOnlyIfSoleTag:     true,      // filet de sécurité : ne vendre que si le tag de vente est le SEUL tag
-        sellDegressive:        true,      // Trash Seller : -15% de prix par tranche de 10 remises en vente (invendus)
+        sellAutoResume:        false,     // NE relance PAS le Trash Seller tout seul après un rechargement de page
+        sellDegressive:        true,      // Trash Seller : baisse du prix à chaque invendu (cf. sellDecay*)
+        sellFloorTries:        2,         // le plancher ne s'applique qu'aux N premières mises en vente (0 = toujours)
+        sellDecayStepPct:      10,        // baisse par invendu, en % du prix de base
+        sellDecayMinPct:       50,        // jamais sous ce % du prix de base, quelle que soit la baisse
+        sellSetAsideAfter:     6,         // après N invendus, la carte sort de la file (0 = jamais)
+        legendHuntEnabled:     false,     // Chasse Légendaire : miser sur les L bradées en toute fin d'enchère
+        legendHuntMaxPrice:    10,        // …tant que la mise reste ≤ ce montant (riposte comprise)
+        legendHuntWindowSec:   20,        // …dans les N dernières secondes
+        legendHuntReserve:     500,       // …sans jamais faire descendre le solde sous ce montant (0 = pas de réserve)
+        optiHuntEnabled:       false,     // Chasse opti : miser en fin d'enchère sur les cartes bien sous leur cote
+        optiRarities:          'L,UR,SR', // …raretés surveillées
+        optiMaxPct:            60,        // …tant que la mise reste ≤ ce % de la cote
+        optiMinGain:           20,        // …et au moins ce gain (cote − mise)
+        optiMaxBid:            200,       // …et jamais au-delà de ce montant, quelle que soit la cote
+        legendResellEnabled:   false,     // mode « Chasse + Revente » : les L gagnées sont remises en vente
+        legendResellSince:     0,         // …seulement celles gagnées après cette date (activation du mode)
+        legendResellMarginPct: 50,        // …jamais sous le prix payé + ce % (plancher)
+        legendResellDecayPct:  10,        // …baisse de ce % (0 = jamais de baisse)…
+        legendResellDecayEvery: 2,        // …toutes les N mises en vente sans acheteur
+        antiBotBanner:         true,      // vérification anti-bot du site : bandeau rouge dans le Market Watcher
+        antiBotSound:          true,      // …son d'alerte
+        antiBotNotif:          true,      // …notification du navigateur (Windows)
         sellUndercutMarket:    true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
         autoTagPacksFromPresets: false,   // étiquette auto les cartes packées selon les recherches enregistrées
         autoTagSkipLegendary:  true,      // n'auto-étiquette PAS les Légendaires (on veut souvent les garder)
@@ -1014,6 +1655,18 @@
     try {
         localStorage.removeItem('wm_pack_zero_ts');
         localStorage.removeItem('wm_observed_pack_cooldown_ms');
+    } catch(e) {}
+
+    // Migration : le pourcentage du prix marché valait 110% dans les versions héritées de
+    // l'amont. Le défaut est maintenant 100% (vendre AU prix du marché, pas au-dessus) : on
+    // efface la valeur stockée si — et seulement si — c'est exactement cet ancien 110, pour
+    // ne pas écraser un réglage choisi volontairement. Une seule fois (flag).
+    try {
+        if (!localStorage.getItem('wm_sell_market_pct_100_v1')) {
+            const rawPct = localStorage.getItem('wm_sell_market_pct');
+            if (rawPct !== null && parseFloat(rawPct) === 110) localStorage.removeItem('wm_sell_market_pct');
+            localStorage.setItem('wm_sell_market_pct_100_v1', '1');
+        }
     } catch(e) {}
 
     // Migration : l'ancien réglage unique "Sons d'alerte" est éclaté en 2 (apparition /
@@ -1116,7 +1769,7 @@
         a.click();
         document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(url), 1000);
-        wmLog(`💾 Log exporté : <b>${filename}</b> (${logEntries.length} ligne${logEntries.length>1?'s':''})`);
+        wmLog(`💾 Log exporté : <b>${esc(filename)}</b> (${logEntries.length} ligne${logEntries.length>1?'s':''})`);
     }
 
     function sortHits(hits) {
@@ -1146,6 +1799,15 @@
             case 'rarity_desc': arr.sort((a,b) => rarOf(b) - rarOf(a)); break;
             case 'rarity_asc':  arr.sort((a,b) => rarOf(a) - rarOf(b)); break;
             case 'title_asc':   arr.sort((a,b) => titleOf(a).localeCompare(titleOf(b))); break;
+            case 'keyword_asc':
+                // Regroupe les annonces par mot-clé qui les a fait remonter, puis fin
+                // proche à l'intérieur de chaque groupe.
+                arr.sort((a, b) => {
+                    const ka = (matchedKeyword(a.card) || '\uffff').toLowerCase();
+                    const kb = (matchedKeyword(b.card) || '\uffff').toLowerCase();
+                    return ka.localeCompare(kb) || endOf(a) - endOf(b);
+                });
+                break;
             case 'recent':      arr.sort((a,b) => seenOf(b) - seenOf(a)); break;
             case 'owned_asc':   arr.sort((a,b) => ownedOf(a) - ownedOf(b) || endOf(a) - endOf(b)); break;
             case 'owned_desc':  arr.sort((a,b) => ownedOf(b) - ownedOf(a) || endOf(a) - endOf(b)); break;
@@ -1205,6 +1867,141 @@
     function saveKeywords() {
         try { localStorage.setItem(KEYWORDS_STORAGE_KEY, JSON.stringify(KEYWORDS_ALERT)); } catch(e) {}
     }
+
+    /* ═══════════ LISTE DE SURVEILLANCE UNIFIÉE ═══════════
+       Une seule liste côté utilisateur. Chaque entrée porte son mode :
+         'auto'   → le bot mise tout seul, dans la limite de son plafond ;
+         'manuel' → l'annonce est seulement affichée, la mise se fait à la main.
+
+       Remplace les quatre listes d'avant (Standards / ⭐ Prioritaires / 🕵️ Fourbe /
+       🎯 Chasseur ciblé). Elles faisaient toutes la même chose à des réglages près, et
+       il fallait les connaître par cœur pour savoir laquelle misait — c'est comme ça
+       qu'on se retrouve à miser sur tout sans l'avoir voulu. Les exclusions restent à
+       part : c'est le contraire d'une recherche, pas un mode de recherche.
+
+       Le moteur de scan n'est PAS réécrit : la liste est *compilée* vers les tableaux
+       internes existants (cf. compileWatchlist). Les entrées 'auto' empruntent le
+       chemin du Chasseur ciblé, seul chemin qui sache déjà gérer mode + plafond +
+       rareté requise. */
+    const WATCHLIST_KEY = 'wm_watchlist';
+    let WATCHLIST = [];
+
+    function normalizeWatchEntry(e) {
+        const kw = String((e && (e.kw != null ? e.kw : e.text)) || '').trim();
+        if (!kw) return null;
+        const cap = Number(e && e.cap);
+        const mode = (e && e.mode === 'auto') ? 'auto' : 'manuel';
+        /* `extended` : chercher aussi dans la description/résumé de la carte, et plus
+           seulement dans le titre et la catégorie. Le site, lui, cherche dans tout —
+           d'où des cartes visibles sur le marché que le bot ne remontait pas.
+           Défaut : ACTIVÉ en mode manuel (on veut tout voir, ça ne coûte rien),
+           DÉSACTIVÉ en mode auto (ne pas miser sur une carte qui ne fait que
+           MENTIONNER le mot). Réglable entrée par entrée. */
+        const extended = (e && e.extended !== undefined && e.extended !== null)
+            ? !!e.extended
+            : mode === 'manuel';
+        return {
+            kw,
+            mode,
+            extended,
+            cap: Number.isFinite(cap) && cap > 0 ? cap : null, // null → plafond global
+            rarity: normalizeHunterRarity(e && e.rarity),
+            snipe: !!(e && e.snipe),
+            autoDisable: !!(e && e.autoDisable),
+            enabled: !(e && e.enabled === false),
+        };
+    }
+
+    /* Migration unique depuis les 4 anciennes listes. Les anciennes clés ne sont PAS
+       effacées : en cas de souci on revient en arrière sans avoir rien perdu.
+       Ordre du plus spécifique au moins spécifique — une chasse ciblée (qui porte un
+       plafond) l'emporte sur le même mot présent ailleurs. */
+    function migrateWatchlist() {
+        const out = [];
+        const push = (kw, extra) => {
+            const e = normalizeWatchEntry(Object.assign({ kw }, extra));
+            if (e && !out.some(o => o.kw.toLowerCase() === e.kw.toLowerCase())) out.push(e);
+        };
+        for (const h of KEYWORDS_HUNTER) {
+            push(h.text, { mode: 'auto', cap: h.cap, rarity: h.rarity,
+                           snipe: h.mode === 'fourbe', autoDisable: h.autoDisable, enabled: h.enabled });
+        }
+        for (const kw of KEYWORDS_FOURBE)   push(kw, { mode: 'auto', snipe: true });
+        for (const kw of KEYWORDS_PRIORITY) push(kw, { mode: 'auto' });
+        for (const kw of KEYWORDS_ALERT)    push(kw, { mode: 'manuel' });
+        return out;
+    }
+
+    function loadWatchlist() {
+        let raw = null;
+        try { raw = localStorage.getItem(WATCHLIST_KEY); } catch(e) {}
+        if (raw) {
+            try {
+                const arr = JSON.parse(raw);
+                if (Array.isArray(arr)) WATCHLIST = arr.map(normalizeWatchEntry).filter(Boolean);
+            } catch(e) {}
+        } else {
+            WATCHLIST = migrateWatchlist();
+            if (WATCHLIST.length) {
+                saveWatchlist();
+                const autos = WATCHLIST.filter(e => e.mode === 'auto').length;
+                wmLog(`🔀 Mots-clés regroupés en une seule liste : <b>${WATCHLIST.length}</b> entrée(s), dont <b>${autos}</b> en mise automatique. Les anciennes listes sont conservées en secours.`);
+            }
+        }
+        compileWatchlist();
+    }
+
+    function saveWatchlist() {
+        // La liste déroulante « mot-clé » du panneau marché se reconstruit depuis
+        // WATCHLIST : sans ça, un mot ajouté ou retiré n'y apparaîtrait qu'après un F5.
+        if (typeof window.wmRefreshKeywordFilter === 'function') {
+            try { setTimeout(window.wmRefreshKeywordFilter, 0); } catch(e) {}
+        }
+        try { localStorage.setItem(WATCHLIST_KEY, JSON.stringify(WATCHLIST)); }
+        catch(e) { wmLog(`⚠️ Sauvegarde des mots-clés ÉCHOUÉE : <b>${esc(e.name || 'Erreur')}</b> — ${esc(e.message || 'inconnue')}`); }
+        compileWatchlist();
+        // Nouvelle liste → le scan en cours (sur l'ancienne liste) est périmé, et on
+        // cherche les nouveaux mots-clés tout de suite au lieu d'attendre le prochain tour.
+        if (typeof requestMarketRescan === 'function') requestMarketRescan();
+    }
+
+    /* Compile la liste vers les tableaux que le moteur consomme déjà.
+       - KEYWORDS_ALERT  : TOUTES les entrées actives → toutes s'affichent dans le panneau.
+       - KEYWORDS_HUNTER : les entrées 'auto' → chemin Chasseur ciblé, qui respecte un plafond.
+       - PRIORITY / FOURBE : vidés. C'étaient précisément les deux chemins qui misaient
+         SANS aucun plafond et ripostaient à l'infini. */
+    function compileWatchlist() {
+        const live = WATCHLIST.filter(e => e.enabled !== false);
+        KEYWORDS_ALERT = live.map(e => e.kw);
+        KEYWORDS_PRIORITY = [];
+        KEYWORDS_FOURBE = [];
+        KEYWORDS_HUNTER = live.filter(e => e.mode === 'auto').map(e => ({
+            text: e.kw,
+            mode: e.snipe ? 'fourbe' : 'autobid',
+            cap: e.cap != null ? e.cap : getSetting('globalBidCap'),
+            rarity: e.rarity,
+            enabled: true,
+            autoDisable: e.autoDisable,
+        }));
+    }
+
+    /* Matcher partagé : SEUL endroit qui décide si une entrée correspond à une carte.
+       Tout le reste (classification du scan, chasse, affichage du mot-clé trouvé) passe
+       par ici, pour qu'un réglage comme `extended` ne s'applique pas à moitié. */
+    function watchEntryMatches(entry, card) {
+        if (!entry) return false;
+        const kwLC = entry.kw.toLowerCase();
+        // Ramenée par la recherche serveur pour CE mot-clé → le serveur fait foi, même si
+        // le mot n'apparaît dans aucun champ qu'il nous renvoie (cf. absorb du scan).
+        if (card && card.__wmServerKw && String(card.__wmServerKw).toLowerCase() === kwLC) return true;
+        return keywordFields(card, !!entry.extended)
+            .some(f => (f || '').toLowerCase().includes(kwLC));
+    }
+
+    // Entrée de la liste qui a fait matcher une carte (pour l'affichage « pourquoi »).
+    function matchedWatchEntry(card) {
+        return WATCHLIST.find(e => e.enabled !== false && watchEntryMatches(e, card)) || null;
+    }
     function savePriorityKeywords() {
         try { localStorage.setItem(KEYWORDS_PRIORITY_KEY, JSON.stringify(KEYWORDS_PRIORITY)); } catch(e) {}
     }
@@ -1222,7 +2019,7 @@
         // QuotaExceededError, si le compte a un gros historique) permettra de confirmer la
         // cause au lieu de continuer à deviner.
         try { localStorage.setItem(KEYWORDS_HUNTER_KEY, JSON.stringify(KEYWORDS_HUNTER)); }
-        catch(e) { wmLog(`⚠️ Sauvegarde Chasseur ciblé ÉCHOUÉE : <b>${e.name || 'Erreur'}</b> — ${e.message || 'inconnue'}. L'entrée reste affichée mais N'A PAS été enregistrée.`); }
+        catch(e) { wmLog(`⚠️ Sauvegarde Chasseur ciblé ÉCHOUÉE : <b>${esc(e.name || 'Erreur')}</b> — ${esc(e.message || 'inconnue')}. L'entrée reste affichée mais N'A PAS été enregistrée.`); }
     }
 
     // Exclusion STRICTE : la carte est exclue si un mot exclu apparaît en SOUS-CHAÎNE
@@ -1263,138 +2060,145 @@
     // Une entrée désactivée (`enabled === false`) est traitée comme absente : elle ne
     // déclenche rien ici, ET elle n'empêche plus le Hunter générique de reprendre la carte
     // (contrairement à une entrée active, qui le bloque volontairement plus loin).
+    /* Passe par le matcher partagé : sans ça, un mot-clé en mode auto ET en recherche
+       étendue serait affiché par le scan mais jamais pris en charge par la chasse. */
     function matchedHunterEntry(input) {
-        const fields = typeof input === "string"
-            ? [input]
-            : [input?.wikipedia_title || "", input?.category || ""];
-        return KEYWORDS_HUNTER.find(h =>
-            h.enabled !== false &&
-            fields.some(f => f.toLowerCase().includes((h.text || '').toLowerCase()))
-        ) || null;
+        const card = typeof input === "string" ? { wikipedia_title: input } : input;
+        const e = WATCHLIST.find(x => x.enabled !== false && x.mode === 'auto' && watchEntryMatches(x, card));
+        if (!e) return null;
+        return KEYWORDS_HUNTER.find(h => (h.text || '').toLowerCase() === e.kw.toLowerCase()) || null;
     }
     function hasHunterKeyword(input) { return !!matchedHunterEntry(input); }
 
     function renderKeywordsPanel() {
         const el = document.getElementById('wm-keywords-panel');
         if (!el) return;
+        const autos = WATCHLIST.filter(e => e.enabled !== false && e.mode === 'auto').length;
         const label = document.getElementById('wm-kw-label');
-        if (label) label.innerText = `Mots-clés (${KEYWORDS_ALERT.length + KEYWORDS_PRIORITY.length + KEYWORDS_FOURBE.length + KEYWORDS_HUNTER.length}) · Exclus (${KEYWORDS_EXCLUDE.length})`;
+        if (label) {
+            label.innerText = `Mots-clés (${WATCHLIST.length}) · ${autos} en auto · Exclus (${KEYWORDS_EXCLUDE.length})`;
+        }
 
-        const renderTag = (kw, i, type) => {
-            const isP = type === 'priority', isE = type === 'exclude', isF = type === 'fourbe';
-            const color  = isE ? '#ef4444' : isP ? '#fbbf24' : isF ? '#c084fc' : '#06b6d4';
-            const bg     = isE ? 'rgba(239,68,68,0.08)' : isP ? 'rgba(251,191,36,0.07)' : isF ? 'rgba(192,132,252,0.08)' : 'rgba(0,255,255,0.07)';
-            const border = isE ? 'rgba(239,68,68,0.4)' : isP ? 'rgba(251,191,36,0.35)' : isF ? 'rgba(192,132,252,0.4)' : 'rgba(0,255,255,0.18)';
-            const fn     = isE ? 'wmRemoveExcludeKeyword' : isP ? 'wmRemovePriorityKeyword' : isF ? 'wmRemoveFourbeKeyword' : 'wmRemoveKeyword';
-            return `<span style="display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:4px;
-                background:${bg};border:1px solid ${border};
-                font-size:10px;color:${color};margin:2px 2px 0 0;">
-                ${kw}
-                <button onclick="window.${fn}(${i})" style="
-                    background:none;border:none;color:#666;cursor:pointer;
-                    font-size:12px;padding:0 0 0 2px;line-height:1;" title="Retirer">×</button>
-            </span>`;
-        };
+        const globalCap = getSetting('globalBidCap');
 
-        const priorityTags = KEYWORDS_PRIORITY.map((kw, i) => renderTag(kw, i, 'priority')).join('');
-        const fourbeTags   = KEYWORDS_FOURBE.map((kw, i)   => renderTag(kw, i, 'fourbe')).join('');
-        const normalTags   = KEYWORDS_ALERT.map((kw, i)   => renderTag(kw, i, 'normal')).join('');
-        const excludeTags  = KEYWORDS_EXCLUDE.map((kw, i)  => renderTag(kw, i, 'exclude')).join('');
-
-        // Chasseur ciblé : chaque tag affiche le mot-clé + son mode + son plafond + sa
-        // rareté requise (si définie) + un indicateur d'auto-pause (si activée). Une chasse
-        // en pause est grisée pour être identifiable d'un coup d'œil, sans devoir lire le
-        // texte du bouton — cohérent avec le reste des indicateurs d'état du bot.
-        const escH = (s) => String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
-        const hunterTags = KEYWORDS_HUNTER.map((h, i) => {
-            const enabled = h.enabled !== false;
-            const modeStr = h.mode === 'fourbe' ? '🕵️ fourbe' : '🤖 auto-bid';
-            const rarStr = h.rarity ? ` · <span style="color:${(RARITY[h.rarity] || {}).color || '#5dade2'};font-weight:700;">${h.rarity}</span> requise` : '';
-            const adStr = h.autoDisable ? ` · <span title="Se met en pause toute seule après avoir gagné une enchère">🔁➜⏸️</span>` : '';
-            return `<span style="display:inline-flex;align-items:center;gap:4px;padding:2px 6px;border-radius:4px;
-                background:${enabled ? 'rgba(52,152,219,0.1)' : 'rgba(255,255,255,0.03)'};
-                border:1px solid ${enabled ? 'rgba(52,152,219,0.45)' : 'rgba(255,255,255,0.12)'};
-                font-size:10px;color:${enabled ? '#5dade2' : '#666'};margin:2px 2px 0 0;
-                ${enabled ? '' : 'opacity:0.65;'}">
-                ${enabled ? '' : '⏸️ '}${escH(h.text)}
-                <span style="color:#888;font-size:9px;">${modeStr} · ≤${h.cap} 💰${rarStr}${adStr}</span>
-                <button onclick="window.wmToggleHunterEnabled(${i})" style="
-                    background:none;border:none;color:${enabled ? '#4ade80' : '#888'};cursor:pointer;
-                    font-size:11px;padding:0 0 0 2px;line-height:1;"
-                    title="${enabled ? 'Mettre en pause (garde la config, arrête les mises)' : 'Réactiver'}">${enabled ? '⏸️' : '▶️'}</button>
-                <button onclick="window.wmRemoveHunterKeyword(${i})" style="
-                    background:none;border:none;color:#666;cursor:pointer;
-                    font-size:12px;padding:0 0 0 2px;line-height:1;" title="Supprimer définitivement">×</button>
-            </span>`;
+        /* Une ligne par mot-clé, avec ses réglages en clair plutôt que répartis dans
+           quatre listes qu'il fallait connaître par cœur. Le mode se change d'un clic :
+           c'est le réglage qui décide si le bot dépense ou non, il doit donc être le
+           plus visible et le plus facile à inverser. */
+        const rows = WATCHLIST.map((e, i) => {
+            const on = e.enabled !== false;
+            const isAuto = e.mode === 'auto';
+            const color = !on ? '#666' : isAuto ? '#fbbf24' : '#06b6d4';
+            const capTxt = e.cap != null ? e.cap.toLocaleString('fr-FR')
+                : (globalCap > 0 ? globalCap.toLocaleString('fr-FR') + ' (global)' : 'aucun');
+            const rarTxt = e.rarity
+                ? ` · <span style="color:${(RARITY[e.rarity] || {}).color || '#5dade2'};font-weight:700;">${e.rarity}</span>`
+                : '';
+            return `<div style="display:flex;align-items:center;gap:5px;padding:4px 6px;margin-bottom:3px;
+                border-radius:5px;background:${on ? 'rgba(255,255,255,0.03)' : 'transparent'};
+                border:1px solid ${on ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.04)'};${on ? '' : 'opacity:0.5;'}">
+                <button onclick="window.wmWatchToggleMode(${i})"
+                    title="${isAuto ? 'Le bot mise tout seul sur ce mot-clé. Clique pour repasser en manuel.' : 'Affichage seulement : à toi de cliquer Miser. Clique pour laisser le bot miser.'}"
+                    style="flex-shrink:0;padding:2px 6px;border-radius:4px;cursor:pointer;font-size:9px;font-weight:700;
+                    border:1px solid ${isAuto ? 'rgba(251,191,36,0.5)' : 'rgba(6,182,212,0.4)'};
+                    background:${isAuto ? 'rgba(251,191,36,0.12)' : 'rgba(6,182,212,0.1)'};color:${color};">
+                    ${isAuto ? '🤖 AUTO' : '👁️ MANUEL'}</button>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+                    color:${on ? '#ddd' : '#666'};font-size:11px;" title="${esc(e.kw)}">${esc(e.kw)}</span>
+                ${isAuto ? `<span style="color:#888;font-size:9px;white-space:nowrap;"
+                    title="Plafond : le bot ne montera jamais au-dessus.">≤${capTxt} 💰${rarTxt}${e.snipe ? ' · 🕵️' : ''}</span>` : ''}
+                <button onclick="window.wmWatchToggleExtended(${i})"
+                    title="${e.extended ? 'Recherche ÉTENDUE : cherche aussi dans la description de la carte. Clique pour revenir au titre + catégorie seuls.' : 'Recherche stricte : titre + catégorie seulement. Clique pour chercher aussi dans la description (plus de résultats).'}"
+                    style="flex-shrink:0;background:none;border:none;cursor:pointer;font-size:10px;padding:0 2px;
+                    opacity:${e.extended ? '1' : '0.3'};">🔎</button>
+                <button onclick="window.wmWatchToggleEnabled(${i})" title="${on ? 'Mettre en pause' : 'Réactiver'}"
+                    style="background:none;border:none;color:${on ? '#4ade80' : '#888'};cursor:pointer;font-size:11px;padding:0 2px;">${on ? '⏸️' : '▶️'}</button>
+                <button onclick="window.wmWatchRemove(${i})" title="Supprimer"
+                    style="background:none;border:none;color:#666;cursor:pointer;font-size:13px;padding:0 2px;line-height:1;">×</button>
+            </div>`;
         }).join('');
 
+        const excludeTags = KEYWORDS_EXCLUDE.map((kw, i) => `
+            <span style="display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:4px;
+                background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.4);
+                font-size:10px;color:#ef4444;margin:2px 2px 0 0;">
+                ${esc(kw)}
+                <button onclick="window.wmRemoveExcludeKeyword(${i})" style="background:none;border:none;
+                    color:#666;cursor:pointer;font-size:12px;padding:0 0 0 2px;line-height:1;" title="Retirer">×</button>
+            </span>`).join('');
+
         el.innerHTML = `
-            <div style="font-size:9px;color:#fbbf24;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">⭐ Prioritaires <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(auto-bid forcé)</span></div>
-            <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${priorityTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
-            <div style="display:flex;gap:4px;margin-bottom:10px;">
-                <input id="wm-kwp-input" type="text" placeholder="Ajouter… (plusieurs : sépare par ;)"
-                    style="flex:1;padding:3px 6px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);
-                    background:#0f0f13;color:#fff;font-size:11px;outline:none;"
-                    onkeydown="if(event.key==='Enter'){window.wmAddPriorityKeyword(this.value);this.value='';}" />
-                <button onclick="const i=document.getElementById('wm-kwp-input');window.wmAddPriorityKeyword(i.value);i.value='';"
-                    style="padding:3px 10px;border-radius:4px;border:1px solid rgba(251,191,36,0.3);
-                    background:rgba(251,191,36,0.1);color:#fbbf24;font-size:13px;cursor:pointer;font-weight:700;">+</button>
+            <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;padding:5px 6px;flex-wrap:wrap;
+                border-radius:5px;background:rgba(239,68,68,0.05);border:1px solid rgba(239,68,68,0.2);">
+                <span style="font-size:9px;color:#ef4444;text-transform:uppercase;letter-spacing:1px;flex-shrink:0;">🛡️ Limites</span>
+                <label style="display:flex;align-items:center;gap:3px;font-size:10px;color:#bbb;white-space:nowrap;">
+                    max
+                    <input id="wm-global-cap" type="number" min="0" step="10" value="${globalCap}"
+                        title="Prix maximum d'une mise automatique, tous mots-clés confondus. 0 = aucune limite (déconseillé)."
+                        style="width:58px;padding:2px 4px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);
+                        background:#0f0f13;color:#fff;font-size:10px;outline:none;" /> 💰/mise
+                </label>
+                <label style="display:flex;align-items:center;gap:3px;font-size:10px;color:#bbb;white-space:nowrap;">
+                    max
+                    <input id="wm-max-bids-hour" type="number" min="0" step="1" value="${getSetting('maxBidsPerHour')}"
+                        title="Nombre maximum de mises automatiques par heure glissante. 0 = aucune limite (déconseillé)."
+                        style="width:44px;padding:2px 4px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);
+                        background:#0f0f13;color:#fff;font-size:10px;outline:none;" /> mises/h
+                </label>
+                <span style="flex:1;"></span>
+                <span style="font-size:9px;color:#666;white-space:nowrap;" title="Mises automatiques passées dans la dernière heure">${bidsLastHour()} cette heure</span>
             </div>
-            <div style="font-size:9px;color:#c084fc;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🕵️ Fourbe <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(snipe auto en fin d'enchère)</span></div>
-            <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${fourbeTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
-            <div style="display:flex;gap:4px;margin-bottom:10px;">
-                <input id="wm-kwf-input" type="text" placeholder="Ajouter… (plusieurs : sépare par ;)"
-                    style="flex:1;padding:3px 6px;border-radius:4px;border:1px solid rgba(192,132,252,0.3);
-                    background:#0f0f13;color:#fff;font-size:11px;outline:none;"
-                    onkeydown="if(event.key==='Enter'){window.wmAddFourbeKeyword(this.value);this.value='';}" />
-                <button onclick="const i=document.getElementById('wm-kwf-input');window.wmAddFourbeKeyword(i.value);i.value='';"
-                    style="padding:3px 10px;border-radius:4px;border:1px solid rgba(192,132,252,0.3);
-                    background:rgba(192,132,252,0.1);color:#c084fc;font-size:13px;cursor:pointer;font-weight:700;">+</button>
+
+            <div style="font-size:9px;color:#06b6d4;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px;">
+                🔍 Mots-clés surveillés
+                <span style="color:#666;text-transform:none;letter-spacing:0;">— 🤖 AUTO : le bot mise · 👁️ MANUEL : affiché seulement · 🔎 : cherche aussi dans la description</span>
             </div>
-            <div style="font-size:9px;color:#5dade2;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🎯 Chasseur ciblé <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(mise + mode + plafond par mot-clé)</span></div>
-            <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${hunterTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
+            <div style="margin-bottom:7px;">${rows || '<span style="color:#444;font-size:10px;">Aucun mot-clé. Ajoute-en un ci-dessous.</span>'}</div>
+
             <div style="display:flex;gap:4px;margin-bottom:4px;">
-                <input id="wm-kwh-text" type="text" placeholder="Mot-clé (ex. gare ferroviaire japonaise)"
-                    style="flex:1;min-width:0;padding:3px 6px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);
-                    background:#0f0f13;color:#fff;font-size:11px;outline:none;" />
-                <select id="wm-kwh-mode" title="Mode" style="padding:3px 4px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
-                    <option value="fourbe">🕵️ Fourbe</option>
-                    <option value="autobid">🤖 Auto-bid</option>
-                </select>
-                <select id="wm-kwh-rarity" title="Rareté requise : la mise n'a lieu QUE si la carte est actuellement dans cette rareté précise. Utile si tu sais qu'elle va bientôt en changer et que tu ne veux pas miser au mauvais prix. « Toutes » = pas de filtre (comportement d'avant)." style="padding:3px 4px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
-                    <option value="">Toutes raretés</option>
-                    <option value="L">L</option>
-                    <option value="UR">UR</option>
-                    <option value="SR">SR</option>
-                    <option value="R">R</option>
-                    <option value="PC">PC</option>
-                    <option value="C">C</option>
-                </select>
-                <input id="wm-kwh-cap" type="number" min="1" step="1" placeholder="Plafond"
-                    style="width:64px;padding:3px 6px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);
-                    background:#0f0f13;color:#fff;font-size:11px;outline:none;" />
-                <button onclick="window.wmAddHunterKeyword(document.getElementById('wm-kwh-text').value, document.getElementById('wm-kwh-cap').value, document.getElementById('wm-kwh-mode').value, document.getElementById('wm-kwh-rarity').value, document.getElementById('wm-kwh-autodisable').checked)"
-                    style="padding:3px 10px;border-radius:4px;border:1px solid rgba(52,152,219,0.3);
-                    background:rgba(52,152,219,0.12);color:#5dade2;font-size:13px;cursor:pointer;font-weight:700;">+</button>
-            </div>
-            <label style="display:flex;align-items:center;gap:5px;margin:-2px 0 6px;font-size:9px;color:#888;cursor:pointer;user-select:none;"
-                title="Dès que cette chasse remporte une enchère, elle se met automatiquement en pause (⏸️) — pratique pour ne vouloir qu'UN exemplaire. Décoché (par défaut) : elle reste active, pour collectionner plusieurs fois la même carte.">
-                <input type="checkbox" id="wm-kwh-autodisable" style="width:11px;height:11px;accent-color:#5dade2;cursor:pointer;margin:0;flex-shrink:0;">
-                <span>Mettre en pause automatiquement après avoir gagné une enchère</span>
-            </label>
-            <div style="color:#555;font-size:9px;margin-bottom:10px;">Dès qu'une carte matche : mise minimale immédiate, puis <b>fourbe</b> (snipe en fin) ou <b>auto-bid</b> (riposte), jamais au-dessus du plafond. Avec une <b>rareté requise</b> : aucune mise tant que la carte n'est pas dans cette rareté précise — pratique si tu sais qu'elle va bientôt en changer et ne veux pas miser au mauvais prix entre-temps.</div>
-            <div style="font-size:9px;color:#06b6d4;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Standards</div>
-            <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${normalTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
-            <div style="display:flex;gap:4px;margin-bottom:10px;">
-                <input id="wm-kw-input" type="text" placeholder="Ajouter… (plusieurs : sépare par ;)"
-                    style="flex:1;padding:3px 6px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);
+                <input id="wm-wl-text" type="text" placeholder="Mot-clé (plusieurs : sépare par ;)"
+                    style="flex:1;min-width:0;padding:3px 6px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);
                     background:#0f0f13;color:#fff;font-size:11px;outline:none;"
-                    onkeydown="if(event.key==='Enter'){window.wmAddKeyword(this.value);this.value='';}" />
-                <button onclick="const i=document.getElementById('wm-kw-input');window.wmAddKeyword(i.value);i.value='';"
+                    onkeydown="if(event.key==='Enter'){window.wmWatchAddFromForm();}" />
+                <select id="wm-wl-mode" title="Que fait le bot quand il trouve une carte ?"
+                    style="padding:3px 4px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
+                    <option value="manuel">👁️ Manuel</option>
+                    <option value="auto">🤖 Auto</option>
+                </select>
+                <button onclick="window.wmWatchAddFromForm()"
                     style="padding:3px 10px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);
                     background:rgba(6,182,212,0.1);color:#06b6d4;font-size:13px;cursor:pointer;font-weight:700;">+</button>
             </div>
-            <div style="font-size:9px;color:#ef4444;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🚫 Exclus <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(masque strictement les annonces contenant la phrase)</span></div>
+            <div style="display:flex;gap:4px;align-items:center;margin-bottom:8px;font-size:9px;color:#666;flex-wrap:wrap;">
+                <span style="white-space:nowrap;">Si 🤖 auto :</span>
+                <input id="wm-wl-cap" type="number" min="1" step="10" placeholder="plafond"
+                    title="Plafond de prix pour CE mot-clé. Vide = le plafond global ci-dessus s'applique."
+                    style="width:62px;padding:2px 4px;border-radius:4px;border:1px solid rgba(255,255,255,0.12);
+                    background:#0f0f13;color:#fff;font-size:10px;outline:none;" />
+                <select id="wm-wl-rarity" title="Ne miser que si la carte est exactement dans cette rareté."
+                    style="padding:2px 4px;border-radius:4px;border:1px solid rgba(255,255,255,0.12);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
+                    <option value="">Toutes raretés</option>
+                    <option value="L">L</option><option value="UR">UR</option><option value="SR">SR</option>
+                    <option value="R">R</option><option value="PC">PC</option><option value="C">C</option>
+                </select>
+                <label style="display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap;"
+                    title="Ne mise pas tout de suite : attend la toute fin de l'enchère pour tirer une seule fois.">
+                    <input type="checkbox" id="wm-wl-snipe" style="width:11px;height:11px;accent-color:#c084fc;cursor:pointer;margin:0;">
+                    <span>🕵️ snipe en fin</span>
+                </label>
+                <label style="display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap;"
+                    title="Cherche aussi dans la DESCRIPTION de la carte, et plus seulement dans son titre et sa catégorie — c'est ce que fait la recherche du site. Coché par défaut en mode manuel (on veut tout voir), décoché en mode auto (ne pas miser sur une carte qui ne fait que mentionner le mot).">
+                    <input type="checkbox" id="wm-wl-extended" checked style="width:11px;height:11px;accent-color:#06b6d4;cursor:pointer;margin:0;">
+                    <span>🔎 étendu (description)</span>
+                </label>
+                <label style="display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap;"
+                    title="Repasse ce mot-clé en pause dès qu'il a remporté une enchère — pour n'en vouloir qu'un exemplaire.">
+                    <input type="checkbox" id="wm-wl-autodisable" style="width:11px;height:11px;accent-color:#5dade2;cursor:pointer;margin:0;">
+                    <span>pause après victoire</span>
+                </label>
+            </div>
+
+            <div style="font-size:9px;color:#ef4444;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🚫 Jamais <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(masque toute annonce contenant la phrase)</span></div>
             <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${excludeTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
             <div style="display:flex;gap:4px;">
                 <input id="wm-kwe-input" type="text" placeholder="Ajouter à exclure… (plusieurs : sépare par ;)"
@@ -1405,8 +2209,91 @@
                     style="padding:3px 10px;border-radius:4px;border:1px solid rgba(239,68,68,0.3);
                     background:rgba(239,68,68,0.1);color:#ef4444;font-size:13px;cursor:pointer;font-weight:700;">+</button>
             </div>`;
+
+        // Les deux limites s'appliquent dès la saisie : pas de bouton « enregistrer » à
+        // oublier, alors que c'est précisément ce qui borne la dépense.
+        const capEl = document.getElementById('wm-global-cap');
+        if (capEl) capEl.onchange = () => {
+            const v = Math.max(0, Math.floor(Number(capEl.value) || 0));
+            setSetting('globalBidCap', v);
+            compileWatchlist(); // les entrées sans plafond propre suivent le global
+            wmLog(v > 0 ? `🛡️ Plafond global : <b>${v.toLocaleString('fr-FR')} 💰</b> par mise.`
+                        : '🛡️ Plafond global retiré — les mises automatiques ne sont plus bornées en prix.');
+            renderKeywordsPanel();
+        };
+        const rateEl = document.getElementById('wm-max-bids-hour');
+        if (rateEl) rateEl.onchange = () => {
+            const v = Math.max(0, Math.floor(Number(rateEl.value) || 0));
+            setSetting('maxBidsPerHour', v);
+            wmLog(v > 0 ? `🛡️ Limite : <b>${v}</b> mise(s) automatique(s) par heure.`
+                        : `🛡️ Limite horaire retirée — le nombre de mises n'est plus borné.`);
+        };
     }
 
+    /* ── Handlers de la liste unifiée, appelés depuis le HTML du panneau ── */
+    window.wmWatchAddFromForm = function () {
+        const txtEl = document.getElementById('wm-wl-text');
+        const raw = txtEl ? txtEl.value : '';
+        const mode = (document.getElementById('wm-wl-mode') || {}).value === 'auto' ? 'auto' : 'manuel';
+        const capRaw = (document.getElementById('wm-wl-cap') || {}).value;
+        const rarity = (document.getElementById('wm-wl-rarity') || {}).value || '';
+        const snipe = !!(document.getElementById('wm-wl-snipe') || {}).checked;
+        const autoDisable = !!(document.getElementById('wm-wl-autodisable') || {}).checked;
+        const extended = !!(document.getElementById('wm-wl-extended') || {}).checked;
+        // Séparateur POINT-VIRGULE, comme partout ailleurs : préserve les titres à virgule.
+        const parts = String(raw || '').split(';').map(x => x.trim()).filter(Boolean);
+        if (!parts.length) return;
+        let added = 0;
+        for (const kw of parts) {
+            if (WATCHLIST.some(e => e.kw.toLowerCase() === kw.toLowerCase())) continue;
+            const entry = normalizeWatchEntry({ kw, mode, cap: capRaw, rarity, snipe, autoDisable, extended });
+            if (entry) { WATCHLIST.push(entry); added++; }
+        }
+        if (!added) return;
+        saveWatchlist();
+        renderKeywordsPanel();
+        const capNum = normalizeWatchEntry({ kw: 'x', cap: capRaw }).cap;
+        const capTxt = mode === 'auto'
+            ? ` · plafond ${(capNum != null ? capNum : getSetting('globalBidCap')).toLocaleString('fr-FR')} 💰`
+            : '';
+        wmLog(`🔍 ${added} mot${added > 1 ? 's' : ''}-clé${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} en <b>${mode === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}</b>${capTxt} : ${esc(parts.join(', '))}`);
+        if (txtEl) txtEl.value = '';
+    };
+
+    window.wmWatchToggleMode = function (i) {
+        const e = WATCHLIST[i];
+        if (!e) return;
+        e.mode = e.mode === 'auto' ? 'manuel' : 'auto';
+        saveWatchlist();
+        renderKeywordsPanel();
+        wmLog(`🔍 <b>${esc(e.kw)}</b> passe en <b>${e.mode === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}</b>.`);
+    };
+
+    window.wmWatchToggleExtended = function (i) {
+        const e = WATCHLIST[i];
+        if (!e) return;
+        e.extended = !e.extended;
+        saveWatchlist();
+        renderKeywordsPanel();
+        wmLog(`🔎 <b>${esc(e.kw)}</b> : recherche <b>${e.extended ? 'étendue (titre + catégorie + description)' : 'stricte (titre + catégorie)'}</b>.`);
+    };
+
+    window.wmWatchToggleEnabled = function (i) {
+        const e = WATCHLIST[i];
+        if (!e) return;
+        e.enabled = e.enabled === false;
+        saveWatchlist();
+        renderKeywordsPanel();
+    };
+
+    window.wmWatchRemove = function (i) {
+        const e = WATCHLIST[i];
+        if (!e) return;
+        WATCHLIST.splice(i, 1);
+        saveWatchlist();
+        renderKeywordsPanel();
+        wmLog(`🗑️ Mot-clé retiré : <b>${esc(e.kw)}</b>`);
+    };
     // Champs texte d'une carte pour le match mots-clés.
     // - includeDesc=false (défaut) : titre + catégorie SEULEMENT → usage marketplace/auto-bid
     //   (on ne veut PAS miser sur une carte qui ne fait que MENTIONNER un mot-clé dans sa desc).
@@ -1432,19 +2319,18 @@
 
     // Accepte une string ou un objet card. includeDesc=true → cherche aussi dans la description.
     function hasKeyword(input, includeDesc) {
-        const fields = keywordFields(input, includeDesc);
-        return KEYWORDS_ALERT.some(k =>
-            fields.some(f => f.toLowerCase().includes(k.toLowerCase()))
-        );
+        return matchedKeyword(input, includeDesc) !== null;
     }
 
     function matchedKeyword(input, includeDesc) {
-        const fields = keywordFields(input, includeDesc);
-        // Cherche dans toutes les catégories d'action pour afficher le mot-clé qui a matché.
-        for (const list of [KEYWORDS_ALERT, KEYWORDS_PRIORITY, KEYWORDS_FOURBE]) {
-            for (const k of list) {
-                if (fields.some(f => f.toLowerCase().includes(k.toLowerCase()))) return k;
-            }
+        const card = typeof input === "string" ? { wikipedia_title: input } : input;
+        // includeDesc forcé par l'appelant → on teste large ; sinon chaque entrée
+        // décide avec son propre réglage `extended`.
+        for (const e of WATCHLIST) {
+            if (e.enabled === false) continue;
+            if (includeDesc
+                ? keywordFields(card, true).some(f => (f || '').toLowerCase().includes(e.kw.toLowerCase()))
+                : watchEntryMatches(e, card)) return e.kw;
         }
         return null;
     }
@@ -1484,9 +2370,10 @@
         wmLog(`🔬 Vue cadres : aucune des annonces affichées n'expose d'image exploitable. Champs disponibles : <span style="color:#888;font-size:9px;">${Object.keys(card).join(', ')}</span>`);
     }
 
-    // Échappement HTML pour le texte injecté dans les templates (titres, descriptions Wikipédia).
-    const htmlEsc = (s) => String(s == null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Alias historique de esc() (cf. section ÉCHAPPEMENT HTML). Conservé parce qu'il
+    // est appelé dans tout le rendu du marché ; ne pas en refaire une implémentation
+    // séparée, c'est comme ça qu'on se retrouve avec des échappements partiels.
+    const htmlEsc = esc;
 
     // Sous-titre de la carte. L'endpoint marketplace ne renvoie PAS de description (contrairement
     // à la fiche du site) : les clés description/summary/extract restent sondées au cas où, mais
@@ -1545,11 +2432,18 @@
         try {
             const d = res && res.headers && res.headers.get && res.headers.get('date');
             if (!d) return;
+            // Réponse servie par un cache (CDN) : son Date est celui de la réponse d'origine.
+            if (parseInt(res.headers.get('age') || '0', 10) > 0) return;
             const serverMs = Date.parse(d);
             if (!Number.isFinite(serverMs)) return;
-            // Estime l'instant local correspondant : milieu de l'aller-retour de la requête
-            const localMid = Number.isFinite(reqStartMs) ? (reqStartMs + Date.now()) / 2 : Date.now();
-            const off = serverMs - localMid;
+            /* Instant de référence = ARRIVÉE des en-têtes (appelé juste après `await fetch`).
+               Le site date sa réponse à la FIN de son traitement, pas au milieu : avec des
+               réponses de 5 à 24 s (capture du 01/10), l'ancien calcul « milieu de la requête »
+               donnait un décalage entre −6 et +12 s — et faussait toute décision de fin
+               d'enchère (fenêtre de tir, « jamais sous 1,2 s »). Mesuré à l'arrivée, il tient
+               entre +0,1 et +1,1 s sur les mêmes captures. +500 ms : l'en-tête est tronqué à la
+               seconde (l'heure réelle est en moyenne une demi-seconde plus tard). */
+            const off = (serverMs + 500) - Date.now();
             // Lissage léger pour absorber le bruit (l'en-tête Date est tronqué à la seconde)
             serverClockOffset = serverClockSynced ? Math.round(serverClockOffset * 0.6 + off * 0.4) : off;
             if (!serverClockSynced) {
@@ -1562,6 +2456,36 @@
     }
     // Heure "serveur" estimée (corrige le décalage d'horloge du PC).
     function serverNow() { return Date.now() + serverClockOffset; }
+    window.wmClockOffset = () => serverClockOffset;   // diagnostic (console / tests)
+
+    /* Une enchère dont le end_at est passé n'accepte plus aucune mise : le serveur
+       répond « Cette enchère est terminée ». Comparé à l'heure SERVEUR (serverNow),
+       jamais à l'horloge du PC — un PC désynchronisé raterait la fin de plusieurs
+       secondes, ce qui est précisément ce que la synchro d'horloge corrige.
+       marginMs > 0 → considère aussi comme terminées celles qui finissent dans moins
+       de marginMs (utile pour ne pas armer un snipe sur une enchère quasi finie).
+       Sans end_at exploitable on ne présume rien : l'enchère reste traitée comme vivante. */
+    function isAuctionOver(a, marginMs = 0) {
+        const end = a && a.end_at ? new Date(a.end_at).getTime() : NaN;
+        if (!Number.isFinite(end)) return false;
+        return end - serverNow() <= marginMs;
+    }
+
+    // Garde commune à tous les chemins de mise. Entre la décision et le POST il y a un
+    // délai humanisé puis la latence réseau : l'enchère peut expirer entre les deux.
+    const auctionOverLogged = new Set();
+    function skipIfAuctionOver(a, contexte) {
+        if (!isAuctionOver(a)) return false;
+        // La hot lane repasse sur la même enchère à chaque tick : sans dé-doublonnage,
+        // une seule enchère morte noierait tout le log.
+        if (a && a.id && !auctionOverLogged.has(a.id)) {
+            if (auctionOverLogged.size > 500) auctionOverLogged.clear(); // borne mémoire
+            auctionOverLogged.add(a.id);
+            const t = (a.card && a.card.wikipedia_title) || (a.id.slice(0, 8) + '…');
+            wmLog(`⏰ ${contexte} annulé — enchère déjà terminée : <b>${esc(t)}</b>`);
+        }
+        return true;
+    }
 
     // Formate le temps restant d'une enchère depuis end_at ISO string
     function formatCountdown(endAtStr) {
@@ -1652,10 +2576,45 @@
     function bidIncrement(amount) {
         return Math.ceil(amount * 1.1 - 1e-9);
     }
+    /* Mise minimale : notre calcul (+10 %) n'est qu'une estimation de la règle du site. Si
+       l'annonce porte elle-même un minimum, ou si le site a refusé une mise en indiquant le
+       sien, c'est lui qui gagne — sinon on retentait trois fois le même montant refusé. */
+    const SITE_MIN_BID_KEYS = ['min_next_bid', 'minNextBid', 'next_min_bid', 'nextMinBid', 'min_bid', 'minBid',
+        'minimum_bid', 'minimumBid', 'min_amount', 'minAmount', 'minimum_amount', 'minimumAmount'];
+    function siteMinBid(o) {
+        if (!o || typeof o !== 'object') return 0;
+        for (const k of SITE_MIN_BID_KEYS) {
+            const v = Number(o[k]);
+            if (o[k] != null && Number.isFinite(v) && v > 0) return Math.ceil(v);
+        }
+        return 0;
+    }
+    // auctionId → { cur, amount } : minimum appris d'un refus, valable tant que l'enchère
+    // n'a pas bougé (même current_bid).
+    const learnedMinBid = new Map();
     function minNextBid(auction) {
-        return auction.current_bid != null
+        const est = auction.current_bid != null
             ? bidIncrement(auction.current_bid)
             : (auction.base_amount || 0);
+        let m = Math.max(est, siteMinBid(auction));
+        const l = auction.id != null ? learnedMinBid.get(auction.id) : null;
+        if (l && l.cur === (auction.current_bid ?? null)) m = Math.max(m, l.amount);
+        return m;
+    }
+    // Minimum annoncé par un refus : champ JSON, sinon nombre qui suit « minim… » dans le
+    // message, sinon le plus grand nombre plausible (> montant refusé). 0 si rien.
+    function minBidFromRefusal(data, msg, refused) {
+        const f = siteMinBid(data) || siteMinBid(data && data.auction);
+        if (f > refused) return f;
+        for (const k of ['minimum', 'min', 'required', 'requiredAmount', 'required_amount']) {
+            const v = Number(data && data[k]);
+            if (data && data[k] != null && Number.isFinite(v) && v > refused) return Math.ceil(v);
+        }
+        const txt = String(msg || '').replace(/(\d)[\s  .,](?=\d{3}\b)/g, '$1');
+        const kw = txt.match(/minim\D{0,40}?(\d+)/i);
+        if (kw && Number(kw[1]) > refused) return Number(kw[1]);
+        const nums = (txt.match(/\d+/g) || []).map(Number).filter(n => n > refused && n <= refused * 2 + 10);
+        return nums.length ? Math.max(...nums) : 0;
     }
 
     function countdownColor(endAtStr) {
@@ -1710,7 +2669,12 @@
 
     async function fetchBalance() {
         try {
-            const res = await fetch("https://www.wiki-masters.com/api/wikibidous", { credentials: "include" });
+            // no-store : un solde doit être frais — et une réponse servie depuis le cache
+            // porterait un en-tête Date ancien, qui fausserait l'horloge serveur.
+            const res = await fetch("https://www.wiki-masters.com/api/wikibidous", { credentials: "include", cache: "no-store" });
+            // Lu à chaque passage du Market Watcher : sans mot-clé (aucune page de marché lue),
+            // c'est la source qui garde l'horloge serveur à jour.
+            syncServerClockFromResponse(res);
             if (!res.ok) return;
             const data = await res.json();
             const newBalance = data.balance ?? data.amount ?? data.wikibidous ?? Infinity;
@@ -1802,6 +2766,7 @@
         if (type === 'pack')      return getSetting('soundPackOpen');
         if (type === 'legendary') return getSetting('soundLegendary');
         if (type === 'won')       return getSetting('soundWon');
+        if (type === 'antibot')   return getSetting('antiBotSound');
         // Son générique : joué si au moins un des sons est activé
         return getSetting('soundNewHit') || getSetting('soundOutbid');
     }
@@ -1870,6 +2835,19 @@
                 fgain.gain.exponentialRampToValueAtTime(0.001, ft + 0.6);
                 fosc.start(ft);
                 fosc.stop(ft + 0.65);
+            } else if (type === "antibot") {
+                // Vérification anti-bot : deux bips graves, bien distincts des autres sons
+                [440, 330].forEach((freq, i) => {
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.connect(gain); gain.connect(ctx.destination);
+                    osc.frequency.value = freq; osc.type = "square";
+                    const t = ctx.currentTime + i * 0.25;
+                    gain.gain.setValueAtTime(0.08, t);
+                    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+                    osc.start(t);
+                    osc.stop(t + 0.22);
+                });
             } else if (type === "won") {
                 // Enchère gagnée : arpège "cha-ching" claire, do-sol-do', volume moyen
                 [659, 988, 1319].forEach((freq, i) => {
@@ -1944,7 +2922,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     border-left:3px solid ${r.color}; display:flex; align-items:center;
                     gap:8px; animation:fadeIn 0.2s ease;">
                     ${isKW ? '<span style="font-size:16px">🚨</span>' : ''}
-                    <span style="color:${r.color}; font-weight:600; font-size:13px; flex:1">${title}</span>
+                    <span style="color:${r.color}; font-weight:600; font-size:13px; flex:1">${esc(title)}</span>
                     ${badge(rarity)}
                 </div>`;
             await new Promise(r => setTimeout(r, 400));
@@ -2206,6 +3184,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!res.ok) break;
             const data = await res.json();
             const items = data.collection || [];
+            // Alimente aussi l'index titre → card_id de la surcouche Collection : elle
+            // fonctionne ainsi même si le site n'a pas encore chargé la page Collection.
+            indexCollectionPayload(data);
             if (items.length === 0) break;
 
             let reachedKnown = false;
@@ -2397,51 +3378,461 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     /* ===================== MARKET API ===================== */
 
     // Fetch une page de la marketplace
-    async function fetchMarketPage(page) {
-        const url = `${MARKET_API_BASE}?page=${page}&limit=${MARKET_PAGE_LIMIT}&sort=ending_soon`;
+    /* Régime de scan auto-adaptatif. Multiplié par 2 dès que le site refuse une page
+       (403 / 429), divisé par 2 après un scan entièrement propre : le bot trouve tout
+       seul le débit que le site tolère, au lieu de dépendre d'une constante devinée. */
+    let marketThrottleFactor = 1;
+    const MARKET_THROTTLE_MAX = 8;
+    let marketScanRefusals = 0;
+
+    async function fetchMarketPage(page, q, sort, extra) {
+        const url = `${MARKET_API_BASE}?page=${page}&limit=${MARKET_PAGE_LIMIT}`
+            + `&sort=${sort || 'ending_soon'}`
+            + (q ? `&q=${encodeURIComponent(q)}` : '')
+            + (extra ? `&${extra}` : '');
         const t0 = Date.now();
         const res = await fetch(url, { credentials: "include" });
         syncServerClockFromResponse(res, t0);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+            if (res.status === 403 || res.status === 429) marketScanRefusals++;
+            throw new Error(`HTTP ${res.status}`);
+        }
         return res.json();
     }
 
-    // Fetch TOUTES les pages et retourne tous les auctions
-    async function fetchAllMarketAuctions(onProgress) {
-        const first = await fetchMarketPage(1);
-        const auctions = [...first.auctions];
-        const total = first.total || 0;
-        const totalPages = Math.ceil(total / MARKET_PAGE_LIMIT);
-
-        if (onProgress) onProgress(1, totalPages, auctions.length);
-
-        // Pagination par lots parallèles : MARKET_PAGE_CONCURRENCY pages à la fois
-        // au lieu d'une par une → temps de scan divisé par ~5.
-        for (let start = 2; start <= totalPages; start += MARKET_PAGE_CONCURRENCY) {
-            const batch = [];
-            for (let p = start; p < start + MARKET_PAGE_CONCURRENCY && p <= totalPages; p++) batch.push(p);
-            const results = await Promise.all(
-                batch.map(p => fetchMarketPage(p).catch(() => ({ auctions: [] }))) // page ratée n'arrête pas le scan
-            );
-            for (const data of results) auctions.push(...data.auctions);
-            if (onProgress) onProgress(Math.min(start + batch.length - 1, totalPages), totalPages, auctions.length);
-            // petite pause entre les lots, pas entre chaque page
-            await new Promise(r => setTimeout(r, 100));
-        }
-
-        // Déduplication par id : comme les enchères sont triées par fin proche et que
-        // le temps s'écoule pendant la pagination, une même enchère peut apparaître sur
-        // 2 pages consécutives (elle glisse d'une page à l'autre entre 2 fetches).
-        // On garde la première occurrence de chaque id.
-        const seen = new Set();
-        const deduped = [];
-        for (const a of auctions) {
-            if (a && a.id && !seen.has(a.id)) {
-                seen.add(a.id);
-                deduped.push(a);
+    /* Nombre total d'annonces annoncé par l'API. Le champ a changé de nom (ou disparu) :
+       il valait 0, donc `Math.ceil(0 / 50)` donnait 0 page à paginer et le scan
+       s'arrêtait à la page 1 — qui, triée par `ending_soon`, ne contient que les
+       enchères les plus anciennes, c'est-à-dire les déjà terminées. Le bot ne voyait
+       donc JAMAIS les annonces vivantes. On sonde les noms plausibles, et surtout on
+       ne se sert plus de cette valeur pour décider quand s'arrêter.
+       Retourne null si l'API n'annonce rien d'exploitable. */
+    function readMarketTotal(data) {
+        const scopes = [data, data && data.pagination, data && data.meta]
+            .filter(o => o && typeof o === 'object');
+        for (const scope of scopes) {
+            for (const k of ['total', 'count', 'total_count', 'totalCount', 'totalItems', 'total_items', 'nbHits']) {
+                const n = Number(scope[k]);
+                if (Number.isFinite(n) && n > 0) return n;
             }
         }
-        return { auctions: deduped, total, totalPages };
+        return null;
+    }
+
+    /* ── Sauter les pages d'enchères mortes ──
+       Le site laisse en liste les enchères qu'il n'a pas encore soldées, et le scan
+       demande `sort=ending_soon` : elles ont donc le end_at le plus ancien et occupent
+       les premières pages. Sur ce marché, 10 820 annonces mortes pour 12 137 relevées
+       (89 %) — soit ~217 pages de cadavres à traverser avant la première annonce
+       vivante, et un scan qui se tronquait au plafond avant d'avoir tout vu.
+
+       « Est terminée » est MONOTONE dans cet ordre de tri : une fois qu'une page
+       contient du vivant, toutes les suivantes en contiennent. On cherche donc la
+       première page vivante par recherche exponentielle puis dichotomie — une dizaine
+       de requêtes au lieu de deux cents. */
+    async function findFirstLivePage(cap) {
+        const probe = async (p) => {
+            try {
+                const d = await fetchMarketPage(p);
+                const list = (d && d.auctions) || [];
+                return { empty: list.length === 0, live: list.some(a => !isAuctionOver(a)) };
+            } catch (e) {
+                return null; // page refusée : on ne conclut rien, la dichotomie l'ignore
+            }
+        };
+        // 1) Borne haute : on double jusqu'à toucher du vivant (ou le bout de la liste).
+        let lo = 1, hi = 0;
+        for (let p = 2; p <= cap; p = Math.min(p * 2, cap)) {
+            const r = await probe(p);
+            await new Promise(r2 => setTimeout(r2, MARKET_BATCH_PAUSE_MS));
+            if (!r) { hi = p; break; }          // refus → on s'arrête là, prudence
+            if (r.live || r.empty) { hi = p; break; }
+            lo = p;                              // page entièrement morte
+            if (p === cap) { hi = cap; break; }
+        }
+        if (!hi) return 1;
+        // 2) Dichotomie sur (lo, hi] : première page contenant du vivant.
+        while (lo + 1 < hi) {
+            const mid = Math.floor((lo + hi) / 2);
+            const r = await probe(mid);
+            await new Promise(r2 => setTimeout(r2, MARKET_BATCH_PAUSE_MS));
+            if (!r) break;
+            if (r.live || r.empty) hi = mid; else lo = mid;
+        }
+        // Une page de marge : des enchères expirent pendant le scan, la frontière bouge.
+        return Math.max(1, hi - 1);
+    }
+
+    /* ── Recherche côté SERVEUR ──
+       Relevé dans l'onglet Réseau : la recherche du site appelle
+       `GET /api/marketplace?page=1&limit=50&sort=recent&q=femme` → 200.
+       L'API sait donc filtrer elle-même. Interroger un mot-clé coûte alors quelques
+       pages au lieu des ~300 qu'exige un balayage complet, et surtout les résultats
+       sont EXACTEMENT ceux que le site montre à l'utilisateur — fini l'écart entre
+       « ce que je vois sur le site » et « ce que le bot trouve ».
+
+       Garde-fou : si l'API ignorait `q` (paramètre retiré, renommé…), elle renverrait
+       le marché entier. On le détecte en vérifiant qu'au moins une annonce ramenée
+       contient réellement le mot ; sinon on repasse au balayage complet et on le dit. */
+    const MARKET_MAX_PAGES_PER_KEYWORD = 20; // 1 000 annonces pour un seul mot : large
+    let serverSearchBroken = false;
+    let serverSearchBrokenTs = 0;
+    // Le balayage complet coûte des centaines de pages : on ne s'y résout jamais
+    // DÉFINITIVEMENT. Au bout de ce délai, on re-sonde la recherche serveur.
+    const SERVER_SEARCH_RETRY_MS = 10 * 60 * 1000;
+
+    /* Est-ce que `q=` filtre vraiment ?
+
+       L'ancienne sonde comptait la proportion d'annonces dont le titre / la catégorie /
+       le résumé contenaient le mot. Elle se trompait dès que le site cherchait dans un
+       champ que la réponse du marché ne renvoie pas (le résumé, justement) : la recherche
+       fonctionnait, la sonde la déclarait cassée, et le bot basculait sur un balayage de
+       277 pages — à chaque scan, sans jamais y revenir.
+
+       On ne devine donc plus ce que le serveur indexe : on compare la 1re page FILTRÉE à
+       la 1re page NON filtrée. Si `q` est ignoré, les deux servent les mêmes annonces. */
+    // La sonde coûte 2 requêtes : on ne la refait pas à chaque scan (le scan tourne
+    // toutes les quelques dizaines de secondes). Un verdict tient 10 min.
+    const SEARCH_PROBE_TTL_MS = 10 * 60 * 1000;
+    let _searchProbe = { verdict: null, ts: 0 };
+
+    async function probeServerSearch(kw) {
+        if (_searchProbe.verdict !== null && Date.now() - _searchProbe.ts < SEARCH_PROBE_TTL_MS) {
+            return _searchProbe.verdict;
+        }
+        let filtered = null, plain = null;
+        try {
+            [filtered, plain] = await Promise.all([
+                fetchMarketPage(1, kw, 'recent').catch(() => null),
+                fetchMarketPage(1, '', 'recent').catch(() => null),
+            ]);
+        } catch (e) { return null; }
+        if (!filtered || !plain) return null;   // refus réseau : indécidable, on n'accuse pas
+        const ids = (filtered.auctions || []).map(x => x && x.id).filter(Boolean);
+        const plainIds = new Set((plain.auctions || []).map(x => x && x.id).filter(Boolean));
+        if (!plainIds.size) return null;
+        const verdict = !ids.length          // 0 résultat filtré = un filtre qui filtre
+            || (ids.filter(id => plainIds.has(id)).length / ids.length) < 0.8;
+        _searchProbe = { verdict, ts: Date.now() };
+        return verdict;
+    }
+
+    async function fetchKeywordAuctions(kw, absorb, onProgress, ctl) {
+        let pages = 0;
+        for (let page = 1; page <= MARKET_MAX_PAGES_PER_KEYWORD; page++) {
+            if (ctl && ctl.abort) break;
+            /* Page refusée : on la REJOUE sur place. Abandonner ici perdrait la page ET
+               toutes les suivantes (on ne connaît plus `hasMore`), soit un trou silencieux
+               dans les résultats — exactement le défaut corrigé côté balayage complet. */
+            let data = null;
+            for (let attempt = 0; attempt < 3 && !data; attempt++) {
+                if (attempt) await new Promise(r => setTimeout(r, 1200 * attempt));
+                try { data = await fetchMarketPage(page, kw, 'recent'); } catch (e) { data = null; }
+            }
+            if (!data) {
+                wmLog(`⚠️ « ${esc(kw)} » : page ${page} refusée même après plusieurs essais — il manque jusqu'à ${MARKET_PAGE_LIMIT} annonces pour ce mot-clé.`);
+                break;
+            }
+            pages++;
+            const list = (data && data.auctions) || [];
+            absorb(list, kw);
+            // La sonde tranche DÈS LA PREMIÈRE PAGE : si `q` est ignoré, continuer
+            // reviendrait à télécharger 20 pages par mot-clé avant de s'en apercevoir.
+            if (ctl && ctl.check && ctl.check()) break;
+            if (onProgress) onProgress(kw, page, list.length);
+            const more = (data && typeof data.hasMore === 'boolean')
+                ? data.hasMore
+                : list.length >= MARKET_PAGE_LIMIT;
+            if (!more) break;
+            await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+        }
+        return pages;
+    }
+
+    /* Scan par mots-clés : une recherche serveur par entrée de la liste, plus les
+       enchères où je mise déjà (elles doivent rester suivies même si elles ne
+       correspondent à aucun mot-clé, sinon le pruning les déclarerait terminées).
+       Retourne null si la recherche serveur s'avère inopérante — l'appelant repasse
+       alors au balayage complet. */
+    async function fetchWatchedAuctions(scanGen, onProgress) {
+        const kws = [...new Set(WATCHLIST.filter(e => e.enabled !== false).map(e => e.kw))];
+        if (!kws.length) return null;
+        const stale = () => scanGen !== undefined && isScanStale(scanGen);
+
+        // Une seule sonde, AVANT de télécharger quoi que ce soit : verdict clair, et on
+        // ne paie pas 20 pages par mot-clé pour s'apercevoir ensuite que `q` est ignoré.
+        const works = await probeServerSearch(kws[0]);
+        if (works === false) {
+            serverSearchBroken = true;
+            serverSearchBrokenTs = Date.now();
+            wmLog(`⚠️ La recherche serveur (<b>q=</b>) renvoie le marché non filtré — balayage complet pendant 10 min, puis nouvelle tentative.`);
+            return null;
+        }
+        // works === null : le serveur a refusé la sonde (403). On ne condamne pas la
+        // recherche pour autant — on tente le scan, quitte à le faire partiellement.
+
+        const seen = new Set();
+        const auctions = [];
+        let refusedKeywords = 0;
+        const absorb = (list, kw) => {
+            for (const a of (list || [])) {
+                if (!a || !a.id) continue;
+                /* Le site indexe des champs que la réponse du marché ne renvoie pas. Une
+                   annonce ramenée par `q=eiffage` peut donc ne contenir « eiffage » nulle
+                   part dans ce qu'on reçoit : la re-tester localement la rejetait, et le
+                   Market Watcher n'affichait RIEN alors que la recherche avait marché.
+                   On retient donc le mot-clé qui l'a ramenée : c'est le serveur qui sait. */
+                if (kw && a.card && !a.card.__wmServerKw) a.card.__wmServerKw = kw;
+                if (seen.has(a.id)) continue;
+                seen.add(a.id);
+                auctions.push(a);
+            }
+        };
+        const ctl = { get abort() { return stale(); }, check() { return stale(); } };
+
+        let pages = 0;
+        for (const kw of kws) {
+            if (stale()) return { aborted: true };
+            const got = await fetchKeywordAuctions(kw, absorb, onProgress, ctl);
+            if (got === 0) refusedKeywords++;   // page 1 refusée : ce mot-clé n'a rien donné
+            pages += got;
+            await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+        }
+
+        // TOUS les mots-clés refusés : rendre « 0 annonce » ferait passer un refus serveur
+        // pour un marché vide, et le pruning déclarerait terminées des enchères vivantes.
+        if (stale()) return { aborted: true };
+        if (refusedKeywords === kws.length) {
+            wmLog(`⚠️ Recherche refusée par le site pour ${refusedKeywords} mot(s)-clé(s) — affichage conservé, nouvel essai dans 20 s (pas de balayage complet).`);
+            return { refused: true };
+        }
+
+        /* Les enchères où je mise déjà : récupérées une par une. Sans ça, une enchère
+           suivie qui ne correspond à aucun mot-clé serait absente du scan et le pruning
+           la déclarerait terminée à tort. myBidsSet reste petit, le coût est marginal. */
+        const missing = [...myBidsSet].filter(id => !seen.has(id)).slice(0, 25);
+        for (const id of missing) {
+            try {
+                const a = await fetchSingleAuction(id);
+                if (!a || !a.id || seen.has(a.id)) continue;
+                // Dernier état connu (gagnant, prix final) : c'est lui que la purge journalise.
+                if (a.end_at) activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
+                /* fork.44 : une enchère TERMINÉE n'est plus ajoutée au scan. L'API la renvoie
+                   encore par son id des heures après sa fin : elle comptait comme « présente »,
+                   n'était donc jamais purgée, et restait suivie à vie — relue à chaque scan et
+                   toutes les 2 s par la voie rapide (capture du 03/10 : 27 enchères finies
+                   depuis des heures, 119 lectures en 29 s). */
+                if (isAuctionOver(a)) continue;
+                seen.add(a.id); auctions.push(a);
+            } catch (e) {}
+        }
+
+        lastScanPageCount = Math.max(1, pages);
+        return { auctions, total: auctions.length, totalPages: pages, keywordMode: true,
+                 incomplete: refusedKeywords > 0 };
+    }
+
+    /* ── Aucun mot-clé : suivi ciblé, JAMAIS de balayage complet ──
+       Capture réseau du 01/10 : sans mot-clé, chaque scan lisait TOUT le marché (~270 pages,
+       5 à 24 s chacune, 1 page sur 4 refusée en 500) en continu — l'essentiel du trafic du
+       bot, qui ralentissait aussi les Chasses et la Revente. Sans mot-clé, la liste du
+       Market Watcher n'affiche QUE mes enchères : tout (affichage, surenchères, auto-bid,
+       purge des enchères finies) n'a besoin que des enchères SUIVIES. Donc :
+         · scan = relecture des seules enchères suivies (celles que la hot lane vient de lire,
+           il y a < 15 s, ne sont pas relues) ; aucune enchère suivie → aucune requête ;
+         · les mises faites à la main dans CET onglet sont captées directement (intercepteur).
+       fork.40 : le balayage complet « au démarrage puis toutes les 15 min » de fork.38 est
+       supprimé. Il repartait à CHAQUE rechargement de page (la Revente en provoque) et
+       défilait des centaines de pages pour un seul usage : repérer une mise faite depuis un
+       AUTRE appareil — les gains, eux, sont de toute façon relevés par syncWonAuctions.
+       Une enchère relue terminée sort de la liste (purge + journal « perdue / gagnée » avec
+       son état final) ; une relecture ratée sans fin connue rend le scan « partiel » : rien
+       n'est purgé sur une absence non prouvée. */
+    function hasEnabledKeywords() {
+        return WATCHLIST.some(e => e.enabled !== false && e.kw);
+    }
+    // Enchère suivie dont la relecture échoue sans fin connue : depuis quand (ms local).
+    const trackedFailSince = new Map();
+    const TRACKED_GIVE_UP_MS = 10 * 60 * 1000;
+    async function fetchTrackedAuctions(scanGen) {
+        const ids = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet,
+            ...hunterFourbeMap.keys(), ...autoBidMaxMap.keys()])];
+        const auctions = [];
+        // Relectures ratées sans fin connue : gardées telles quelles (comptées « vivantes »
+        // pour la purge) — mais elles ne bloquent plus la purge des AUTRES enchères. Avant
+        // fork.40, une seule enchère illisible rendait tout le scan « partiel » à vie (le
+        // balayage complet du démarrage masquait le problème).
+        const keepIds = [];
+        const fresh = (id) => {
+            const e = activeHitsMap.get(id);
+            return e && e.at && Date.now() - e.at < 15000 && e.auction && e.auction.id ? e.auction : null;
+        };
+        const toFetch = [];
+        for (const id of ids) {
+            const a = fresh(id);
+            if (a) { if (!isAuctionOver(a)) auctions.push(a); }
+            else toFetch.push(id);
+        }
+        for (let i = 0; i < toFetch.length; i += 5) {
+            if (scanGen !== undefined && isScanStale(scanGen)) return { aborted: true };
+            const grp = toFetch.slice(i, i + 5);
+            const res = await Promise.allSettled(grp.map(id => fetchSingleAuction(id)));
+            res.forEach((r, k) => {
+                const id = grp[k];
+                const a = r.status === 'fulfilled' ? r.value : null;
+                if (a && a.id) {
+                    trackedFailSince.delete(id);
+                    // Dernier état connu (gagnant, prix final) : c'est lui que la purge journalise.
+                    if (a.end_at) activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
+                    if (!isAuctionOver(a)) auctions.push(a);
+                    return;
+                }
+                // Relecture ratée (404/500 intermittents) : sans fin connue, aucune conclusion ;
+                // encore vivante d'après son dernier état → on la garde affichée (sinon la liste
+                // clignotait d'un passage à l'autre).
+                const last = activeHitsMap.get(id);
+                if (!(last && last.auction && last.auction.end_at)) {
+                    // Illisible depuis 10 min d'affilée : l'enchère n'existe plus (soldée et
+                    // retirée par le site). On cesse de la garder → la purge la retire.
+                    if (!trackedFailSince.has(id)) trackedFailSince.set(id, Date.now());
+                    if (Date.now() - trackedFailSince.get(id) < TRACKED_GIVE_UP_MS) keepIds.push(id);
+                    else trackedFailSince.delete(id);
+                }
+                else if (!isAuctionOver(last.auction)) auctions.push(last.auction);
+            });
+        }
+        lastScanPageCount = 1;
+        return { auctions, total: auctions.length, totalPages: 1, keywordMode: true, trackedOnly: true, incomplete: false, keepIds };
+    }
+
+    // Fetch TOUTES les pages et retourne tous les auctions
+    async function fetchAllMarketAuctions(scanGen, onProgress) {
+        if (typeof scanGen === 'function') { onProgress = scanGen; scanGen = undefined; }
+        const stale = () => scanGen !== undefined && isScanStale(scanGen);
+        // Déduplication à l'absorption : les enchères sont triées par fin proche et le
+        // temps s'écoule pendant la pagination, donc une même annonce peut apparaître
+        // sur 2 pages consécutives. `absorb` retourne le nombre d'entrées RÉELLEMENT
+        // nouvelles, ce qui sert aussi de garde-fou anti-boucle ci-dessous.
+        const seen = new Set();
+        const auctions = [];
+        const absorb = (list) => {
+            let added = 0;
+            for (const a of (list || [])) {
+                if (!a || !a.id || seen.has(a.id)) continue;
+                seen.add(a.id);
+                auctions.push(a);
+                added++;
+            }
+            return added;
+        };
+
+        const first = await fetchMarketPage(1);
+        const firstList = (first && first.auctions) || [];
+        absorb(firstList);
+
+        const reportedTotal = readMarketTotal(first);
+        const expectedPages = reportedTotal ? Math.ceil(reportedTotal / MARKET_PAGE_LIMIT) : null;
+        /* L'API n'annonce pas de total, mais elle expose `hasMore` (champs racine
+           observés : auctions, page, limit, hasMore). C'est le signal FAISANT AUTORITÉ :
+           on ne déduit plus la fin du scan d'une page incomplète, on la lit. */
+        const hasMoreOf = (d) => (d && typeof d.hasMore === 'boolean') ? d.hasMore : null;
+        if (!expectedPages && hasMoreOf(first) === null && !fetchAllMarketAuctions._loggedNoTotal) {
+            fetchAllMarketAuctions._loggedNoTotal = true;
+            wmLog(`🔬 Pagination marché : ni total ni hasMore exploitable (champs racine : <span style="color:#888;font-size:9px;">${esc(Object.keys(first || {}).join(', '))}</span>) — pagination jusqu'à une page incomplète.`);
+        }
+        if (onProgress) onProgress(1, expectedPages || '?', auctions.length);
+
+        // Pagination par lots parallèles : MARKET_PAGE_CONCURRENCY pages à la fois
+        // au lieu d'une par une → temps de scan divisé par ~5. On continue tant que
+        // les pages reviennent PLEINES : une page incomplète est la dernière. Ne
+        // dépend donc plus du total annoncé par l'API.
+        let lastPage = 1;
+        // `hasMore` quand l'API le donne, sinon repli sur « la page était pleine ».
+        const firstMore = hasMoreOf(first);
+        let more = firstMore !== null ? firstMore : firstList.length >= MARKET_PAGE_LIMIT;
+
+        /* Page 1 pleine et 100 % morte → toutes les pages de tête le sont aussi. On
+           saute directement à la première page vivante au lieu de les télécharger une
+           à une : c'est ce qui faisait tronquer le scan au plafond. */
+        let startPage = 2;
+        if (more && firstList.length > 0 && firstList.every(a => isAuctionOver(a))) {
+            const firstLive = await findFirstLivePage(expectedPages || MARKET_MAX_PAGES);
+            if (firstLive > 2) {
+                startPage = firstLive;
+                wmLog(`⏭️ ${firstLive - 1} page(s) d'enchères déjà terminées sautées — le scan démarre à la page ${firstLive}.`);
+            }
+        }
+        // Pages refusées (403/429) : elles étaient silencieusement abandonnées, soit ~50
+        // annonces perdues chacune — d'où des résultats manquants sans le moindre signal.
+        const failedPages = [];
+        let pagesFetched = 1;
+        for (let start = startPage; more && start <= MARKET_MAX_PAGES; start += MARKET_PAGE_CONCURRENCY) {
+            if (stale()) return { aborted: true, auctions: [], total: 0, totalPages: 0 };
+            const batch = [];
+            for (let p = start; p < start + MARKET_PAGE_CONCURRENCY && p <= MARKET_MAX_PAGES; p++) {
+                if (expectedPages && p > expectedPages) break;
+                batch.push(p);
+            }
+            if (!batch.length) break;
+
+            const results = await Promise.all(batch.map(p => fetchMarketPage(p)
+                .then(d => ({ ok: true, page: p, list: (d && d.auctions) || [], more: hasMoreOf(d) }))
+                // Une page ratée n'arrête pas le scan — et ne doit surtout pas être prise
+                // pour une page incomplète, sinon un hoquet réseau tronque tout le scan.
+                .catch(() => ({ ok: false, page: p, list: [], more: null }))));
+
+            let addedInBatch = 0;
+            for (const r of results) {
+                if (!r.ok) { failedPages.push(r.page); continue; }
+                addedInBatch += absorb(r.list);
+                if (r.more !== null) { if (!r.more) more = false; }
+                else if (r.list.length < MARKET_PAGE_LIMIT) more = false;
+            }
+            lastPage = batch[batch.length - 1];
+            pagesFetched += batch.length;
+            if (onProgress) onProgress(lastPage, expectedPages || lastPage, auctions.length);
+
+            // Garde-fou : un lot entier sans aucune nouveauté = l'API ignore le paramètre
+            // `page` (ou on tourne en rond). On s'arrête au lieu de boucler jusqu'au plafond.
+            if (addedInBatch === 0) break;
+            // Plafond atteint alors que les pages étaient encore pleines : le scan est
+            // TRONQUÉ, et il manque donc des annonces. À dire, pas à avaler en silence.
+            if (more && lastPage + MARKET_PAGE_CONCURRENCY > MARKET_MAX_PAGES) {
+                wmLog(`⚠️ Scan tronqué au plafond de <b>${MARKET_MAX_PAGES} pages</b> (${auctions.length} annonces) — il reste des annonces non scannées.`);
+            }
+            await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS)); // souffle entre les lots
+        }
+
+        /* Deuxième passe sur les pages refusées. Le site répond 403 par rafales quand on
+           le sollicite trop : abandonner ces pages, c'est perdre ~50 annonces chacune
+           SANS que rien ne le signale — exactement le « il ne trouve pas tout ». On
+           laisse retomber la pression, puis on les rejoue une par une. */
+        if (failedPages.length) {
+            await new Promise(r => setTimeout(r, 2000));
+            const stillFailed = [];
+            for (const p of failedPages) {
+                try {
+                    const d = await fetchMarketPage(p);
+                    absorb((d && d.auctions) || []);
+                } catch (e) {
+                    stillFailed.push(p);
+                }
+                await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+            }
+            if (stillFailed.length) {
+                wmLog(`⚠️ Scan incomplet : <b>${stillFailed.length} page(s)</b> refusée(s) par le site même après un second essai — il manque jusqu'à ${stillFailed.length * MARKET_PAGE_LIMIT} annonces. Le scan va se ralentir tout seul.`);
+            } else {
+                wmLog(`✅ ${failedPages.length} page(s) d'abord refusée(s), récupérée(s) au second essai.`);
+            }
+        }
+
+        // Le total affiché doit refléter ce qu'on a réellement vu : quand l'API annonce
+        // 0 (le bug d'origine), le panneau affichait « 0 annonces » en plein scan.
+        // Cadence du scan suivant : proportionnelle aux pages RÉELLEMENT téléchargées,
+        // pas au numéro de la dernière page — sauter 200 pages mortes ne doit pas être
+        // facturé comme si on les avait chargées.
+        lastScanPageCount = pagesFetched;
+        return { auctions, total: Math.max(reportedTotal || 0, auctions.length), totalPages: expectedPages || lastPage };
     }
 
     /* ===================== MARKET WATCHER ===================== */
@@ -2451,6 +3842,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Cache des ventes actives (mes mises en vente) pour le calcul header
     let lastActiveSales = [];
+
+    // Dernier log « annonces terminées ignorées » (throttle, cf. checkMarketplace).
+    let lastEndedScanLogTs = 0;
 
     // Timestamp de première détection de chaque hit (pour tri "ajout récent")
     // Map<auctionId, ms>. Conservé même quand activeHitsMap.set écrase l'entrée.
@@ -2549,6 +3943,318 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Vérifie si une mise prévue respecte le plafond auto-bid.
     // Si elle le dépasse : désactive l'auto-bid pour cette enchère et retourne false.
     // Sinon retourne true (la mise peut partir).
+    /* ═══════ SÉCURITÉS DES MISES AUTOMATIQUES ═══════
+       Porte unique par laquelle passe TOUTE mise automatique. Avant, chaque chemin
+       (prioritaire, chasseur, riposte, snipe, hot-lane) avait ses propres conditions,
+       et les mots-clés prioritaires n'en avaient aucune : ils misaient sans plafond et
+       ripostaient à l'infini. */
+
+    // Horodatage des mises réellement passées, pour la limite horaire glissante.
+    let bidTimestamps = [];
+    function recordBidPlaced() {
+        bidTimestamps.push(Date.now());
+        if (bidTimestamps.length > 500) bidTimestamps = bidTimestamps.slice(-500);
+    }
+    function bidsLastHour() {
+        const cutoff = Date.now() - 3600000;
+        bidTimestamps = bidTimestamps.filter(t => t > cutoff);
+        return bidTimestamps.length;
+    }
+
+    let _lastRateLogTs = 0;
+    const _capLogged = new Set();
+    // Un blocage par l'interrupteur maître doit SE VOIR. Sans ça, armer le Fourbe ou
+    // l'auto-bid sur une carte affichait « activé » puis ne misait jamais, sans une ligne
+    // pour dire pourquoi — le symptôme exact remonté (« le mode fourbe ne fonctionne pas »).
+    let _pausedLogTs = 0;
+    function warnAutoBidsPaused(what) {
+        if (autoSnipeEnabled) return false;
+        if (Date.now() - _pausedLogTs < 60000) return true; // pas plus d'1 ligne par minute
+        _pausedLogTs = Date.now();
+        wmLog(`⏸️ <b>Mises auto EN PAUSE</b> — ${esc(what)} ne misera pas. Clique sur le bandeau « ⏸️ Mises auto EN PAUSE » en haut du Market Watcher pour armer.`);
+        return true;
+    }
+
+    /* ── Solde insuffisant ──
+       Avant : chaque chemin ne vérifiait que « solde > 0 ». À 50 💰 pour une mise de 97, la
+       mise partait, le site refusait… et le Fourbe retentait à chaque tick de la hot lane
+       (plusieurs fois par seconde jusqu'à la fin), la Chasse toutes les 2 s, l'auto-bid à
+       chaque scan : des rafales de requêtes refusées, de quoi déclencher l'anti-bot.
+       Désormais une mise auto n'est pas envoyée au-delà du solde disponible (le site retient
+       le montant de mes mises en tête, et le rend quand je suis surenchéri : le solde lu est
+       donc bien ce qui reste à miser), et un refus « solde insuffisant » suspend les mises
+       auto 30 s, le temps de relire le solde. */
+    let balanceRefusedUntil = 0;
+    const _lowBalanceLogged = new Map(); // auctionId → dernier log
+    // `reserve` : montant sous lequel le solde ne doit pas descendre (Chasse Légendaire).
+    function balanceAllows(auction, plannedAmount, reserve) {
+        if (Date.now() < balanceRefusedUntil) return false;
+        const keep = Math.max(0, Number(reserve) || 0);
+        if (!Number.isFinite(wikibidousBalance) || plannedAmount + keep <= wikibidousBalance) return true;
+        const id = (auction && auction.id) || '?';
+        if (Date.now() - (_lowBalanceLogged.get(id) || 0) > 5 * 60 * 1000) {
+            if (_lowBalanceLogged.size > 300) _lowBalanceLogged.clear();
+            _lowBalanceLogged.set(id, Date.now());
+            const t = (auction && auction.card && auction.card.wikipedia_title) || '?';
+            wmLog(plannedAmount <= wikibidousBalance
+                ? `💸 Réserve : <b>${esc(t)}</b> demanderait ${plannedAmount.toLocaleString('fr-FR')} 💰 — il ne te resterait que ${(wikibidousBalance - plannedAmount).toLocaleString('fr-FR')} 💰, sous ta réserve de ${keep.toLocaleString('fr-FR')} 💰. Pas de mise.`
+                : `💸 Solde insuffisant : <b>${esc(t)}</b> demanderait ${plannedAmount.toLocaleString('fr-FR')} 💰, il te reste ${wikibidousBalance.toLocaleString('fr-FR')} 💰 — pas de mise. Les mises reprennent seules quand le solde remonte (vente, surenchère remboursée).`);
+        }
+        return false;
+    }
+
+    /* ── Vérification anti-bot du site ──
+       Le site refuse parfois une mise : 403 {"error":"Vérification anti-bot requise.",
+       "code":"human_verification_required"} (capture du 03/10). Sa vérification s'affiche
+       1 à 2 s puis se fait toute seule. Le bot NE la contourne PAS : il cesse de miser,
+       laisse la vérification se faire, et reprend après une pause. Avant, il réessayait
+       toutes les 4 à 5 s pendant plus de 3 minutes (même enchère, toujours refusée).
+       Pause : 10 s, puis 30 s, 1 min, 2 min, 5 min si le site redemande la vérification
+       juste après la reprise ; retour à 10 s après une mise acceptée (ou 15 min sans refus).
+       fork.42 (demande du 03/10) : pendant la pause, le bot ne fait plus AUCUNE requête
+       (scans, Chasses, cotes, voie rapide, Revente, Trash Seller, paquets…) — cf. fetch()
+       et botNet en tête du script. Le site, lui, n'est jamais bloqué. */
+    const HUMAN_CHECK_RE = /human_verification|anti-?bot|captcha|v[ée]rification humaine/i;
+    const HUMAN_CHECK_PAUSES_MS = [10000, 30000, 60000, 120000, 300000];
+    let humanCheckStreak = 0, humanCheckLastAt = 0;
+    let humanCheckTimer = null, humanCheckTick = null;
+    function humanCheckActive() { return botNetPaused(); }
+    function isHumanCheckRefusal(data, err) {
+        return !!((data && data.code === 'human_verification_required') || HUMAN_CHECK_RE.test(String(err || '')));
+    }
+    function renderHumanCheckBanner() {
+        const el = document.getElementById('wm-antibot-banner');
+        if (!el) return;
+        const left = Math.ceil((botNet.pausedUntil - Date.now()) / 1000);
+        if (left <= 0 || !getSetting('antiBotBanner')) { el.style.display = 'none'; el.innerHTML = ''; return; }
+        el.style.display = 'block';
+        el.innerHTML = `🛡️ <b>Vérification anti-bot du site</b> — le bot est en pause (aucune requête), reprise dans <b>${left} s</b>.`;
+    }
+    function notifyHumanCheck(body) {
+        if (!getSetting('antiBotNotif')) return;
+        try {
+            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                new Notification('WikiMasters — vérification anti-bot', { body, tag: 'wm-antibot' });
+            }
+        } catch(e) {}
+    }
+    // La permission de notifier ne peut être demandée que sur un clic de l'utilisateur.
+    function ensureNotifPermission() {
+        try {
+            if (getSetting('antiBotNotif') && typeof Notification !== 'undefined' && Notification.permission === 'default') {
+                Notification.requestPermission().catch(() => {});
+            }
+        } catch(e) {}
+    }
+    window.wmEnsureNotifPermission = ensureNotifPermission;
+    function onHumanCheckRequired(contexte, title) {
+        if (humanCheckActive()) return;   // déjà en pause : une seule alerte par pause
+        if (Date.now() - humanCheckLastAt > 15 * 60 * 1000) humanCheckStreak = 0;
+        const ms = HUMAN_CHECK_PAUSES_MS[Math.min(humanCheckStreak, HUMAN_CHECK_PAUSES_MS.length - 1)];
+        humanCheckStreak++;
+        humanCheckLastAt = Date.now();
+        botNet.pausedUntil = Date.now() + ms;   // coupe TOUTES les requêtes du bot (cf. fetch en tête)
+        const pause = ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Math.round(ms / 1000)} s`;
+        wmLog(`🛡️ Le site demande une <b>vérification anti-bot</b> (${esc(contexte || 'mise')} · <b>${esc(title || '?')}</b>) — <b>tout le bot en pause ${pause}</b>, aucune requête au site${humanCheckStreak > 1 ? ` (${humanCheckStreak}ᵉ fois d'affilée)` : ''}.`);
+        playSound('antibot');
+        notifyHumanCheck(`Bot en pause ${pause} (aucune requête). Il reprendra tout seul.`);
+        renderHumanCheckBanner();
+        if (humanCheckTick) clearInterval(humanCheckTick);
+        humanCheckTick = setInterval(renderHumanCheckBanner, 1000);
+        if (humanCheckTimer) clearTimeout(humanCheckTimer);
+        humanCheckTimer = setTimeout(() => {
+            if (humanCheckTick) { clearInterval(humanCheckTick); humanCheckTick = null; }
+            humanCheckTimer = null;
+            renderHumanCheckBanner();
+            wmLog('🛡️ Fin de la pause anti-bot — le bot reprend (requêtes et mises).');
+        }, ms + 50);
+    }
+
+    function autoBidAllowed(auction, plannedAmount, contexte) {
+        // 0) Vérification anti-bot du site en cours : on laisse le site faire, sans miser.
+        if (humanCheckActive()) return false;
+
+        // 1) Interrupteur maître : les mises auto sont-elles armées ?
+        if (!autoSnipeEnabled) {
+            const t = (auction && auction.card && auction.card.wikipedia_title) || contexte || 'la mise auto';
+            warnAutoBidsPaused(t);
+            return false;
+        }
+
+        // 1 bis) De quoi payer la mise (et, pour la Chasse, sans entamer la réserve).
+        const reserve = (contexte === 'Chasse Légendaire' || contexte === 'Chasse opti') ? getSetting('legendHuntReserve') : 0;
+        if (!balanceAllows(auction, plannedAmount, reserve)) return false;
+
+        // 2) Plafond de prix global — jamais dépassé, quel que soit le mot-clé.
+        const globalCap = getSetting('globalBidCap');
+        if (globalCap > 0 && plannedAmount > globalCap) {
+            if (auction && auction.id && !_capLogged.has(auction.id)) {
+                if (_capLogged.size > 500) _capLogged.clear();
+                _capLogged.add(auction.id);
+                const t = (auction.card && auction.card.wikipedia_title) || '?';
+                wmLog(`🛑 Mise annulée (plafond global <b>${globalCap.toLocaleString('fr-FR')} 💰</b>) : <b>${esc(t)}</b> — il aurait fallu ${plannedAmount.toLocaleString('fr-FR')} 💰`);
+            }
+            return false;
+        }
+
+        // 3) Limite du nombre de mises par heure glissante.
+        const maxPerHour = getSetting('maxBidsPerHour');
+        if (maxPerHour > 0 && bidsLastHour() >= maxPerHour) {
+            if (Date.now() - _lastRateLogTs > 300000) { // 5 min : on ne répète pas en boucle
+                _lastRateLogTs = Date.now();
+                wmLog(`⏸️ Limite de <b>${maxPerHour} mises/heure</b> atteinte — les mises automatiques reprendront d'elles-mêmes.`);
+            }
+            return false;
+        }
+
+        // 4) Plafond propre à cette enchère (réglé par mot-clé ou à la main).
+        return autoBidWithinCap(auction, plannedAmount);
+    }
+
+    /* ── Envoi d'une mise, avec rattrapage de la course ──
+       Entre le calcul du montant et l'arrivée du POST, un autre joueur peut miser : le site
+       refuse alors la nôtre (« montant trop bas ») et, avant, on abandonnait sur un simple
+       log — la mise de l'autre passait, pas la nôtre. On relit donc l'enchère, on recalcule
+       le minimum, on revérifie les plafonds, et on retente. Point de passage unique des cinq
+       chemins de mise (Hunter, Chasseur, prioritaire, snipe fourbe, riposte hot-lane). */
+    const BID_RETRY_MAX = 3;
+    const BID_RETRY_DELAY_MS = 180;
+    // Refus qui veulent dire « le prix a bougé » → relancer a un sens.
+    const BID_STALE_RE = /trop\s*bas|too\s*low|higher|sup[ée]rieur|minim|montant|amount|outbid|surench|insuffisant/i;
+    // Refus définitifs → insister ne ferait que spammer le serveur.
+    const BID_FATAL_RE = /termin|ended|closed|expir|finished|insufficient|fonds|solde|balance|propre|own|self/i;
+    // Refus pour manque de fonds (sous-ensemble des définitifs) : suspend les mises auto.
+    const BID_FUNDS_RE = /insufficient|insuffisant|not enough|pas assez|fonds|solde|balance|wikibidous? manquant/i;
+
+    function bidRetryNote(r) {
+        if (!r || !r.attempts || r.attempts < 2) return '';
+        return ` <span style="color:#22d3ee;font-size:9px;">(rattrapée après ${r.attempts} essais — quelqu'un misait en même temps)</span>`;
+    }
+
+    // Garde-fou d'une mise MANUELLE : l'utilisateur a cliqué, donc ni l'interrupteur des
+    // mises auto ni la limite horaire ne s'appliquent. Le plafond global reste, lui, une
+    // protection contre la faute de frappe et l'emballement.
+    function manualBidAllowed(auction, amount) {
+        const cap = getSetting('globalBidCap');
+        if (cap > 0 && amount > cap) {
+            const t = (auction && auction.card && auction.card.wikipedia_title) || '?';
+            wmLog(`🛑 Relance annulée (plafond global <b>${cap.toLocaleString('fr-FR')} 💰</b>) : <b>${esc(t)}</b> — il aurait fallu ${amount.toLocaleString('fr-FR')} 💰`);
+            return false;
+        }
+        return true;
+    }
+
+    async function placeBid(auction, amount, contexte, opts) {
+        const manual = !!(opts && opts.manual);
+        // Plafond propre à l'appelant (ex. Chasse : plafond calculé sur la cote). Vérifié à
+        // chaque relance : avant, seul autoBidMaxMap l'était — et il peut porter un plafond
+        // plus haut posé ailleurs sur la même enchère.
+        const maxCap = (opts && Number.isFinite(opts.max)) ? opts.max : Infinity;
+        let a = auction, amt = amount, lastErr = null;
+        for (let attempt = 1; attempt <= BID_RETRY_MAX; attempt++) {
+            let res = null, data = {};
+            try {
+                res = await fetch(`${MARKET_API_BASE}/${a.id}/bid`, {
+                    method: 'POST', credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ amount: amt })
+                });
+                data = await res.json().catch(() => ({}));
+            } catch (e) {
+                lastErr = (e && e.message) || 'réseau';
+            }
+            if (res && res.ok) {
+                humanCheckStreak = 0;   // mise acceptée : la prochaine pause anti-bot repart à 10 s
+                markAuctionAsMine(a.id, amt, a);
+                return { ok: true, amount: amt, attempts: attempt, data, auction: a };
+            }
+            lastErr = (data && (data.error || data.message)) || (res ? `HTTP ${res.status}` : lastErr) || 'erreur';
+            // Vérification anti-bot demandée : on ne réessaie PAS — pause de toutes les mises auto.
+            if (res && !res.ok && isHumanCheckRefusal(data, lastErr)) {
+                onHumanCheckRequired(contexte, a.card && a.card.wikipedia_title);
+                return { ok: false, amount: amt, reason: lastErr, humanCheck: true, auction: a };
+            }
+            if (res && !res.ok && BID_FUNDS_RE.test(String(lastErr))) {
+                // Le site dit « pas assez » : on relit le solde et on suspend les mises auto
+                // 30 s (le solde lu était sans doute périmé) plutôt que de réessayer.
+                if (Date.now() >= balanceRefusedUntil) {
+                    wmLog(`💸 Le site refuse la mise (<span style="color:#888;">${esc(String(lastErr).slice(0, 80))}</span>) — mises auto suspendues 30 s, solde relu.`);
+                }
+                balanceRefusedUntil = Date.now() + 30000;
+                fetchBalance().catch(() => {});
+                break;
+            }
+            if (BID_FATAL_RE.test(String(lastErr))) break;
+            // Le site a dit « trop bas » : on retient son minimum (ou, faute de chiffre, un cran
+            // au-dessus) pour ce prix-là — les prochaines mises sur cette enchère en tiendront
+            // compte, même après ce passage.
+            const curAtRefusal = a.current_bid ?? null;
+            let quickNext = 0;
+            if (res && !res.ok && (BID_STALE_RE.test(String(lastErr)) || (data && data.code === 'bid_too_low'))) {
+                const told = minBidFromRefusal(data, lastErr, amt - 1);
+                // « minimum 97 » alors qu'on a misé 97 : le site veut strictement plus.
+                if (told >= amt) {
+                    const need = told > amt ? told : amt + 1;
+                    if (learnedMinBid.size > 500) learnedMinBid.clear();
+                    learnedMinBid.set(a.id, { cur: curAtRefusal, amount: need });
+                    // Minimum = ma dernière mise + 10 % : c'est sans doute MOI qui mène (autre
+                    // onglet, mise faite à la main en même temps). Pas de relance à l'aveugle —
+                    // on relit l'enchère (chemin lent, qui vérifie « je mène déjà »).
+                    const mine = myLastBidMap.get(a.id);
+                    if (!(Number.isFinite(mine) && need <= bidIncrement(mine))) quickNext = need;
+                }
+            }
+            /* Le site a DONNÉ son minimum (réponse 409 {"code":"bid_too_low","min":79}) : on
+               remise tout de suite à ce montant. Avant, on relisait d'abord l'enchère — 3 à 8 s
+               avec un site lent (capture du 01/10) — et la nouvelle mise arrivait déjà trop
+               basse : 71 → refus (min 79), 8 s, 79 → refus (min 87)… Mêmes garde-fous qu'avant ;
+               un montant hors plafond est un arrêt normal, signalé comme tel (plus « échouée »). */
+            if (quickNext) {
+                if (isAuctionOver(a)) { lastErr = 'enchère terminée'; break; }
+                const allowedNow = quickNext <= maxCap
+                    && (manual ? manualBidAllowed(a, quickNext) : autoBidAllowed(a, quickNext, contexte));
+                if (!allowedNow) {
+                    return { ok: false, amount: quickNext, reason: 'plafond ou limite atteint après surenchère', blocked: true, auction: a };
+                }
+                if (attempt === BID_RETRY_MAX) break;
+                lastErr = `${lastErr} → relance à ${quickNext} 💰`;
+                amt = quickNext;
+                continue;
+            }
+            if (attempt === BID_RETRY_MAX) break;
+
+            await new Promise(r => setTimeout(r, BID_RETRY_DELAY_MS));
+            let fresh = null;
+            try { fresh = await fetchSingleAuction(a.id); } catch(e) {}
+            if (!fresh || !fresh.id) break;          // enchère illisible → on ne tire pas à l'aveugle
+            a = fresh;
+            if (isAuctionOver(a)) { lastErr = 'enchère terminée'; break; }
+            if (iAmLeading(a)) return { ok: true, amount: amt, attempts: attempt, alreadyLeading: true, auction: a };
+
+            // Prix inchangé et pourtant refusé « trop bas », sans minimum lisible : notre +10 %
+            // est sous la règle du site → un cran au-dessus plutôt que le même montant refusé.
+            if (res && !res.ok && BID_STALE_RE.test(String(lastErr)) && (a.current_bid ?? null) === curAtRefusal
+                && minNextBid(a) <= amt) {
+                learnedMinBid.set(a.id, { cur: curAtRefusal, amount: amt + Math.max(1, Math.ceil(amt * 0.05)) });
+            }
+            if (learnedMinBid.size > 500) learnedMinBid.clear();
+
+            const next = minNextBid(a);
+            if (!Number.isFinite(next) || next <= 0) break;
+            // Le nouveau montant doit repasser TOUS les garde-fous : un rattrapage qui
+            // ignorerait le plafond serait exactement la surenchère sans limite qu'on a
+            // supprimée. Un refus ici est un arrêt normal, pas un échec.
+            const allowed = next <= maxCap
+                && (manual ? manualBidAllowed(a, next) : autoBidAllowed(a, next, contexte));
+            if (!allowed) {
+                return { ok: false, amount: next, reason: 'plafond ou limite atteint après surenchère', blocked: true, auction: a };
+            }
+            if (next !== amt) lastErr = `${lastErr} → relance à ${next} 💰`;
+            amt = next;
+        }
+        return { ok: false, amount: amt, reason: lastErr || 'erreur', auction: a };
+    }
+
     function autoBidWithinCap(auction, plannedAmount) {
         const cap = getAutoBidMax(auction.id);
         if (cap === null) return true; // pas de plafond → illimité
@@ -2659,7 +4365,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     let wikibidousBalance = Infinity; // Infinity = pas encore chargé, on laisse passer
 
     // Auto-snipe initial (nouvelle annonce ≤ 100 wikibidous)
-    let autoSnipeEnabled = false;
+    /* Interrupteur maître des mises automatiques. Mémorisé : depuis qu'il commande
+       TOUTES les mises (et plus un simple seuil de prix), le remettre à zéro à chaque
+       rechargement de page revenait à désarmer le bot sans prévenir. Éteint à la
+       première utilisation, puis on respecte le dernier choix. */
+    const AUTOBID_ARMED_KEY = 'wm_autobid_armed';
+    let autoSnipeEnabled = (() => {
+        try { return localStorage.getItem(AUTOBID_ARMED_KEY) === '1'; } catch(e) { return false; }
+    })();
 
     /* ── Hot lane : poller rapide dédié aux enchères trackées ── */
     // Mutex per-auction partagé entre main scan et hot lane (anti-doublons)
@@ -2686,8 +4399,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const card = (activeHitsMap.get(id) || {}).auction?.card;
             const title = (card && card.wikipedia_title) || '?';
             wmLog(val != null
-                ? `🎯 Plafond auto-bid : <b>${title}</b> → ${val.toLocaleString('fr-FR')} 💰`
-                : `♾️ Plafond auto-bid retiré : <b>${title}</b>`);
+                ? `🎯 Plafond auto-bid : <b>${esc(title)}</b> → ${val.toLocaleString('fr-FR')} 💰`
+                : `♾️ Plafond auto-bid retiré : <b>${esc(title)}</b>`);
         }
     };
     window.leadingBidsMap = leadingBidsMap;
@@ -2725,94 +4438,129 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         autobid: { label: '🤖 Auto-bid', color: '#4ade80', border: 'rgba(74,222,128,0.45)',  bg: 'rgba(74,222,128,0.07)' },
         fourbe:  { label: '🕵️ Fourbe',   color: '#c084fc', border: 'rgba(192,132,252,0.5)',  bg: 'rgba(192,132,252,0.07)' }
     };
-    window.wmCycleBidMode = function(id) {
-        const title = activeHitsMap.get(id)?.auction?.card?.wikipedia_title || '?';
+    window.wmWarnAutoBidsPaused = warnAutoBidsPaused; // pour les handlers inline des boutons
+
+
+    // Le titre venait UNIQUEMENT d'activeHitsMap. Cette map est vidée à chaque
+    // (re)démarrage du Market Watcher alors que les cartes restent affichées : les logs
+    // se remplissaient alors de « Fourbe activé : ? ». Le cache de rendu contient les
+    // mêmes annonces — on interroge les deux.
+    function auctionTitleById(id) {
+        const fromMap = activeHitsMap.get(id)?.auction?.card?.wikipedia_title;
+        if (fromMap) return fromMap;
+        const row = Array.isArray(lastHitsCache) ? lastHitsCache.find(h => h && h.id === id) : null;
+        return (row && row.card && row.card.wikipedia_title) || '?';
+    }
+
+    /* Repeint le bouton de mode SUR PLACE.
+
+       Avant, le clic se contentait de demander un re-render complet de la liste — or ce
+       re-render est volontairement ignoré tant qu'un champ du panneau a le focus (sinon
+       le champ « plafond », juste à côté, perdrait la frappe en cours). Résultat : le
+       mode changeait bien en mémoire, mais le bouton gardait son ancien libellé.
+       L'utilisateur recliquait, et le mode repartait pour un tour — d'où les cycles
+       Manuel → Auto-bid → Fourbe en rafale dans les logs. */
+    function paintBidModeButton(btn, mode) {
+        const ui = BID_MODE_UI[mode] || BID_MODE_UI.manual;
+        if (!btn) return;
+        btn.innerText = ui.label;
+        btn.style.color = ui.color;
+        btn.style.borderColor = ui.border;
+        btn.style.background = ui.bg;
+    }
+
+    /* Mise manuelle (bouton « 🔨 Miser N 💰 ») — passait par un fetch écrit à la main dans
+       l'attribut onclick : aucun rattrapage si un autre joueur misait dans le même instant,
+       juste un « ✗ Échec ». Elle emprunte maintenant le même chemin que les mises
+       automatiques (relecture de l'enchère, nouveau minimum, relance). */
+    window.wmManualBid = async function(id, amount, btn) {
+        const a = (Array.isArray(lastHitsCache) ? lastHitsCache.find(h => h && h.id === id) : null)
+            || (activeHitsMap.get(id) || {}).auction
+            || { id };
+        const title = auctionTitleById(id);
+        if (!manualBidAllowed(a, amount)) {
+            if (btn) { btn.innerText = '✗ Plafond'; btn.style.color = '#ef4444'; }
+            return;
+        }
+        if (btn) { btn.disabled = true; btn.innerText = '⏳'; }
+        const r = await placeBid(a, amount, 'Mise manuelle', { manual: true });
+        if (r.ok) {
+            wmLog(`🔨 Mise manuelle : <b>${esc(title)}</b> → <span style="color:#fbbf24;">${r.amount} 💰</span>${bidRetryNote(r)}`);
+        } else {
+            wmLog(`⚠️ Mise manuelle échouée : <b>${esc(title)}</b> · ${esc(r.reason)}`);
+        }
+        if (btn) {
+            btn.innerText = r.ok ? `✔ Misé ${r.amount} 💰` : '✗ Échec';
+            btn.style.color = r.ok ? '#4ade80' : '#ef4444';
+            const base = `🔨 Miser ${Number(amount).toLocaleString('fr-FR')} 💰`;
+            setTimeout(() => { btn.disabled = false; btn.innerText = base; btn.style.color = '#06b6d4'; }, 1800);
+        }
+    };
+
+    window.wmAuctionTitle = auctionTitleById; // pour les handlers inline des vues héritées
+
+    window.wmCycleBidMode = function(id, btn) {
+        const title = auctionTitleById(id);
         const mode = bidModeOf(id);
         if (mode === 'manual') {
             autoBidSet.add(id); saveAutoBidSet();
-            wmLog(`🤖 Auto-bid activé (riposte auto en cas de surenchère) : <b>${title}</b>`);
+            wmLog(`🤖 Auto-bid activé (riposte auto en cas de surenchère) : <b>${esc(title)}</b>`);
+            warnAutoBidsPaused(`l'auto-bid sur « ${title} »`);
         } else if (mode === 'autobid') {
             autoBidSet.delete(id); saveAutoBidSet();
             snipeSet.add(id); saveSnipeSet();
-            wmLog(`🕵️ Fourbe activé (snipe à ~${getSetting('snipeSecondsBefore')}s de la fin) : <b>${title}</b>`);
+            wmLog(`🕵️ Fourbe activé (snipe à ~${getSetting('snipeSecondsBefore')}s de la fin) : <b>${esc(title)}</b>`);
+            warnAutoBidsPaused(`le Fourbe sur « ${title} »`);
         } else {
             snipeSet.delete(id); saveSnipeSet();
             // Si c'est le Hunter agressif qui avait armé cette enchère, il lâche prise et rend
             // le plafond d'origine — sinon son plafond resterait collé à la carte.
             if (disarmHunterFourbe(id)) saveHunterFourbe();
-            wmLog(`⚪ Mise manuelle : <b>${title}</b> — plus d'automatisme sur cette enchère.`);
+            wmLog(`⚪ Mise manuelle : <b>${esc(title)}</b> — plus d'automatisme sur cette enchère.`);
         }
+        // D'abord le bouton cliqué (toujours), ensuite la liste (peut être sautée).
+        paintBidModeButton(btn || document.querySelector(`[data-wm-mode-btn="${id}"]`), bidModeOf(id));
         const el = document.getElementById('wm-market-alert');
         if (el && lastHitsCache.length > 0) renderMarketHits(el, lastHitsCache, []);
     };
 
     // Ajoute un ou plusieurs mots-clés. Plusieurs termes possibles en les séparant par « ; »
     // (le titre à virgule reste entier, ex. « Star Wars, épisode I »).
-    window.wmAddKeyword = function(input) {
-        const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
-        let added = 0, last = '';
-        for (const kw of terms) {
-            if (KEYWORDS_ALERT.some(k => k.toLowerCase() === kw.toLowerCase())) continue;
-            KEYWORDS_ALERT.push(kw); added++; last = kw;
+    /* ── Adaptateurs des anciens handlers vers la liste unifiée ──
+       Ils écrivaient dans KEYWORDS_ALERT / PRIORITY / FOURBE / HUNTER, qui sont
+       maintenant DÉRIVÉS de WATCHLIST : leurs écritures seraient effacées au premier
+       compileWatchlist(). On les garde comme adaptateurs pour que les appelants
+       restants (import wishlist, onboarding) continuent de fonctionner. */
+    function watchlistAdd(kw, extra, silent) {
+        const entry = normalizeWatchEntry(Object.assign({ kw }, extra || {}));
+        if (!entry) return false;
+        const existing = WATCHLIST.find(e => e.kw.toLowerCase() === entry.kw.toLowerCase());
+        if (existing) { Object.assign(existing, entry); }
+        else { WATCHLIST.push(entry); }
+        saveWatchlist();
+        renderKeywordsPanel();
+        if (!silent) {
+            wmLog(`🔍 Mot-clé ${existing ? 'mis à jour' : 'ajouté'} : <b>${esc(entry.kw)}</b> · ${entry.mode === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}`);
         }
-        if (added === 0) return;
-        saveKeywords();
-        renderKeywordsPanel();
-        if (added > 1) wmLog(`➕ <b>${added}</b> mots-clés ajoutés`);
-    };
-
-    window.wmRemoveKeyword = function(idx) {
-        if (idx < 0 || idx >= KEYWORDS_ALERT.length) return;
-        KEYWORDS_ALERT.splice(idx, 1);
-        saveKeywords();
-        renderKeywordsPanel();
-    };
-
-    window.wmAddPriorityKeyword = function(input) {
-        const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
-        let added = 0, last = '';
-        for (const kw of terms) {
-            if (KEYWORDS_PRIORITY.some(k => k.toLowerCase() === kw.toLowerCase())) continue;
-            KEYWORDS_PRIORITY.push(kw); added++; last = kw;
+        return true;
+    }
+    function watchlistAddMany(input, extra) {
+        const terms = String(input || '').split(';').map(x => x.trim()).filter(Boolean);
+        let added = 0;
+        for (const kw of terms) if (watchlistAdd(kw, extra, true)) added++;
+        if (added) {
+            wmLog(`🔍 <b>${added}</b> mot${added > 1 ? 's' : ''}-clé${added > 1 ? 's' : ''} ajouté${added > 1 ? 's' : ''} en <b>${(extra && extra.mode) === 'auto' ? '🤖 mise automatique' : '👁️ affichage seul'}</b>`);
         }
-        if (added === 0) return;
-        savePriorityKeywords();
-        renderKeywordsPanel();
-        wmLog(added === 1
-            ? `⭐ Mot-clé prioritaire ajouté : <b style="color:#fbbf24;">${last}</b>`
-            : `⭐ <b>${added}</b> mots-clés prioritaires ajoutés`);
-    };
+        return added;
+    }
+    // L'index reçu vient du panneau, qui rend WATCHLIST : il s'y applique directement.
+    function watchlistRemoveAt(idx) { window.wmWatchRemove(idx); }
 
-    window.wmRemovePriorityKeyword = function(idx) {
-        if (idx < 0 || idx >= KEYWORDS_PRIORITY.length) return;
-        const removed = KEYWORDS_PRIORITY.splice(idx, 1)[0];
-        savePriorityKeywords();
-        renderKeywordsPanel();
-        if (removed) wmLog(`⭐ Mot-clé prioritaire retiré : <b style="color:#fbbf24;">${removed}</b>`);
-    };
+    window.wmAddKeyword = function(input) { watchlistAddMany(input, { mode: 'manuel' }); };
 
-    window.wmAddFourbeKeyword = function(input) {
-        const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
-        let added = 0, last = '';
-        for (const kw of terms) {
-            if (KEYWORDS_FOURBE.some(k => k.toLowerCase() === kw.toLowerCase())) continue;
-            KEYWORDS_FOURBE.push(kw); added++; last = kw;
-        }
-        if (added === 0) return;
-        saveFourbeKeywords();
-        renderKeywordsPanel();
-        wmLog(added === 1
-            ? `🕵️ Mot-clé fourbe ajouté : <b style="color:#c084fc;">${last}</b>`
-            : `🕵️ <b>${added}</b> mots-clés fourbe ajoutés`);
-    };
 
-    window.wmRemoveFourbeKeyword = function(idx) {
-        if (idx < 0 || idx >= KEYWORDS_FOURBE.length) return;
-        const removed = KEYWORDS_FOURBE.splice(idx, 1)[0];
-        saveFourbeKeywords();
-        renderKeywordsPanel();
-        if (removed) wmLog(`🕵️ Mot-clé fourbe retiré : <b style="color:#c084fc;">${removed}</b>`);
-    };
+
+
 
     // Rareté requise valide (l'un des 6 codes) — toute autre valeur (y compris vide/absente,
     // le cas normal) veut dire « pas de filtre », comportement identique à avant cette option.
@@ -2834,41 +4582,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // remporte une enchère — pratique pour ne vouloir qu'UN exemplaire. Faux par défaut (une
     // nouvelle chasse reste active tant qu'on ne la coupe pas soi-même), pour ceux qui
     // collectionnent plusieurs fois la même carte.
-    window.wmAddHunterKeyword = function(text, cap, mode, rarity, autoDisable) {
-        const t = String(text || '').trim();
-        const c = Number(cap);
-        const m = (mode === 'fourbe') ? 'fourbe' : 'autobid';
-        const rr = normalizeHunterRarity(rarity);
-        const ad = !!autoDisable;
-        if (!t) { wmLog('⚠️ Chasseur : mot-clé vide'); return; }
-        if (!Number.isFinite(c) || c <= 0) { wmLog('⚠️ Chasseur : plafond invalide (entre un nombre &gt; 0)'); return; }
-        const rarSuffix = rr ? ` · rareté <b>${rr}</b> requise` : '';
-        const adSuffix = ad ? ` · <b>auto-pause</b> après obtention` : '';
-        const existing = KEYWORDS_HUNTER.find(h => h.text.toLowerCase() === t.toLowerCase());
-        if (existing) {
-            existing.cap = c; existing.mode = m; existing.rarity = rr; existing.autoDisable = ad;
-            saveHunterKeywords(); renderKeywordsPanel();
-            wmLog(`🎯 Chasseur mis à jour : <b style="color:#5dade2;">${t}</b> → ${m === 'fourbe' ? 'fourbe' : 'auto-bid'} · plafond ${c} 💰${rarSuffix}${adSuffix}`);
-            return;
-        }
-        KEYWORDS_HUNTER.push({ text: t, cap: c, mode: m, rarity: rr, autoDisable: ad, enabled: true });
-        saveHunterKeywords(); renderKeywordsPanel();
-        wmLog(`🎯 Chasseur ajouté : <b style="color:#5dade2;">${t}</b> → ${m === 'fourbe' ? 'fourbe' : 'auto-bid'} · plafond ${c} 💰${rarSuffix}${adSuffix}`);
-    };
 
     // Bascule pause/active d'une chasse SANS la supprimer — pour la garder configurée
     // (mot-clé, plafond, mode, rareté) et la réactiver d'un clic plus tard.
-    window.wmToggleHunterEnabled = function(idx) {
-        const h = KEYWORDS_HUNTER[idx];
-        if (!h) return;
-        const wasEnabled = h.enabled !== false;
-        h.enabled = !wasEnabled;
-        saveHunterKeywords();
-        renderKeywordsPanel();
-        wmLog(h.enabled
-            ? `🎯 Chasseur réactivé : <b style="color:#5dade2;">${h.text}</b>`
-            : `🎯 Chasseur mis en pause : <b style="color:#5dade2;">${h.text}</b>`);
-    };
 
     window.wmRemoveHunterKeyword = function(idx) {
         if (idx < 0 || idx >= KEYWORDS_HUNTER.length) return;
@@ -2907,19 +4623,25 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     };
 
     loadKeywords();
+    loadWatchlist(); // migre les 4 anciennes listes et compile vers le moteur
     loadMyBids();
 
+    /* Le bouton n'est plus un seuil de prix (« Hunter ≤1000 ») mais l'INTERRUPTEUR
+       MAÎTRE des mises automatiques. Un seuil de prix global qui misait sur tout ce
+       qui passait dessous était exactement le mécanisme qui faisait miser sur tout :
+       le prix se décide maintenant par mot-clé (plafond de l'entrée) et globalement
+       (réglage `globalBidCap`). Ici on ne dit plus qu'une chose, lisible d'un coup
+       d'œil : est-ce que le bot a le droit de miser, oui ou non. */
     function autoSnipeLabel(enabled) {
-        const mode = getSetting('autoSnipeMode');
-        const state = enabled ? 'ON' : 'OFF';
-        // Quand le mode fourbe est actif, le Hunter ne mise PLUS immédiatement : le dire ici,
-        // sinon « Hunter ≤30💰 ON » promet une mise immédiate qui n'aura jamais lieu.
-        const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
-        if (mode === 'adaptive') {
-            return `⚡ Hunter dynamique ${state}${suffix}`;
-        }
-        const price = getSetting('autoSnipePrice');
-        return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
+        const nb = WATCHLIST.filter(e => e.enabled !== false && e.mode === 'auto').length;
+        if (enabled) return `🤖 Mises auto ARMÉES · ${nb} mot${nb > 1 ? 's' : ''}-clé${nb > 1 ? 's' : ''}`;
+        // En pause, le nombre d'enchères déjà armées (Fourbe / auto-bid) est L'information
+        // utile : « Fourbe activé » sur une carte laissait croire que ça miserait, alors que
+        // l'interrupteur bloquait tout en silence.
+        const armed = new Set([...autoBidSet, ...snipeSet]).size;
+        return armed > 0
+            ? `⏸️ Mises auto EN PAUSE · ${armed} enchère${armed > 1 ? 's' : ''} armée${armed > 1 ? 's' : ''} ne misera${armed > 1 ? 'ont' : ''} PAS`
+            : '⏸️ Mises auto EN PAUSE';
     }
 
     // Auto-bid Hunter (mise initiale selon le mode fixe/dynamique) sur une LISTE d'enchères.
@@ -2927,6 +4649,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // présentes). bidLockSet garantit qu'une même enchère n'est pas mise deux fois en parallèle.
     async function runHunterAutoBidPass(list) {
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
+        /* Ne mise QUE sur les annonces dont le mot-clé est en mode « auto ». Avant,
+           ce passage misait sur toute nouvelle annonce passant sous un seuil de prix
+           global, quel que soit le mot-clé qui l'avait fait remonter — un mot-clé
+           ajouté pour simplement SURVEILLER déclenchait donc des mises. Les entrées
+           en mode auto sont déjà traitées par le Chasseur ciblé (avec leur plafond),
+           donc en pratique ce filtre ne laisse plus rien passer ici : c'est voulu. */
+        list = list.filter(a => {
+            const e = matchedWatchEntry(a && a.card);
+            return e && e.mode === 'auto';
+        });
+        if (!list.length) return 0;
         if (hunterAggressive) return runHunterFourbePass(list); // pas de mise : on arme le snipe
         let placed = 0;
         for (const a of list) {
@@ -2941,26 +4674,25 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (bidLockSet.has(a.id)) continue; // la hot lane / une autre passe bid déjà dessus
             bidLockSet.add(a.id);
             await new Promise(r => setTimeout(r, bidDelayMs(a)));
+            // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
+            if (skipIfAuctionOver(a, 'Hunter')) { bidLockSet.delete(a.id); continue; }
             const bidAmount = minNextBid(a);
+            // Ce chemin ne passait PAS par le garde-fou commun : il ne connaissait que son
+            // propre seuil (autoSnipePrice), donc ni le plafond global ni la limite horaire
+            // ne s'y appliquaient. C'est le seul des cinq chemins qui pouvait les ignorer.
+            if (!autoBidAllowed(a, bidAmount, 'Hunter')) { bidLockSet.delete(a.id); continue; }
             try {
-                const res = await fetch(
-                    `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                    { method: "POST", credentials: "include",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ amount: bidAmount }) }
-                );
-                const data = await res.json().catch(() => ({}));
+                const r = await placeBid(a, bidAmount, 'Hunter');
                 const title = a.card?.wikipedia_title || "?";
                 const rar = (a.card?.rarity || '').toUpperCase();
-                if (res.ok) {
-                    markAuctionAsMine(a.id, bidAmount, a);
+                if (r.ok) {
                     placed++;
-                    const reasonStr = decision.reason ? ` <span style="color:#666;font-size:9px;">(${decision.reason})</span>` : '';
-                    wmLog(`🤖 Hunter : <b>${title}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>${reasonStr}`);
-                    sendToDiscord("🤖 Auto-bid place : **" + title + "** a **" + bidAmount + " coins**", 5763719, 'market');
+                    const reasonStr = decision.reason ? ` <span style="color:#666;font-size:9px;">(${esc(decision.reason)})</span>` : '';
+                    wmLog(`🤖 Hunter : <b>${esc(title)}</b> [${rar}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${esc(reasonStr)}${bidRetryNote(r)}`);
+                    sendToDiscord("🤖 Auto-bid place : **" + title + "** a **" + r.amount + " coins**", 5763719, 'market');
                 } else {
-                    wmLog(`⚠️ Hunter échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
-                    sendToDiscord("⚠️ Auto-bid echoue : **" + title + "** - " + (data?.error || "erreur inconnue"), 15548997, 'market');
+                    wmLog(`⚠️ Hunter échoué : <b>${esc(title)}</b> [${rar}] · ${esc(r.reason)}`);
+                    sendToDiscord("⚠️ Auto-bid echoue : **" + title + "** - " + r.reason, 15548997, 'market');
                 }
             } catch(e) {} finally { bidLockSet.delete(a.id); }
             await new Promise(r => setTimeout(r, bidDelayMs(a)));
@@ -2990,7 +4722,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             armed++;
             const title = a.card?.wikipedia_title || '?';
             const rar = (a.card?.rarity || '').toUpperCase();
-            wmLog(`🕵️ Hunter agressif : <b>${title}</b> [${rar}] — snipe armé à ~${getSetting('snipeSecondsBefore')}s de la fin, plafond <span style="color:#fbbf24;">${decision.cap} 💰</span>`);
+            wmLog(`🕵️ Hunter agressif : <b>${esc(title)}</b> [${rar}] — snipe armé à ~${getSetting('snipeSecondsBefore')}s de la fin, plafond <span style="color:#fbbf24;">${decision.cap} 💰</span>`);
+            warnAutoBidsPaused('le Hunter agressif');
         }
         return armed;
     }
@@ -3042,6 +4775,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     window.wmToggleAutoSnipe = function(btn) {
         autoSnipeEnabled = !autoSnipeEnabled;
+        try { localStorage.setItem(AUTOBID_ARMED_KEY, autoSnipeEnabled ? '1' : '0'); } catch(e) {}
         if (autoSnipeEnabled) {
             btn.style.color = '#4ade80';
             btn.style.borderColor = 'rgba(74,222,128,0.4)';
@@ -3117,6 +4851,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // (état optimiste) et re-render la ligne, sans attendre le prochain scan.
     // Le prochain tick hot-lane / scan réconcilie ensuite avec l'état serveur réel.
     function markAuctionAsMine(auctionId, bidAmount, auctionObj) {
+        // Point de passage unique d'une mise réussie → c'est ici qu'on alimente la
+        // limite horaire, plutôt que dans chacun des cinq chemins de mise.
+        recordBidPlaced();
         if (currentUsername) leadingBidsMap.set(auctionId, currentUsername);
         // Mémorise le montant de ma mise (signal d'identité indépendant du pseudo)
         if (Number.isFinite(bidAmount)) myLastBidMap.set(auctionId, bidAmount);
@@ -3141,12 +4878,178 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function auctionLikelyStillLive(id) {
         const last = activeHitsMap.get(id);
         if (last && last.auction && last.auction.end_at) {
-            return new Date(last.auction.end_at).getTime() > Date.now() + 5000;
+            // serverNow() et non Date.now() : même référence de temps que isAuctionOver,
+            // sinon un PC décalé prune des enchères encore vivantes (ou l'inverse).
+            // Vivante tant que sa fin connue n'est pas dépassée de 15 s : une seule relecture
+            // ratée (404/500 intermittents) près de la fin ne conclut plus « perdue / gagnée »
+            // sur un état incomplet — la relecture suivante donnera l'état final.
+            return new Date(last.auction.end_at).getTime() > serverNow() - 15000;
         }
         return false;
     }
 
-    async function checkMarketplace(marketAlertEl, marketStatusEl) {
+    /* Relit (25 au plus, par 5) les enchères suivies dont le dernier état a plus d'une minute,
+       pour que la purge « prouvée » puisse trancher. */
+    async function refreshTrackedStates(scanGen) {
+        const ids = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet,
+            ...hunterFourbeMap.keys(), ...autoBidMaxMap.keys()])];
+        const stale = ids.filter(id => {
+            const l = activeHitsMap.get(id);
+            return !(l && l.at && Date.now() - l.at < 60000);
+        }).slice(0, 25);
+        for (let i = 0; i < stale.length; i += 5) {
+            if (isScanStale(scanGen)) return;
+            const grp = stale.slice(i, i + 5);
+            const res = await Promise.allSettled(grp.map(id => fetchSingleAuction(id)));
+            res.forEach(r => {
+                const a = r.status === 'fulfilled' ? r.value : null;
+                if (a && a.id && a.end_at) activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
+            });
+        }
+    }
+    /* Purge des enchères suivies terminées (mes mises, auto-bid, Fourbe, plafonds…). Sortie
+       de checkMarketplace (fork.44) pour servir aussi quand la recherche est refusée. */
+    function pruneTrackedAuctions(auctions, scan, incomplete) {
+        // Prune : retire de myBidsSet les enchères qui ne sont plus en cours.
+        // Un scan PARTIEL (mot-clé refusé par le serveur) ne prouve rien sur ce qui
+        // manque : purger sur cette base déclarerait terminées des enchères vivantes.
+        // Une enchère listée mais finie depuis plus de 15 s (heure serveur) ne compte plus
+        // comme présente : le site peut la lister ou la renvoyer longtemps après sa fin.
+        const liveIds = new Set(auctions.filter(a => {
+            const end = a.end_at ? new Date(a.end_at).getTime() : NaN;
+            return !(Number.isFinite(end) && end < serverNow() - 15000);
+        }).map(a => a.id));
+        for (const a of auctions) {
+            if (a.end_at && myBidsSet.has(a.id) && !liveIds.has(a.id)) {
+                activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
+            }
+        }
+        /* Scan PARTIEL (mot-clé refusé) : on ne purge que ce qui est PROUVÉ fini — une
+           lecture de moins d'une minute dont la fin est passée de plus de 15 s. Avant,
+           rien n'était purgé du tout, et les refus de recherche sont fréquents. */
+        const provenOver = (id) => {
+            const l = activeHitsMap.get(id);
+            return !!(l && l.at && Date.now() - l.at < 60000 && l.auction && l.auction.end_at
+                && new Date(l.auction.end_at).getTime() < serverNow() - 15000);
+        };
+        const prunable = (set) => [...set].filter(id => !incomplete || provenOver(id));
+        // Suivi ciblé : relectures ratées sans fin connue → présumées vivantes (rien n'est
+        // purgé sur une absence non prouvée), sans bloquer la purge des autres.
+        if (scan.keepIds) for (const id of scan.keepIds) liveIds.add(id);
+        let prunedAny = false;
+        for (const id of prunable(myBidsSet)) {
+            if (liveIds.has(id)) continue;
+            const last = activeHitsMap.get(id);
+            // Garde-fou : si on connaît end_at et qu'il est dans le futur,
+            // c'est juste un blip de scan (pagination ratée, enchère qui glisse entre 2 pages…)
+            // → on attend le scan suivant pour décider
+            if (last && last.auction && last.auction.end_at) {
+                const endTs = new Date(last.auction.end_at).getTime();
+                // Même règle que auctionLikelyStillLive : heure SERVEUR, 15 s de grâce.
+                if (endTs > serverNow() - 15000) continue;
+            }
+            // Tente de récupérer le dernier état connu pour logger qui a gagné / à combien
+            if (last && last.auction) {
+                const a = last.auction;
+                const t = a.card?.wikipedia_title || '?';
+                const r = (a.card?.rarity || '').toUpperCase();
+                const finalBid = a.current_bid ?? a.base_amount;
+                const winner = a.current_bidder?.username || null;
+                if (winner === currentUsername) {
+                    // Note : le comptage des achats (bidsWon/bidsSpent) est fait par
+                    // syncWonAuctions() à partir de l'endpoint serveur, plus fiable.
+                    // Ici on ne fait que logguer en temps réel.
+                    wmLog(`🏆 Enchère gagnée : <b>${t}</b> [${r}] à <span style="color:#fbbf24;">${finalBid} 💰</span>`);
+                } else if (winner) {
+                    wmLog(`🏳️ Enchère perdue : <b>${t}</b> [${r}] · <b>${winner}</b> à <span style="color:#fbbf24;">${finalBid} 💰</span>`);
+                } else {
+                    wmLog(`📭 Enchère terminée sans vente : <b>${t}</b> [${r}]`);
+                }
+            } else {
+                wmLog(`📭 Enchère ${id.slice(0,8)}… terminée`);
+            }
+            myBidsSet.delete(id);
+            prunedAny = true;
+        }
+        if (prunedAny) saveMyBids();
+
+        // Prune autoBidSet : UNIQUEMENT les enchères réellement terminées.
+        // Garde-fou anti-blip → on ne coupe plus l'auto-bid sur une enchère qui a
+        // juste glissé entre 2 pages du scan (cause du « il se désactive sans raison »).
+        let autoBidPruned = false;
+        for (const id of prunable(autoBidSet)) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue; // blip de scan : on garde l'auto-bid
+            const last = activeHitsMap.get(id);
+            const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
+            autoBidSet.delete(id);
+            autoBidPruned = true;
+            wmLog(`🤖 Auto-bid retiré (enchère terminée) : <b>${t}</b>`);
+        }
+        if (autoBidPruned) saveAutoBidSet();
+
+        // Prune le mode Fourbe — même garde-fou anti-blip que l'auto-bid.
+        let snipePruned = false;
+        for (const id of prunable(snipeSet)) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            const last = activeHitsMap.get(id);
+            const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
+            snipeSet.delete(id);
+            snipePruned = true;
+            wmLog(`🕵️ Fourbe retiré (enchère terminée) : <b>${t}</b>`);
+        }
+        if (snipePruned) saveSnipeSet();
+
+        // Prune le suivi du Hunter agressif — même garde-fou anti-blip. Sans ça, la Map
+        // grossirait indéfiniment et un désarmement futur restaurerait des plafonds sur
+        // des enchères mortes depuis longtemps.
+        let aggroPruned = false;
+        for (const id of prunable(hunterFourbeMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            hunterFourbeMap.delete(id); aggroPruned = true;
+        }
+        if (aggroPruned) saveHunterFourbe();
+
+        // Prune les plafonds auto-bid — même garde-fou (sinon on perdrait le plafond
+        // sur un simple blip, et la carte repasserait en auto-bid SANS limite).
+        let maxPruned = false;
+        for (const id of prunable(autoBidMaxMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            autoBidMaxMap.delete(id); maxPruned = true;
+        }
+        if (maxPruned) saveAutoBidMax();
+
+        // Purge le suivi auto-désactivation pour les enchères terminées SANS être
+        // gagnées (perdues, annulées…) — sinon la map grossirait indéfiniment. Une
+        // victoire réelle est déjà retirée de la map par syncWonAuctions() lui-même.
+        let hadPruned = false;
+        for (const id of prunable(hunterAutoDisableMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            hunterAutoDisableMap.delete(id); hadPruned = true;
+        }
+        if (hadPruned) saveHunterAutoDisableMap();
+
+        // Purge le suivi "montant de ma dernière mise" pour les enchères terminées
+        for (const id of prunable(myLastBidMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            myLastBidMap.delete(id);
+        }
+
+        // Purge la dé-dup de log des surenchères pour les enchères terminées (borne la taille,
+        // puisque clearOutbid ne la vide plus lors d'une reprise de lead).
+        for (const id of prunable(outbidLogMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            outbidLogMap.delete(id);
+        }
+    }
+    async function checkMarketplace(marketAlertEl, marketStatusEl, scanGen) {
+        if (scanGen === undefined) scanGen = marketScanGen;
         // Pause propre si le réseau est coupé
         if (!navigator.onLine) {
             if (marketStatusEl) marketStatusEl.innerHTML = `<span style="color:#ef4444;font-size:10px;">📡 hors ligne</span>`;
@@ -3161,134 +5064,68 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             await fetchBalance();
             marketStatusEl.innerHTML = `<span style="color:#06b6d4;font-size:10px;">⏳ scan p.1…</span>`;
 
-            const { auctions, total, totalPages } = await fetchAllMarketAuctions((page, total, found) => {
-                marketStatusEl.innerHTML =
-                    `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ p.${page}/${total} · ${found} annonces</span>`;
-            });
+            /* Recherche serveur par mot-clé quand c'est possible : quelques pages au lieu
+               de plusieurs centaines, et surtout les MÊMES résultats que la recherche du
+               site. Repli sur le balayage complet si `q` n'est pas (ou plus) pris en compte. */
+            let scan = null;
+            if (serverSearchBroken && Date.now() - serverSearchBrokenTs > SERVER_SEARCH_RETRY_MS) {
+                serverSearchBroken = false;
+                wmLog('🔁 Nouvelle tentative de recherche serveur (<b>q=</b>) après 10 min de balayage complet.');
+            }
+            if (!serverSearchBroken) {
+                scan = await fetchWatchedAuctions(scanGen, (kw, page, found) => {
+                    marketStatusEl.innerHTML =
+                        `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ « ${esc(kw)} » p.${page} · ${found}</span>`;
+                });
+            }
+            // Recherche REFUSÉE (403 sur les mots-clés) : on garde l'affichage actuel et on
+            // retente la recherche dans 20 s. Surtout PAS de balayage complet : ~160 pages,
+            // plusieurs minutes, lui-même refusé par endroits — et incapable de retrouver
+            // à coup sûr une carte précise (les enchères changent de page pendant le
+            // parcours). C'est ce qui a fait rater les 2 « Marcel Dassault » UR.
+            if (scan && scan.refused) {
+                if (isScanStale(scanGen)) return null;
+                // Purge quand même ce qui est PROUVÉ fini (relu il y a < 1 min) : sans ça, des
+                // enchères finies depuis des heures restaient suivies tant que la recherche
+                // était refusée (fréquent), et relues en boucle.
+                await refreshTrackedStates(scanGen);
+                if (isScanStale(scanGen)) return null;
+                pruneTrackedAuctions([], {}, true);
+                marketStatusEl.innerHTML = `<span style="color:#fbbf24;font-size:10px;white-space:nowrap;">⚠️ recherche refusée par le site — nouvel essai dans 20 s</span>`;
+                return 20000 * marketThrottleFactor;
+            }
+            if (isScanStale(scanGen)) return null;
+            // Aucun mot-clé : suivi ciblé seulement, jamais de balayage complet du marché.
+            if (!scan && !hasEnabledKeywords()) {
+                scan = await fetchTrackedAuctions(scanGen);
+            }
+            if (!scan) {
+                scan = await fetchAllMarketAuctions(scanGen, (page, total, found) => {
+                    marketStatusEl.innerHTML =
+                        `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ p.${page}/${total} · ${found} annonces</span>`;
+                });
+            }
+            // Liste de mots-clés changée (ou STOP) pendant le scan : ces résultats
+            // répondent à une question qu'on ne pose plus. On ne les affiche pas.
+            if (!scan || scan.aborted || isScanStale(scanGen)) return null;
+            const { auctions, total, totalPages, incomplete } = scan;
 
             const now = new Date().toLocaleTimeString("fr-FR",
                 { hour:"2-digit", minute:"2-digit", second:"2-digit" });
-            marketStatusEl.innerHTML =
-                `<span style="color:#555;font-size:10px;white-space:nowrap;">✅ ${now} · ${total} annonces · ${totalPages} pages</span>`;
+            if (scan.trackedOnly) {
+                marketStatusEl.innerHTML = `<span style="color:#555;font-size:10px;white-space:nowrap;" title="Aucun mot-clé : le marché n'est pas parcouru, seules tes enchères en cours sont relues (toutes les 20 s). Ajoute un mot-clé pour chercher des cartes.">✅ ${now} · ${total} enchère(s) suivie(s) · aucun mot-clé, marché non parcouru</span>`;
+            } else marketStatusEl.innerHTML = incomplete
+                ? `<span style="color:#fbbf24;font-size:10px;white-space:nowrap;">⚠️ ${now} · ${total} annonces · scan partiel (refus serveur)</span>`
+                : `<span style="color:#555;font-size:10px;white-space:nowrap;">✅ ${now} · ${total} annonces · ${totalPages} pages</span>`;
             apiHealth.lastMarketScanTs = Date.now(); // santé : dernier scan marché réussi
 
             // Auto-track : si je suis le current bidder sur une enchère, je la mémorise
             auctions.forEach(a => {
-                if (isSelf(a.current_bidder?.username)) trackMyBid(a.id);
+                // Enchère finie : ne pas la (re)mettre dans le suivi — elle vient d'en sortir.
+                if (!isAuctionOver(a) && isSelf(a.current_bidder?.username)) trackMyBid(a.id);
             });
 
-            // Prune : retire de myBidsSet les enchères qui ne sont plus en cours
-            const liveIds = new Set(auctions.map(a => a.id));
-            let prunedAny = false;
-            for (const id of [...myBidsSet]) {
-                if (liveIds.has(id)) continue;
-                const last = activeHitsMap.get(id);
-                // Garde-fou : si on connaît end_at et qu'il est dans le futur,
-                // c'est juste un blip de scan (pagination ratée, enchère qui glisse entre 2 pages…)
-                // → on attend le scan suivant pour décider
-                if (last && last.auction && last.auction.end_at) {
-                    const endTs = new Date(last.auction.end_at).getTime();
-                    if (endTs > Date.now() + 5000) continue; // 5s de marge pour éviter les races
-                }
-                // Tente de récupérer le dernier état connu pour logger qui a gagné / à combien
-                if (last && last.auction) {
-                    const a = last.auction;
-                    const t = a.card?.wikipedia_title || '?';
-                    const r = (a.card?.rarity || '').toUpperCase();
-                    const finalBid = a.current_bid ?? a.base_amount;
-                    const winner = a.current_bidder?.username || null;
-                    if (winner === currentUsername) {
-                        // Note : le comptage des achats (bidsWon/bidsSpent) est fait par
-                        // syncWonAuctions() à partir de l'endpoint serveur, plus fiable.
-                        // Ici on ne fait que logguer en temps réel.
-                        wmLog(`🏆 Enchère gagnée : <b>${t}</b> [${r}] à <span style="color:#fbbf24;">${finalBid} 💰</span>`);
-                    } else if (winner) {
-                        wmLog(`🏳️ Enchère perdue : <b>${t}</b> [${r}] · <b>${winner}</b> à <span style="color:#fbbf24;">${finalBid} 💰</span>`);
-                    } else {
-                        wmLog(`📭 Enchère terminée sans vente : <b>${t}</b> [${r}]`);
-                    }
-                } else {
-                    wmLog(`📭 Enchère ${id.slice(0,8)}… terminée`);
-                }
-                myBidsSet.delete(id);
-                prunedAny = true;
-            }
-            if (prunedAny) saveMyBids();
-
-            // Prune autoBidSet : UNIQUEMENT les enchères réellement terminées.
-            // Garde-fou anti-blip → on ne coupe plus l'auto-bid sur une enchère qui a
-            // juste glissé entre 2 pages du scan (cause du « il se désactive sans raison »).
-            let autoBidPruned = false;
-            for (const id of [...autoBidSet]) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue; // blip de scan : on garde l'auto-bid
-                const last = activeHitsMap.get(id);
-                const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
-                autoBidSet.delete(id);
-                autoBidPruned = true;
-                wmLog(`🤖 Auto-bid retiré (enchère terminée) : <b>${t}</b>`);
-            }
-            if (autoBidPruned) saveAutoBidSet();
-
-            // Prune le mode Fourbe — même garde-fou anti-blip que l'auto-bid.
-            let snipePruned = false;
-            for (const id of [...snipeSet]) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                const last = activeHitsMap.get(id);
-                const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
-                snipeSet.delete(id);
-                snipePruned = true;
-                wmLog(`🕵️ Fourbe retiré (enchère terminée) : <b>${t}</b>`);
-            }
-            if (snipePruned) saveSnipeSet();
-
-            // Prune le suivi du Hunter agressif — même garde-fou anti-blip. Sans ça, la Map
-            // grossirait indéfiniment et un désarmement futur restaurerait des plafonds sur
-            // des enchères mortes depuis longtemps.
-            let aggroPruned = false;
-            for (const id of [...hunterFourbeMap.keys()]) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                hunterFourbeMap.delete(id); aggroPruned = true;
-            }
-            if (aggroPruned) saveHunterFourbe();
-
-            // Prune les plafonds auto-bid — même garde-fou (sinon on perdrait le plafond
-            // sur un simple blip, et la carte repasserait en auto-bid SANS limite).
-            let maxPruned = false;
-            for (const id of [...autoBidMaxMap.keys()]) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                autoBidMaxMap.delete(id); maxPruned = true;
-            }
-            if (maxPruned) saveAutoBidMax();
-
-            // Purge le suivi auto-désactivation pour les enchères terminées SANS être
-            // gagnées (perdues, annulées…) — sinon la map grossirait indéfiniment. Une
-            // victoire réelle est déjà retirée de la map par syncWonAuctions() lui-même.
-            let hadPruned = false;
-            for (const id of [...hunterAutoDisableMap.keys()]) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                hunterAutoDisableMap.delete(id); hadPruned = true;
-            }
-            if (hadPruned) saveHunterAutoDisableMap();
-
-            // Purge le suivi "montant de ma dernière mise" pour les enchères terminées
-            for (const id of [...myLastBidMap.keys()]) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                myLastBidMap.delete(id);
-            }
-
-            // Purge la dé-dup de log des surenchères pour les enchères terminées (borne la taille,
-            // puisque clearOutbid ne la vide plus lors d'une reprise de lead).
-            for (const id of [...outbidLogMap.keys()]) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                outbidLogMap.delete(id);
-            }
+            pruneTrackedAuctions(auctions, scan, incomplete);
 
             /* ── Classement mots-clés en masse : optimisé pour ~N annonces × ~M mots-clés ──
                AVANT : hasKeyword/hasPriorityKeyword/hasFourbeKeyword/hasHunterKeyword
@@ -3304,26 +5141,53 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                une fois par mot-clé testé contre elle). Comportement de matching identique
                (sous-chaîne, insensible à la casse, titre + catégorie) — seul le nombre de
                recalculs change. */
-            const alertLC    = KEYWORDS_ALERT.map(k => (k || '').toLowerCase());
-            const priorityLC = KEYWORDS_PRIORITY.map(k => (k || '').toLowerCase());
-            const fourbeLC   = KEYWORDS_FOURBE.map(k => (k || '').toLowerCase());
-            const excludeLC  = KEYWORDS_EXCLUDE.map(k => (k || '').toLowerCase());
-            const hunterLC   = KEYWORDS_HUNTER.map(h => ({ h, textLC: (h.text || '').toLowerCase() }));
+            const excludeLC = KEYWORDS_EXCLUDE.map(k => (k || '').toLowerCase());
+            // Une entrée de la liste, son mot-clé déjà en minuscules et son plafond
+            // compilé — préparés une fois pour tout le scan.
+            const watchLC = WATCHLIST
+                .filter(e => e.enabled !== false)
+                .map(e => ({
+                    e,
+                    kwLC: e.kw.toLowerCase(),
+                    hunter: e.mode === 'auto'
+                        ? (KEYWORDS_HUNTER.find(h => (h.text || '').toLowerCase() === e.kw.toLowerCase()) || null)
+                        : null,
+                }));
+            // Le texte long (description/résumé) n'est construit que si au moins un
+            // mot-clé est en recherche étendue : sur ~6 000 annonces, ça compte.
+            const anyExtended = watchLC.some(w => w.e.extended);
+
             function classifyAuctionKeywords(card) {
                 const titleLC = (card?.wikipedia_title || '').toLowerCase();
                 const categoryLC = (card?.category || '').toLowerCase();
-                const matchAny = (lc) => lc.some(k => titleLC.includes(k) || categoryLC.includes(k));
-                let hunterEntry = null;
-                for (const { h, textLC } of hunterLC) {
-                    if (titleLC.includes(textLC) || categoryLC.includes(textLC)) { hunterEntry = h; break; }
+                // Construit une fois par annonce, pas une fois par mot-clé testé.
+                const fullLC = anyExtended
+                    ? keywordFields(card, true).join(' \u0000 ').toLowerCase()
+                    : null;
+
+                const serverKwLC = card && card.__wmServerKw
+                    ? String(card.__wmServerKw).toLowerCase() : null;
+
+                let hunterEntry = null, alert = false, matchedEntry = null;
+                for (const { e, kwLC, hunter } of watchLC) {
+                    const hit = serverKwLC === kwLC   // verdict de la recherche serveur
+                        || ((e.extended && fullLC !== null)
+                            ? fullLC.includes(kwLC)
+                            : (titleLC.includes(kwLC) || categoryLC.includes(kwLC)));
+                    if (!hit) continue;
+                    alert = true;
+                    if (!matchedEntry) matchedEntry = e;
+                    // Premier mot-clé en mode auto rencontré → c'est lui qui pilotera la mise.
+                    if (!hunterEntry && hunter) hunterEntry = hunter;
                 }
-                const alert = matchAny(alertLC);
-                const priority = matchAny(priorityLC);
-                const fourbe = matchAny(fourbeLC);
                 return {
-                    excluded: excludeLC.length > 0 && matchAny(excludeLC),
-                    alert, priority, fourbe, hunterEntry,
-                    keywordMatch: alert || priority || fourbe || !!hunterEntry
+                    // L'exclusion reste STRICTE sur titre + catégorie : elle doit rester
+                    // prévisible, une exclusion qui pioche dans les descriptions masquerait
+                    // des annonces sans qu'on comprenne pourquoi.
+                    excluded: excludeLC.length > 0
+                        && excludeLC.some(k => titleLC.includes(k) || categoryLC.includes(k)),
+                    alert, priority: false, fourbe: false, hunterEntry, matchedEntry,
+                    keywordMatch: alert,
                 };
             }
             // Réutilisée juste en dessous pour newHits (sinon on re-classerait les mêmes
@@ -3333,7 +5197,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Filtre les hits : mots-clés (standard + prioritaires) OU enchères où je mise.
             // Exclusion STRICTE : une annonce contenant un mot exclu est écartée — SAUF
             // si je mise déjà dessus (je veux toujours voir/suivre mes propres enchères).
-            const hits = auctions.filter(a => {
+            /* ── Enchères déjà terminées ──
+               L'API liste une enchère tant que le serveur ne l'a pas SOLDÉE, et le scan
+               demande `sort=ending_soon` : les enchères finies, ayant le end_at le plus
+               ancien, arrivent donc EN TÊTE du scan. Sans ce filtre ce sont elles que le
+               watcher « trouve » en premier, et chaque mise part sur une enchère morte
+               (« Cette enchère est terminée »), sur tous les chemins à la fois : match +
+               son + Discord, chasseur, mot-clé prioritaire, armement du mode fourbe.
+               On les écarte ici, un seul point de passage pour tout ce qui suit. */
+            const endedAuctions = auctions.filter(a => isAuctionOver(a));
+            const liveAuctions = endedAuctions.length ? auctions.filter(a => !isAuctionOver(a)) : auctions;
+
+            // Leur dernier état connu reste rafraîchi : c'est lui qui sert à logguer
+            // « gagnée / perdue » et le gagnant quand le serveur les retire de la liste.
+            for (const a of endedAuctions) {
+                if (activeHitsMap.has(a.id)) activeHitsMap.set(a.id, { auction: a, endAt: a.end_at });
+            }
+
+            // Log throttlé : c'est un état NORMAL du site, pas une anomalie — inutile de
+            // le répéter à chaque scan (toutes les 30 s).
+            if (endedAuctions.length && Date.now() - lastEndedScanLogTs > 600000) {
+                lastEndedScanLogTs = Date.now();
+                wmLog(`🧹 ${endedAuctions.length} annonce(s) déjà terminée(s) ignorée(s) — le serveur les liste encore tant qu'il ne les a pas soldées.`);
+            }
+
+            const hits = liveAuctions.filter(a => {
                 // Classifie D'ABORD, même pour mes propres mises : sinon kwClassCache resterait
                 // sans entrée pour ces annonces, et newHits (juste en dessous) perdrait la
                 // notif si une enchère où je mise DÉJÀ matche AUSSI un mot-clé (cas réel : bug
@@ -3366,7 +5254,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     marketAlertEl.innerHTML = `<div style="color:#555;font-size:11px;text-align:center;padding:4px 0;">
                         Aucune carte recherchée en vente</div>`;
                 }
-                return;
+                // Suivi ciblé (aucun mot-clé) : même cadence de 20 s que plus bas.
+                return scan.trackedOnly ? 20000 * marketThrottleFactor : undefined;
             }
 
             // Sépare nouveaux hits des connus — uniquement les hits MOTS-CLÉS déclenchent son/Discord/auto-snipe
@@ -3391,7 +5280,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     const priceLabel = a.current_bid != null ? 'mise' : 'base';
                     const owned = collectionMap.get(a.card?.id) || 0;
                     const kw = matchedKeyword(a.card) || '?';
-                    wmLog(`🛒 Nouveau match : <b>${t}</b> [${r}] · ${priceLabel} ${p} 💰 · possession ×${owned} · keyword <span style="color:#00FFFF;">${kw}</span>`);
+                    wmLog(`🛒 Nouveau match : <b>${t}</b> [${r}] · ${priceLabel} ${p} 💰 · possession ×${owned} · keyword <span style="color:#00FFFF;">${esc(kw)}</span>`);
                 });
 
                 // 🛒 Notification Discord groupée
@@ -3436,7 +5325,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // exactement le cas d'une carte en train de dériver.
                     const alreadyOwned = isOwnedDuplicate(a.card?.id, rar);
                     if (alreadyOwned) {
-                        wmLog(`🎯 Chasseur ignoré (déjà possédée en ${rar || '?'}) : <b>${title}</b>`);
+                        wmLog(`🎯 Chasseur ignoré (déjà possédée en ${rar || '?'}) : <b>${esc(title)}</b>`);
                         continue;
                     }
                     // Rareté requise (optionnelle) : aucune mise tant que la carte n'affiche
@@ -3447,7 +5336,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // marqué juste au-dessus, donc l'annonce reste simplement ignorée tant que
                     // sa rareté n'est pas la bonne — jamais reprise par un autre mécanisme.
                     if (h.rarity && h.rarity !== rar) {
-                        wmLog(`🎯 Chasseur ignoré (rareté <b>${rar || '?'}</b> ≠ <b>${h.rarity}</b> requise) : <b>${title}</b>`);
+                        wmLog(`🎯 Chasseur ignoré (rareté <b>${rar || '?'}</b> ≠ <b>${h.rarity}</b> requise) : <b>${esc(title)}</b>`);
                         continue;
                     }
                     // 1) Plafond de l'enchère → respecté par TOUS les chemins de mise (riposte + snipe)
@@ -3470,30 +5359,30 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // 3) Mise initiale unique (les deux modes), jamais au-dessus du plafond
                     const alreadyLeading = isSelf(a.current_bidder?.username);
                     if (alreadyLeading || bidLockSet.has(a.id) || wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) {
-                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] — pas de mise initiale (${alreadyLeading ? 'déjà meneur' : 'solde/lock'})`);
+                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${esc(title)}</b> [${rar}] — pas de mise initiale (${alreadyLeading ? 'déjà meneur' : 'solde/lock'})`);
                         continue;
                     }
                     const bidAmount = minNextBid(a);
-                    if (!autoBidWithinCap(a, bidAmount)) {
-                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}) : <b>${title}</b> [${rar}] — mise min ${bidAmount} &gt; plafond ${h.cap}, pas de mise`);
+                    if (!autoBidAllowed(a, bidAmount, 'Chasse')) {
+                        // autoBidAllowed() a déjà dit pourquoi quand ça méritait de l'être
+                        // (plafond dépassé, limite horaire). Interrupteur en pause → on se
+                        // tait, sinon chaque annonce trouvée produirait une ligne de log.
+                        if (autoSnipeEnabled && !humanCheckActive()) {
+                            wmLog(`🎯 <b>${esc(title)}</b> [${rar}] trouvé — pas de mise (mise minimale ${bidAmount.toLocaleString('fr-FR')} 💰 refusée par les limites)`);
+                        }
                         continue;
                     }
                     bidLockSet.add(a.id);
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                    // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
+                    if (skipIfAuctionOver(a, 'Chasseur ciblé')) { bidLockSet.delete(a.id); continue; }
                     try {
-                        const res = await fetch(
-                            `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                            { method: "POST", credentials: "include",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ amount: bidAmount }) }
-                        );
-                        const data = await res.json().catch(() => ({}));
-                        if (res.ok) {
-                            markAuctionAsMine(a.id, bidAmount, a);
-                            wmLog(`🎯 Chasseur (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] → mise <span style="color:#fbbf24;">${bidAmount} 💰</span>${h.mode === 'fourbe' ? ' · snipe armé en fin' : ' · riposte activée'}`);
-                            sendToDiscord("🎯 Chasseur : **" + title + "** mise **" + bidAmount + " coins** (mode " + h.mode + ", plafond " + h.cap + ")", 3447003, 'market');
+                        const r = await placeBid(a, bidAmount, 'Chasseur ciblé');
+                        if (r.ok) {
+                            wmLog(`🎯 Chasseur (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${esc(title)}</b> [${rar}] → mise <span style="color:#fbbf24;">${r.amount} 💰</span>${h.mode === 'fourbe' ? ' · snipe armé en fin' : ' · riposte activée'}${bidRetryNote(r)}`);
+                            sendToDiscord("🎯 Chasseur : **" + title + "** mise **" + r.amount + " coins** (mode " + h.mode + ", plafond " + h.cap + ")", 3447003, 'market');
                         } else {
-                            wmLog(`⚠️ Chasseur échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
+                            wmLog(`⚠️ Chasseur échoué : <b>${esc(title)}</b> [${rar}] · ${esc(r.reason)}`);
                         }
                     } catch(e) {} finally { bidLockSet.delete(a.id); }
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
@@ -3515,26 +5404,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     }
                     bidLockSet.add(a.id);
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                    // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
+                    if (skipIfAuctionOver(a, 'Bid prioritaire')) { bidLockSet.delete(a.id); continue; }
                     const bidAmount = minNextBid(a);
                     try {
-                        const res = await fetch(
-                            `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                            { method: "POST", credentials: "include",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ amount: bidAmount }) }
-                        );
-                        const data = await res.json().catch(() => ({}));
+                        const r = await placeBid(a, bidAmount, 'Mot-clé prioritaire');
                         const title = a.card?.wikipedia_title || "?";
                         const rar = (a.card?.rarity || '').toUpperCase();
-                        if (res.ok) {
-                            markAuctionAsMine(a.id, bidAmount, a);
-                            wmLog(`⭐ Mot-clé prioritaire : <b>${title}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                        if (r.ok) {
+                            wmLog(`⭐ Mot-clé prioritaire : <b>${esc(title)}</b> [${rar}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${bidRetryNote(r)}`);
                             sendToDiscord(
-                                "⭐ Auto-bid prioritaire : **" + title + "** à **" + bidAmount + " coins**",
+                                "⭐ Auto-bid prioritaire : **" + title + "** à **" + r.amount + " coins**",
                                 16766720, 'market'
                             );
                         } else {
-                            wmLog(`⚠️ Bid prioritaire échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
+                            wmLog(`⚠️ Bid prioritaire échoué : <b>${esc(title)}</b> [${rar}] · ${esc(r.reason)}`);
                         }
                     } catch(e) {} finally { bidLockSet.delete(a.id); }
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
@@ -3555,7 +5439,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     armedFourbe = true;
                     const title = a.card?.wikipedia_title || '?';
                     const rar = (a.card?.rarity || '').toUpperCase();
-                    wmLog(`🕵️ Fourbe armé (mot-clé) : <b>${title}</b> [${rar}] — snipe à ~${getSetting('snipeSecondsBefore')}s de la fin`);
+                    wmLog(`🕵️ Fourbe armé (mot-clé) : <b>${esc(title)}</b> [${rar}] — snipe à ~${getSetting('snipeSecondsBefore')}s de la fin`);
+                    warnAutoBidsPaused('le Fourbe armé par mot-clé');
                 }
                 if (armedFourbe) saveSnipeSet();
 
@@ -3588,7 +5473,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             outbidHits.push(a); // → son + notif Discord groupée plus bas
                             const titleOb = a.card?.wikipedia_title || '?';
                             const rarOb = (a.card?.rarity || '').toUpperCase();
-                            wmLog(`😤 Surenchéri : <b>${titleOb}</b> [${rarOb}] · <b>${bidder}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>`);
+                            wmLog(`😤 Surenchéri : <b>${esc(titleOb)}</b> [${rarOb}] · <b>${esc(bidder)}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>`);
                         }
                     }
                 }
@@ -3640,9 +5525,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (bidLockSet.has(a.id)) continue;
                 const bidAmount = minNextBid(a);
                 // Respecte le plafond par enchère (coupe l'auto-bid si dépassé)
-                if (!autoBidWithinCap(a, bidAmount)) continue;
+                if (!autoBidAllowed(a, bidAmount, 'Riposte auto-bid')) continue;
                 bidLockSet.add(a.id);
                 await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                // L'enchère a pu expirer pendant le délai humanisé ci-dessus.
+                if (skipIfAuctionOver(a, 'Auto-bid (riposte)')) { bidLockSet.delete(a.id); continue; }
                 try {
                     const res = await fetch(
                         "https://www.wiki-masters.com/api/marketplace/" + a.id + "/bid",
@@ -3654,7 +5541,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         markAuctionAsMine(a.id, bidAmount, a);
                         const titleAb = a.card?.wikipedia_title || '?';
                         const rarAb = (a.card?.rarity || '').toUpperCase();
-                        wmLog(`🤖 Auto-bid (riposte) : <b>${titleAb}</b> [${rarAb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                        wmLog(`🤖 Auto-bid (riposte) : <b>${esc(titleAb)}</b> [${rarAb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                         await fetchBalance();
                         sendToDiscord(
                             "🤖 Auto-bid : **" + (a.card?.wikipedia_title || "?") + "** → **" + bidAmount + " 💰** (solde : " + wikibidousBalance + ")",
@@ -3663,7 +5550,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         );
                     } else {
                         const errData = await res.json().catch(() => ({}));
-                        wmLog(`⚠️ Auto-bid (riposte) échoué : <b>${a.card?.wikipedia_title || '?'}</b> · ${errData?.error || 'erreur'}`);
+                        wmLog(`⚠️ Auto-bid (riposte) échoué : <b>${esc(a.card?.wikipedia_title || '?')}</b> · ${esc(errData?.error || 'erreur')}`);
                     }
                 } catch(e) {} finally { bidLockSet.delete(a.id); }
             }
@@ -3686,10 +5573,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Notif dans le titre de l'onglet
             const hitCount = activeHitsMap.size;
             document.title = hitCount > 0 ? `(${hitCount}) WikiMasters` : 'WikiMasters';
+            // Suivi ciblé : prochain passage dans 20 s (la hot lane garde la précision à la seconde).
+            if (scan.trackedOnly) return 20000 * marketThrottleFactor;
 
         } catch(err) {
             marketStatusEl.innerHTML =
-                `<span style="color:#EF4444;font-size:10px;">⚠️ ${err.message}</span>`;
+                `<span style="color:#EF4444;font-size:10px;">⚠️ ${esc(err.message)}</span>`;
         }
     }
 
@@ -3722,9 +5611,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // + masquage des cartes déjà possédées.
         const totalBeforeFilter = hits.length;
         const sq = marketSearchNorm(marketSearchQuery.trim());
-        const filterActive = sq || marketHideOwned;
+        const filterActive = sq || marketHideOwned || marketRarityFilter.size > 0 || marketKeywordFilter;
         if (filterActive) {
             hits = hits.filter(a => {
+                if (marketRarityFilter.size > 0
+                    && !marketRarityFilter.has((a.card?.rarity || '').toUpperCase())) return false;
+                if (marketKeywordFilter) {
+                    // Quel mot-clé a fait remonter cette annonce ? Même règle que
+                    // l'affichage du badge, donc ce que l'utilisateur lit sur la ligne.
+                    const k = matchedKeyword(a.card);
+                    if (!k || k.toLowerCase() !== marketKeywordFilter.toLowerCase()) return false;
+                }
                 // Masque les cartes déjà possédées DANS LA MÊME RARETÉ. Une carte possédée en
                 // SR mais listée en UR (revalorisée par le site) n'est PAS un doublon → visible.
                 if (marketHideOwned && isOwnedDuplicate(a.card?.id ?? a.card_id, a.card?.rarity)) return false;
@@ -3940,7 +5837,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <div style="padding:7px 8px 8px;border-radius:0 0 6px 6px;
                             background:linear-gradient(160deg, ${rarHex}30 0%, ${rarHex}14 100%);
                             border:1px solid ${rarHex}40;border-top:none;">
-                            <a href="${marketUrl}" target="wm-card-view" rel="noopener"
+                            <a href="${escUrl(marketUrl)}" target="wm-card-view" rel="noopener"
                                 style="display:block;color:#fff;font-size:11.5px;font-weight:700;line-height:1.25;text-decoration:none;
                                 overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${htmlEsc(title)}">${htmlEsc(title)}</a>
                             ${desc ? `<div style="color:#ffffffaa;font-size:9px;line-height:1.3;margin-top:2px;max-height:24px;overflow:hidden;" title="${htmlEsc(desc)}">${htmlEsc(desc)}</div>` : ''}
@@ -3983,19 +5880,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                                 const base='🔨 Miser ' + amount.toLocaleString('fr-FR') + ' 💰';
                                 if(btn.dataset.jumped === '1' && btn.dataset.confirm !== '1'){ btn.dataset.confirm='1'; btn.innerText='⚠ Confirmer ?'; btn.style.color='#fbbf24'; clearTimeout(btn._ct); btn._ct=setTimeout(()=>{btn.dataset.confirm='';btn.innerText=base;btn.style.color='#06b6d4';},3000); return; }
                                 btn.dataset.confirm=''; clearTimeout(btn._ct);
-                                btn.disabled=true; btn.innerText='⏳';
-                                try { const res=await fetch('https://www.wiki-masters.com/api/marketplace/${a.id}/bid',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount})});
-                                    btn.innerText=res.ok?'✔ Misé':'✗ Échec'; btn.style.color=res.ok?'#4ade80':'#ef4444';
-                                    if(res.ok){ if(window.wmMarkAuctionMine) window.wmMarkAuctionMine('${a.id}', amount); else if(window.wmTrackMyBid) window.wmTrackMyBid('${a.id}'); }
-                                } catch(e){ btn.innerText='✗ Échec'; btn.style.color='#ef4444'; }
-                                setTimeout(()=>{btn.disabled=false;btn.innerText=base;btn.style.color='#06b6d4';},1500);
+                                await window.wmManualBid('${a.id}', amount, btn);
                             })()"
                             style="width:100%;margin-top:6px;height:24px;font-size:10px;font-weight:700;
                             border:1px solid rgba(6,182,212,0.4);border-radius:4px;background:rgba(6,182,212,0.06);
                             color:#06b6d4;cursor:pointer;">🔨 Miser ${nextBid.toLocaleString('fr-FR')} 💰</button>
                         <!-- Automatismes : un seul bouton à 3 états + son plafond -->
                         <div style="display:flex;gap:4px;margin-top:4px;">
-                            <button onclick="window.wmCycleBidMode('${a.id}')"
+                            <button data-wm-mode-btn="${a.id}" onclick="window.wmCycleBidMode('${a.id}', this)"
                                 title="Mode de mise automatique — clic pour passer au suivant : ⚪ Manuel → 🤖 Auto-bid (riposte à chaque surenchère) → 🕵️ Fourbe (une seule mise, à ~${getSetting('snipeSecondsBefore')}s de la fin) → ⚪ Manuel. Les deux automatismes respectent le plafond ci-contre."
                                 style="flex:1;min-width:0;height:22px;font-size:9px;font-weight:700;cursor:pointer;
                                 border:1px solid ${modeUi.border};border-radius:4px;background:${modeUi.bg};color:${modeUi.color};
@@ -4017,9 +5909,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <span onclick="window.wmToggleRowExpand('${a.id}')" title="Agrandir cette enchère" style="cursor:pointer;color:#888;font-size:11px;flex-shrink:0;user-select:none;">▸</span>
                     ${isOutbid ? '<span title="Surenchéri">😤</span>' : isLeading ? '<span title="Meneur">👑</span>' : isNew ? '<span title="Nouvelle annonce">🆕</span>' : ''}
                     ${snipeSet.has(a.id) ? `<span title="Mode Fourbe activé (snipe en fin d'enchère)${getAutoBidMax(a.id) ? ` · plafond ${getAutoBidMax(a.id).toLocaleString('fr-FR')} 💰` : ' · sans plafond'}" style="flex-shrink:0;font-size:9px;">🟣</span>` : ''}
-                    <a href="${marketUrl}" target="wm-card-view" rel="noopener" style="color:#fff;text-decoration:none;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${title}">${title}</a>
+                    <a href="${escUrl(marketUrl)}" target="wm-card-view" rel="noopener" style="color:#fff;text-decoration:none;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(title)}">${esc(title)}</a>
                     <span style="color:#FFD700;font-weight:700;white-space:nowrap;">${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>
-                    <span style="color:#888;white-space:nowrap;max-width:90px;overflow:hidden;text-overflow:ellipsis;" title="${hasBid ? (bidder || '?') : 'aucune mise'}">${hasBid ? (bidder || '?') : '—'}</span>
+                    <span style="color:#888;white-space:nowrap;max-width:90px;overflow:hidden;text-overflow:ellipsis;" title="${hasBid ? esc(bidder || '?') : 'aucune mise'}">${hasBid ? esc(bidder || '?') : '—'}</span>
                     <span id="wm-countdown-${a.id}" style="color:${cdColor};font-family:monospace;font-weight:700;white-space:nowrap;min-width:50px;text-align:right;">${cd}</span>
                     <button data-jumped="${priceJumped ? 1 : 0}"
                         title="Miser le minimum (${minNextBid(a)} 💰)${priceJumped ? ' — ⚠ prix en forte hausse, double-clic requis' : ''}"
@@ -4027,11 +5919,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             if(btn.dataset.jumped === '1' && btn.dataset.confirm !== '1'){ btn.dataset.confirm='1'; btn.innerText='⚠'; btn.style.color='#fbbf24'; clearTimeout(btn._ct); btn._ct=setTimeout(()=>{btn.dataset.confirm='';btn.innerText='🔨';btn.style.color='#06b6d4';},3000); return; }
                             btn.dataset.confirm=''; clearTimeout(btn._ct);
                             btn.disabled=true; btn.innerText='⏳';
-                            try { const res=await fetch('https://www.wiki-masters.com/api/marketplace/${a.id}/bid',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({amount})});
-                                btn.innerText=res.ok?'✔':'✗'; btn.style.color=res.ok?'#4ade80':'#ef4444';
-                                if(res.ok){ if(window.wmMarkAuctionMine) window.wmMarkAuctionMine('${a.id}', amount); else if(window.wmTrackMyBid) window.wmTrackMyBid('${a.id}'); }
-                            } catch(e){ btn.innerText='✗'; }
-                            setTimeout(()=>{btn.disabled=false;btn.innerText='🔨';btn.style.color='#06b6d4';},1500);
+                            await window.wmManualBid('${a.id}', amount, btn);
+                            btn.innerText='🔨';
                         })()"
                         style="flex-shrink:0;font-size:11px;line-height:1;height:20px;padding:0 6px;border:1px solid rgba(6,182,212,0.35);border-radius:3px;background:none;color:#06b6d4;cursor:pointer;">🔨</button>
                 </div>`;
@@ -4047,7 +5936,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     ${marketView === 'compact' ? `<span onclick="window.wmToggleRowExpand('${a.id}')" title="Réduire (revenir en compact)" style="cursor:pointer;color:#06b6d4;font-size:11px;flex-shrink:0;user-select:none;">▾</span>` : ''}
                     ${isNew ? '<span style="font-size:11px;" title="Nouvelle annonce">🆕</span>' : ''}
                     ${isOutbid ? '<span style="font-size:11px;" title="Vous avez perdu le lead">😤</span>' : isLeading ? '<span style="font-size:11px;" title="Vous êtes meneur">👑</span>' : ''}
-                    <a href="${marketUrl}" target="wm-card-view" rel="noopener" style="color:#fff;font-size:12px;font-weight:700;flex:1;text-decoration:none;">${title}</a>
+                    <a href="${escUrl(marketUrl)}" target="wm-card-view" rel="noopener" style="color:#fff;font-size:12px;font-weight:700;flex:1;text-decoration:none;">${esc(title)}</a>
                     ${badge(rarity)}
                     ${ownedBadge}
                     ${kw
@@ -4055,7 +5944,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             background:rgba(0,255,255,0.1);padding:1px 4px;border-radius:3px;
                             box-sizing:border-box;width:82px;text-align:center;
                             display:inline-block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-                            vertical-align:middle;" title="${kw}">${kw}</span>`
+                            vertical-align:middle;" title="${esc(kw)}">${esc(kw)}</span>`
                         : `<span style="box-sizing:border-box;width:82px;display:inline-block;"></span>`
                     }
                 </div>
@@ -4064,7 +5953,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <span style="font-size:11px;">
                         ${hasBid
                             ? `<span style="color:#FFD700;font-weight:700;">💰 ${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>
-                               <span style="color:#888;font-size:10px;"> par ${bidder || "?"}</span>`
+                               <span style="color:#888;font-size:10px;"> par ${esc(bidder || "?")}</span>`
                             : `<span style="color:#888;font-size:11px;">Base : ${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>`
                         }
                     </span>
@@ -4079,7 +5968,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         ">⏱ ${cd}</span>
                         ${(() => {
                             const seller = a.seller?.username || a.owner?.username || a.user?.username || a.lister?.username || a.created_by?.username || null;
-                            return seller ? `<span style="color:#555;font-size:9px;margin-top:-1px;">vendu par <b style="color:#777;">${seller}</b></span>` : '';
+                            return seller ? `<span style="color:#555;font-size:9px;margin-top:-1px;">vendu par <b style="color:#777;">${esc(seller)}</b></span>` : '';
                         })()}
                     </div>
                 </div>
@@ -4091,9 +5980,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <button title="Rafraîchir le prix réel de cette enchère (mise à jour du prix et de la mise minimale)"
                         onclick="if(window.wmRefreshAuction)window.wmRefreshAuction('${a.id}', this);"
                         style="height:24px;box-sizing:border-box;padding:0 7px;border:1px solid rgba(6,182,212,0.3);border-radius:3px;background:none;color:#06b6d4;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;line-height:1;">↻</button>
-                    <button data-excl="${String(title).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}"
+                    <button data-excl="${esc(title)}"
                         onclick="if(window.wmAddExcludeKeyword)window.wmAddExcludeKeyword(this.dataset.excl);"
-                        title="Exclure strictement « ${String(title).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')} » des recherches"
+                        title="Exclure strictement « ${esc(title)} » des recherches"
                         style="height:24px;box-sizing:border-box;padding:0 7px;border:1px solid rgba(239,68,68,0.3);border-radius:3px;background:none;color:#ef4444;font-size:11px;cursor:pointer;display:inline-flex;align-items:center;">🚫</button>
                     <button data-jumped="${priceJumped ? 1 : 0}"
                         title="Miser.${priceJumped ? ' ⚠ Le prix a bondi de +10% depuis ta dernière mise — double-clic requis pour confirmer.' : ''}"
@@ -4112,22 +6001,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             return;
                         }
                         btn.dataset.confirm=''; clearTimeout(btn._ct);
-                        btn.disabled=true; btn.innerText='⏳';
-                        try {
-                            const res = await fetch('https://www.wiki-masters.com/api/marketplace/${a.id}/bid',{
-                                method:'POST',credentials:'include',
-                                headers:{'Content-Type':'application/json'},
-                                body:JSON.stringify({amount})
-                            });
-                            const data = await res.json();
-                            btn.innerText = res.ok ? '✔ Misé' : '✗ Erreur';
-                            btn.style.color = res.ok ? '#4ade80' : '#ef4444';
-                            if(res.ok) {
-                                if(window.wmMarkAuctionMine) window.wmMarkAuctionMine('${a.id}', amount);
-                                else if(window.wmTrackMyBid) window.wmTrackMyBid('${a.id}');
-                            }
-                        } catch(e){ btn.innerText='✗'; }
-                        setTimeout(()=>{btn.disabled=false;btn.innerText='🔨 Miser';btn.style.color='#06b6d4';btn.style.borderColor='rgba(6,182,212,0.3)';},2000);
+                        await window.wmManualBid('${a.id}', amount, btn);
+                        setTimeout(()=>{btn.innerText='🔨 Miser';btn.style.borderColor='rgba(6,182,212,0.3)';},2000);
                     })()" style="
                         font-size:10px;color:#06b6d4;cursor:pointer;
                         height:24px;box-sizing:border-box;padding:0 8px;border:1px solid rgba(6,182,212,0.3);
@@ -4139,7 +6014,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const btn = document.getElementById('wm-autobid-' + auctionId);
                         const hit = window.activeHitsMap && window.activeHitsMap.get(auctionId);
                         const card = hit && hit.auction && hit.auction.card;
-                        const title = (card && card.wikipedia_title) || '?';
+                        // Repli sur le cache de rendu : activeHitsMap est vidée à chaque
+                        // redémarrage du Market Watcher, les cartes restent affichées.
+                        const title = (card && card.wikipedia_title)
+                            || (window.wmAuctionTitle ? window.wmAuctionTitle(auctionId) : '?');
                         const rar = ((card && card.rarity) || '').toUpperCase();
                         if(window.autoBidSet.has(auctionId)) {
                             window.autoBidSet.delete(auctionId);
@@ -4153,6 +6031,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             btn.style.color = '#4ade80';
                             btn.style.borderColor = 'rgba(74,222,128,0.4)';
                             if(window.wmLog) window.wmLog('🤖 Auto-bid activé : <b>' + title + '</b> [' + rar + ']');
+                            if(window.wmWarnAutoBidsPaused) window.wmWarnAutoBidsPaused('l\\'auto-bid sur « ' + title + ' »');
                             // Mutuellement exclusif avec le mode Fourbe
                             if(window.snipeSet && window.snipeSet.has(auctionId)) {
                                 window.snipeSet.delete(auctionId);
@@ -4190,7 +6069,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const abtn = document.getElementById('wm-autobid-' + auctionId);
                         const hit = window.activeHitsMap && window.activeHitsMap.get(auctionId);
                         const card = hit && hit.auction && hit.auction.card;
-                        const title = (card && card.wikipedia_title) || '?';
+                        // Repli sur le cache de rendu : activeHitsMap est vidée à chaque
+                        // redémarrage du Market Watcher, les cartes restent affichées.
+                        const title = (card && card.wikipedia_title)
+                            || (window.wmAuctionTitle ? window.wmAuctionTitle(auctionId) : '?');
                         if(window.snipeSet.has(auctionId)) {
                             window.snipeSet.delete(auctionId);
                             // Si c'est le Hunter agressif qui avait armé : il lâche prise et
@@ -4206,6 +6088,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             btn.style.color = '#c084fc';
                             btn.style.borderColor = 'rgba(192,132,252,0.5)';
                             if(window.wmLog) window.wmLog('🕵️ Fourbe activé (snipe en fin d\\'enchère) : <b>' + title + '</b>');
+                            if(window.wmWarnAutoBidsPaused) window.wmWarnAutoBidsPaused('le Fourbe sur « ' + title + ' »');
                             // Mutuellement exclusif avec l'auto-bid réactif
                             if(window.autoBidSet && window.autoBidSet.has(auctionId)) {
                                 window.autoBidSet.delete(auctionId);
@@ -4250,7 +6133,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Récupère UNE enchère par ID — endpoint dédié (rapide, single request)
     async function fetchSingleAuction(id) {
         const t0 = Date.now();
-        const res = await fetch(`${MARKET_API_BASE}/${id}`, { credentials: "include" });
+        // 10 s maximum : la hot lane attend la plus lente de ses lectures avant de décider ;
+        // une réponse plus tardive serait de toute façon périmée (capture du 01/10 : jusqu'à
+        // 24 s pour une page en erreur).
+        const res = await fetchWithTimeout(`${MARKET_API_BASE}/${id}`, { credentials: "include" }, 10000);
         syncServerClockFromResponse(res, t0); // recale l'horloge serveur (critique pour le snipe)
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
@@ -4292,29 +6178,60 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Calcule l'intervalle de polling en fonction de l'enchère trackée la plus urgente.
     // Retourne null si rien d'urgent à surveiller (le main scan suffit).
+    const HOT_LANE_FAST_MS = 500;
+    /* Voie rapide PAR ENCHÈRE (fork.43). Avant, chaque passage relisait TOUTES les enchères
+       suivies au rythme de la plus urgente : une seule Chasse dans ses 30 dernières secondes
+       faisait relire toutes les autres (même à 3 min de leur fin) toutes les 0,15 s. Chaque
+       enchère a maintenant son propre rythme, d'après SON temps restant. null = froide : le
+       suivi ciblé (20 s) suffit. */
+    const hotLaneLastRead = new Map();   // id → début de la dernière lecture (ms local)
+    function hotLaneItemInterval(id) {
+        const hit = activeHitsMap.get(id);
+        const end = hit && hit.endAt ? new Date(hit.endAt).getTime() : NaN;
+        if (!Number.isFinite(end)) return 5000;          // état initial inconnu : on le découvre
+        const ms = end - serverNow();
+        // Fin passée : état final (gagnée / perdue) pendant 1 min, puis plus rien — la purge
+        // du scan s'en charge. Avant : relue toutes les 2 s, sans limite de durée.
+        if (ms <= 0) return ms > -60_000 ? 2000 : null;
+        if (legendHunt.has(id) && ms < (getSetting('legendHuntWindowSec') + 10) * 1000) return HOT_LANE_FAST_MS;
+        if (snipeSet.has(id) && ms < (getSetting('snipeSecondsBefore') + 10) * 1000) return HOT_LANE_FAST_MS;
+        if (ms < 12_000)      return HOT_LANE_FAST_MS;
+        if (ms < 30_000)      return 1000;
+        if (ms < 90_000)      return 2000;
+        if (ms < 5 * 60_000)  return 5000;
+        return null;
+    }
     function computeHotLaneInterval() {
-        const tracked = new Set([...myBidsSet, ...autoBidSet, ...snipeSet]);
+        const tracked = new Set([...myBidsSet, ...autoBidSet, ...snipeSet, ...legendHunt.keys()]);
         if (tracked.size === 0) return null;
 
-        let minMs = Infinity, minSnipeMs = Infinity;
+        let minMs = Infinity, minSnipeMs = Infinity, minLegendMs = Infinity;
         tracked.forEach(id => {
             const hit = activeHitsMap.get(id);
             if (!hit) return;
-            const ms = new Date(hit.endAt).getTime() - Date.now();
+            // Horloge SERVEUR : c'est elle qui décide de la fin de l'enchère. Avec un décalage
+            // PC↔serveur de quelques secondes, se baser sur Date.now() resserrait le polling
+            // trop tard (ou trop tôt) — pile sur la seule fenêtre qui compte.
+            const ms = new Date(hit.endAt).getTime() - serverNow();
             if (ms > 0 && ms < minMs) minMs = ms;
             if (snipeSet.has(id) && ms > 0 && ms < minSnipeMs) minSnipeMs = ms;
+            if (legendHunt.has(id) && ms > 0 && ms < minLegendMs) minLegendMs = ms;
         });
+        // Rythme le plus serré : 0,5 s (fork.43). Le site met 1 à 6 s à répondre : relire toutes
+        // les 0,15 s empilait des requêtes sans donner l'information plus tôt.
+        if (minLegendMs < (getSetting('legendHuntWindowSec') + 10) * 1000) return HOT_LANE_FAST_MS;
 
-        // Snipe imminent : polling très serré (~150ms) pour tirer pile au bon moment
-        // quand une enchère "Fourbe" approche de sa fenêtre de ~10s.
-        if (minSnipeMs < 20_000) return 150;
+        // Snipe imminent : polling très serré (~150ms) pour tirer pile au bon moment. La
+        // fenêtre suit le RÉGLAGE (+10s de marge) : figée à 20s, un snipe réglé à 60s était
+        // décidé par un tick lent, donc jusqu'à 2s en retard sur la cible.
+        const snipeWindowMs = (getSetting('snipeSecondsBefore') + 10) * 1000;
+        if (minSnipeMs < snipeWindowMs) return HOT_LANE_FAST_MS;
 
         // Aucune enchère trackée connue dans activeHitsMap → on poll quand même
         // toutes les 5s pour découvrir leur état initial.
         if (minMs === Infinity) return 5000;
 
-        if (minMs < 5_000)       return 250;   // mort de l'enchère : 4 ticks/s
-        if (minMs < 12_000)      return 500;   // snipe : 2 ticks/s
+        if (minMs < 12_000)      return HOT_LANE_FAST_MS;   // fin de l'enchère / snipe : 2 ticks/s
         if (minMs < 30_000)      return 1000;  // très chaud : 1s
         if (minMs < 90_000)      return 2000;  // chaud : 2s
         if (minMs < 5 * 60_000)  return 5000;  // tiède : 5s
@@ -4322,13 +6239,261 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     }
 
     // Un tick : fetch en parallèle toutes les enchères trackées, détecte outbid, ripote.
+    /* ══════════ CHASSE LÉGENDAIRE ══════════
+       Demande du 29/09 : repérer les Légendaires dont l'enchère finit (ex. dans 20 s) à un
+       prix bradé (ex. ≤ 10 💰) et miser au dernier moment. Choix de l'utilisateur : riposte
+       jusqu'au prix max, y compris sur les Légendaires déjà possédées, L seulement.
+
+       Deux temps :
+         · REPÉRAGE, toutes les 15 s : les L qui finissent dans les 3 prochaines minutes et
+           dont la mise minimale est sous le max entrent dans `legendHunt`. Le site accepte
+           peut-être un filtre `rarity=L` : on l'essaie et on le VÉRIFIE (toutes les annonces
+           renvoyées doivent être des L), sinon repli sur le début « vivant » du marché trié
+           par fin proche — là où se trouvent justement les enchères qui vont finir.
+         · TIR, dans la hot lane (sondage à ~0,5 s près de la fin) : sous la fenêtre, si je
+           ne mène pas et que la mise minimale est ≤ max → placeBid. Réévalué à chaque tick :
+           une surenchère adverse relance donc une riposte, jusqu'au max.
+       Même garde-fous que toute mise automatique : interrupteur « Mises auto », plafond
+       global, limite de mises par heure, et un plafond PAR ENCHÈRE égal au max (il borne
+       aussi les relances de placeBid en cas de course). */
+    const legendHunt = new Map(); // auctionId → { title, setCap }
+    let legendHuntTimer = null;
+    let legendRarityParam = null;     // null = pas encore vérifié · true / false
+    let legendLivePage = 0, legendLivePageAt = 0;
+    const LEGEND_LOOKAHEAD_MS = 3 * 60 * 1000;
+    /* Une enchère qui finit dans moins de 3 s ne peut plus être emportée : 1,2 s de garde
+       avant la fin, un passage de la hot lane, la lecture de la cote, et une marge. La
+       repérer quand même coûtait une lecture de cote et une ligne de journal pour rien
+       (« Opportunité … fin dans 0 s », logs du 01/10). */
+    const OPPORTUNITY_MIN_LEFT_MS = 3000;
+
+    function auctionEndMs(a) {
+        const t = new Date((a && (a.end_at || a.ends_at)) || NaN).getTime();
+        return Number.isFinite(t) ? t : NaN;
+    }
+
+    function forgetLegend(id) {
+        const e = legendHunt.get(id);
+        if (!e) return;
+        legendHunt.delete(id);
+        // Le plafond posé par la chasse n'est retiré que s'il est TOUJOURS le sien : entre-temps,
+        // un Chasseur ciblé, le Hunter ou l'utilisateur a pu en poser un autre sur la même
+        // enchère — le supprimer libérait l'auto-bid jusqu'au seul plafond global (relecture
+        // du 01/10, reproduit : riposte à 275 au lieu de l'arrêt à 200).
+        if (e.setCap && autoBidMaxMap.has(id)
+            && (e.capValue === undefined || autoBidMaxMap.get(id) === e.capValue)) {
+            autoBidMaxMap.delete(id); saveAutoBidMax();
+        }
+    }
+
+    async function discoverLegends() {
+        if (!getSetting('legendHuntEnabled') || !marketWatcherActive || botNetPaused()) return;
+        // Ménage : enchères terminées depuis plus de 30 s.
+        for (const id of [...legendHunt.keys()]) {
+            const hit = activeHitsMap.get(id);
+            const end = hit ? auctionEndMs(hit.auction) : NaN;
+            if (!Number.isFinite(end) || serverNow() - end > 30000) forgetLegend(id);
+        }
+        const max = getSetting('legendHuntMaxPrice');
+        const found = [];
+
+        // A) Filtre serveur par rareté, s'il est honoré.
+        if (legendRarityParam !== false) {
+            try {
+                for (let p = 1; p <= 6; p++) {
+                    const d = await fetchMarketPage(p, '', 'ending_soon', 'rarity=L');
+                    const list = (d && d.auctions) || [];
+                    if (legendRarityParam === null && list.length) {
+                        legendRarityParam = list.every(a => (a.card?.rarity || '').toUpperCase() === 'L');
+                        wmLog(legendRarityParam
+                            ? '👑 Chasse Légendaire : le site filtre par rareté — seules les Légendaires sont lues.'
+                            : '👑 Chasse Légendaire : pas de filtre de rareté côté site — lecture du début du marché trié par fin proche.');
+                        if (!legendRarityParam) break;
+                    }
+                    found.push(...list);
+                    // Liste triée par fin : au-delà de l'horizon, inutile d'aller plus loin.
+                    if (list.some(a => !isAuctionOver(a) && auctionEndMs(a) - serverNow() > LEGEND_LOOKAHEAD_MS)) break;
+                    const more = (d && typeof d.hasMore === 'boolean') ? d.hasMore : list.length >= MARKET_PAGE_LIMIT;
+                    if (!more) break;
+                    await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+                }
+            } catch (e) {
+                return; // refus du site : on retentera au prochain passage, sans insister
+            }
+        }
+
+        // B) Repli : le début « vivant » du marché (les enchères qui finissent le plus tôt).
+        if (legendRarityParam === false) {
+            try {
+                if (!legendLivePage || Date.now() - legendLivePageAt > 3 * 60 * 1000) {
+                    legendLivePage = await findFirstLivePage(MARKET_MAX_PAGES);
+                    legendLivePageAt = Date.now();
+                }
+                for (let p = legendLivePage; p < legendLivePage + 2; p++) {
+                    const d = await fetchMarketPage(p, '', 'ending_soon');
+                    found.push(...((d && d.auctions) || []));
+                    await new Promise(r => setTimeout(r, MARKET_BATCH_PAUSE_MS));
+                }
+            } catch (e) {
+                return;
+            }
+        }
+
+        for (const a of found) {
+            if (!a || !a.id || legendHunt.has(a.id)) continue;
+            if ((a.card?.rarity || '').toUpperCase() !== 'L') continue;
+            if (isAuctionOver(a)) continue;
+            const remaining = auctionEndMs(a) - serverNow();
+            if (!(remaining <= LEGEND_LOOKAHEAD_MS)) continue;
+            if (remaining < OPPORTUNITY_MIN_LEFT_MS) continue;
+            const next = minNextBid(a);
+            if (!(next <= max)) continue;
+            const hadCap = autoBidMaxMap.has(a.id);
+            if (!hadCap) { autoBidMaxMap.set(a.id, max); saveAutoBidMax(); }
+            legendHunt.set(a.id, { title: a.card?.wikipedia_title || '?', setCap: !hadCap, capValue: max });
+            // Connue de la hot lane : elle resserre son sondage à l'approche de la fin.
+            activeHitsMap.set(a.id, { auction: a, endAt: a.end_at });
+            wmLog(`👑 Légendaire repérée : <b>${esc(a.card?.wikipedia_title || '?')}</b> — mise minimale ${next} 💰, fin dans ${Math.round(remaining / 1000)} s · mise si ≤ ${max} 💰 dans les ${getSetting('legendHuntWindowSec')} dernières secondes`);
+            warnAutoBidsPaused('la Chasse Légendaire');
+        }
+    }
+
+    /* ── 🎯 CHASSE OPTI ──
+       Demande du 30/09 : « le but est de faire de l'argent » — repérer les enchères qui
+       finissent bientôt, comparer à la cote du marché, et miser si la cote est bien au-dessus.
+       Choix de l'utilisateur : raretés cochées, mise ≤ 60 % de la cote, gain ≥ 20 💰, et une
+       mise max absolue (pas d'énorme somme, quelle que soit la cote). Même moteur de tir que
+       la Chasse L (hot lane, riposte), avec un plafond PAR ENCHÈRE :
+           plafond = min(cote × %, cote − gain min, mise max).
+       La cote se lit carte par carte : au plus 12 nouvelles par passage, jamais pendant une
+       pause imposée par le site. Jamais sur mes propres ventes. */
+    function optiRarities() {
+        return String(getSetting('optiRarities') || '').toUpperCase().split(/[,\s]+/).filter(r => RARITY[r]);
+    }
+    const OPTI_COTE_BUDGET = 6;
+    const OPTI_COTE_HORIZON_MS = 90 * 1000;
+    async function discoverOpti() {
+        if (!getSetting('optiHuntEnabled') || !marketWatcherActive || botNetPaused()) return;
+        for (const [id, e] of [...legendHunt.entries()]) {
+            if (e.kind !== 'opti') continue;
+            const hit = activeHitsMap.get(id);
+            const end = hit ? auctionEndMs(hit.auction) : NaN;
+            if (!Number.isFinite(end) || serverNow() - end > 30000) forgetLegend(id);
+        }
+        const rars = optiRarities();
+        if (!rars.length) return;
+        const pct = Math.min(100, Math.max(1, getSetting('optiMaxPct'))) / 100;
+        const minGain = Math.max(0, getSetting('optiMinGain'));
+        const maxBid = Math.max(1, getSetting('optiMaxBid'));
+        const found = [];
+        for (const r of rars) {
+            for (let p = 1; p <= 2; p++) {
+                let d;
+                try { d = await fetchMarketPage(p, '', 'ending_soon', 'rarity=' + r); } catch (e) { return; }
+                const list = (d && d.auctions) || [];
+                found.push(...list);
+                if (!list.length || list.some(a => !isAuctionOver(a) && auctionEndMs(a) - serverNow() > LEGEND_LOOKAHEAD_MS)) break;
+                const more = (d && typeof d.hasMore === 'boolean') ? d.hasMore : list.length >= MARKET_PAGE_LIMIT;
+                if (!more) break;
+                await new Promise(res => setTimeout(res, MARKET_BATCH_PAUSE_MS));
+            }
+        }
+        const cands = [], seen = new Set();
+        for (const a of found) {
+            if (!a || !a.id || seen.has(a.id) || legendHunt.has(a.id)) continue;
+            seen.add(a.id);
+            const rar = (a.card?.rarity || '').toUpperCase();
+            if (!rars.includes(rar) || isAuctionOver(a)) continue;   // filtre refait ici : le site peut ignorer rarity=
+            const remaining = auctionEndMs(a) - serverNow();
+            if (!(remaining <= LEGEND_LOOKAHEAD_MS)) continue;
+            if (remaining < OPPORTUNITY_MIN_LEFT_MS) continue;
+            if (isSelf(a.seller?.username) || isSelf(a.seller_username)) continue;   // mes propres ventes
+            const next = minNextBid(a);
+            if (!(next <= maxBid)) continue;
+            cands.push({ a, rar, next, remaining, cardId: a.card?.id || a.card_id });
+        }
+        /* fork.43 : au plus 6 cotes par passage, et seulement pour les enchères qui finissent
+           dans les 90 s (les autres seront revues aux passages suivants — la cote lue reste
+           en cache 12 h). Avant : 12 par passage, sur tout l'horizon de 3 min. */
+        let budget = OPTI_COTE_BUDGET;
+        /* Cotes à lire, À TOUR DE RÔLE par rareté (retour du 30/09 : « toutes les chasses opti
+           se font sur des Légendaires »). Lues dans l'ordre L, UR, SR…, les nombreuses L qui
+           finissent bientôt consommaient tout le budget du passage : les autres raretés
+           n'étaient presque jamais évaluées avant la fin de leur enchère. */
+        const byRar = new Map();
+        for (const c of cands) {
+            if (!c.cardId || getCachedSales(c.cardId) || salesFetchBlocked(c.cardId)) continue;
+            if (c.remaining > OPTI_COTE_HORIZON_MS) continue;
+            if (!byRar.has(c.rar)) byRar.set(c.rar, []);
+            if (!byRar.get(c.rar).some(x => x.cardId === c.cardId)) byRar.get(c.rar).push(c);
+        }
+        const need = [];
+        for (let more = true; more; ) {
+            more = false;
+            for (const list of byRar.values()) if (list.length) { need.push(list.shift()); more = true; }
+        }
+        for (let i = 0; i < need.length && budget > 0; i += 4) {
+            if (Date.now() < salesEndpointCooldownUntil) break;
+            const grp = need.slice(i, i + Math.min(4, budget));
+            budget -= grp.length;
+            await Promise.all(grp.map(c => fetchCardSales(c.cardId, { priority: SALES_PRIO.urgent }).catch(() => null)));
+        }
+        for (const c of cands) {
+            const entry = c.cardId ? getCachedSales(c.cardId) : null;
+            if (!entry) continue;
+            const cote = entry.byRarity ? entry.byRarity[c.rar] : (entry.count > 0 ? entry.avg : null);
+            if (!Number.isFinite(cote) || cote <= 0) continue;
+            const cap = Math.min(Math.floor(cote * pct), Math.floor(cote - minGain), maxBid);
+            if (!(c.next <= cap)) continue;
+            const hadCap = autoBidMaxMap.has(c.a.id);
+            if (!hadCap) { autoBidMaxMap.set(c.a.id, cap); saveAutoBidMax(); }
+            const title = c.a.card?.wikipedia_title || '?';
+            // Le temps restant est remesuré : la lecture des cotes a pu prendre plusieurs secondes.
+            const left = auctionEndMs(c.a) - serverNow();
+            if (left < OPPORTUNITY_MIN_LEFT_MS) { if (!hadCap) { autoBidMaxMap.delete(c.a.id); saveAutoBidMax(); } continue; }
+            legendHunt.set(c.a.id, { title, setCap: !hadCap, capValue: cap, cap, kind: 'opti', rarity: c.rar, cote });
+            activeHitsMap.set(c.a.id, { auction: c.a, endAt: c.a.end_at });
+            wmLog(`🎯 Opportunité : <b>${esc(title)}</b> [${esc(c.rar)}] — mise min ${c.next} 💰 pour une cote de ${cote} 💰 · mise jusqu'à ${cap} 💰 dans les ${getSetting('legendHuntWindowSec')} dernières secondes (fin dans ${Math.round(left / 1000)} s)`);
+            warnAutoBidsPaused('la Chasse opti');
+        }
+    }
+    window.wmDiscoverOpti = () => discoverOpti();
+
+    const LEGEND_DISCOVER_MS = 30 * 1000;
+    function startLegendHunt() {
+        stopLegendHunt();
+        const tick = async () => {
+            try { await discoverLegends(); } catch (e) {}
+            try { await discoverOpti(); } catch (e) {}
+            if (!marketWatcherActive) return;
+            // Recherche toutes les 30 s (demande du 03/10 ; 15 s avant) : l'horizon est de 3 min,
+            // une enchère intéressante est vue plusieurs fois avant sa fenêtre de mise.
+            legendHuntTimer = setTimeout(tick, LEGEND_DISCOVER_MS * marketThrottleFactor);
+        };
+        legendHuntTimer = setTimeout(tick, 2000);
+    }
+    function stopLegendHunt() {
+        if (legendHuntTimer) { clearTimeout(legendHuntTimer); legendHuntTimer = null; }
+    }
+    window.wmDiscoverLegends = () => discoverLegends();
+
     async function hotLaneTick() {
-        const tracked = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet])];
+        if (botNetPaused()) return;   // pause anti-bot : aucune lecture (le tick suivant repassera)
+        const tracked = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet, ...legendHunt.keys()])];
         if (tracked.length === 0) return;
 
-        // Ne pas fetch les enchères en cours de bid (lock)
-        const toFetch = tracked.filter(id => !bidLockSet.has(id));
+        // Ne pas fetch les enchères en cours de bid (lock), ni celles dont le rythme propre
+        // ne demande pas encore de nouvelle lecture.
+        const now = Date.now();
+        const trackedSet = new Set(tracked);
+        for (const id of [...hotLaneLastRead.keys()]) if (!trackedSet.has(id)) hotLaneLastRead.delete(id);
+        const toFetch = tracked.filter(id => {
+            if (bidLockSet.has(id)) return false;
+            const iv = hotLaneItemInterval(id);
+            return iv !== null && now - (hotLaneLastRead.get(id) || 0) >= iv - 50;
+        });
         if (toFetch.length === 0) return;
+        for (const id of toFetch) hotLaneLastRead.set(id, now);
 
         hotLaneTickCount++;
 
@@ -4346,7 +6511,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // (la fin de l'enchère sera détaillée par le main scan via le pruning)
             const endTs = a.end_at ? new Date(a.end_at).getTime() : 0;
             if (endTs > 0) {
-                activeHitsMap.set(a.id, { auction: a, endAt: a.end_at });
+                // `at` : lecture fraîche, réutilisable par le suivi sans mot-clé (fetchTrackedAuctions).
+                activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
             }
 
             // 🕵️ MODE FOURBE (snipe) : ne mise QU'UNE fois, à ~10s de la fin.
@@ -4364,33 +6530,77 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     && !iAmLeading(a)
                     && wikibidousBalance > 0) {
                     const bidAmount = minNextBid(a);
-                    if (autoBidWithinCap(a, bidAmount)) {
+                    if (autoBidAllowed(a, bidAmount, 'Snipe fourbe')) {
                         bidLockSet.add(a.id);
                         const titleSn = a.card?.wikipedia_title || '?';
                         const rarSn = (a.card?.rarity || '').toUpperCase();
                         try {
-                            const res = await fetch(
-                                `${MARKET_API_BASE}/${a.id}/bid`,
-                                { method: "POST", credentials: "include",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ amount: bidAmount }) }
-                            );
-                            if (res.ok) {
-                                markAuctionAsMine(a.id, bidAmount, a);
+                            // Le snipe est LE moment où deux joueurs tirent en même temps :
+                            // placeBid relit l'enchère et repart au nouveau minimum plutôt que
+                            // de laisser passer la mise adverse.
+                            const r = await placeBid(a, bidAmount, 'Snipe fourbe');
+                            if (r.ok) {
                                 const secLeft = Math.round(remaining / 1000);
-                                wmLog(`🕵️ Fourbe (snipe à ${secLeft}s) : <b>${titleSn}</b> [${rarSn}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                                wmLog(`🕵️ Fourbe (snipe à ${secLeft}s) : <b>${esc(titleSn)}</b> [${rarSn}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${bidRetryNote(r)}`);
                                 fetchBalance().catch(() => {});
-                                sendToDiscord("🕵️ Snipe fourbe : **" + titleSn + "** → **" + bidAmount + " 💰**", 10181046, 'market');
+                                sendToDiscord("🕵️ Snipe fourbe : **" + titleSn + "** → **" + r.amount + " 💰**", 10181046, 'market');
                             } else {
-                                const errData = await res.json().catch(() => ({}));
-                                wmLog(`⚠️ Fourbe échoué : <b>${titleSn}</b> [${rarSn}] · ${errData?.error || 'erreur'}`);
+                                wmLog(`⚠️ Fourbe échoué : <b>${esc(titleSn)}</b> [${rarSn}] · ${esc(r.reason)}`);
                             }
                         } catch(e) {
-                            wmLog(`⚠️ Fourbe exception : <b>${titleSn}</b> · ${e.message}`);
+                            wmLog(`⚠️ Fourbe exception : <b>${esc(titleSn)}</b> · ${esc(e.message)}`);
                         } finally {
                             bidLockSet.delete(a.id);
                         }
                         continue; // ce tick a servi au snipe pour cette enchère
+                    }
+                }
+            }
+
+            // 👑 CHASSE LÉGENDAIRE : dans la fenêtre de fin, mise (ou riposte) tant que la
+            // mise minimale reste ≤ au max. Réévalué à chaque tick → riposte automatique.
+            const legendEntry = legendHunt.get(a.id);
+            if (legendEntry && endTs > 0 && !bidLockSet.has(a.id)
+                && !(legendEntry.failAt && Date.now() - legendEntry.failAt < 2000)) {
+                const remaining = endTs - serverNow();
+                const windowMs = (getSetting('legendHuntWindowSec') + 1) * 1000;
+                // Chasse opti : plafond propre à l'enchère (calculé sur la cote) ; Chasse L : max fixe.
+                const opti = legendEntry.kind === 'opti';
+                const maxL = opti ? legendEntry.cap : getSetting('legendHuntMaxPrice');
+                const ctxL = opti ? 'Chasse opti' : 'Chasse Légendaire';
+                const icoL = opti ? '🎯' : '👑';
+                const rarL = (a.card?.rarity || legendEntry.rarity || 'L').toUpperCase();
+                if (remaining <= 0) { forgetLegend(a.id); }
+                // Hors de portée (la mise suivante dépasse le plafond ; les prix ne baissent
+                // jamais) : on lâche cette chasse. Sinon elle gardait la hot lane à 150 ms sur
+                // ses 30 dernières secondes pour rien. L'enchère reste suivie par ailleurs si
+                // j'y ai misé (mes enchères, surenchère, gagnée/perdue).
+                else if (minNextBid(a) > maxL) { forgetLegend(a.id); }
+                else if (remaining <= windowMs && remaining > 1200 && !iAmLeading(a) && wikibidousBalance > 0) {
+                    const bidAmount = minNextBid(a);
+                    if (bidAmount <= maxL && autoBidAllowed(a, bidAmount, ctxL)) {
+                        bidLockSet.add(a.id);
+                        const tL = a.card?.wikipedia_title || '?';
+                        try {
+                            const r = await placeBid(a, bidAmount, ctxL, { max: maxL });
+                            if (r.ok) {
+                                markChasseBid(a.id);   // un achat de la Chasse : la Revente pourra le reprendre
+                                wmLog(`${icoL} ${ctxL} : <b>${esc(tL)}</b> [${esc(rarL)}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${opti ? ` <span style="color:#888;font-size:9px;">(cote ${legendEntry.cote} 💰)</span>` : ''} (fin dans ${Math.round(remaining / 1000)} s)${bidRetryNote(r)}`);
+                                fetchBalance().catch(() => {});
+                                sendToDiscord(icoL + " " + ctxL + " : **" + tL + "** → **" + r.amount + " 💰**", 16766720, 'market');
+                            } else {
+                                // Pas de rafale : 2 s avant de retenter (placeBid a déjà relancé).
+                                legendEntry.failAt = Date.now();
+                                if (!r.humanCheck) wmLog(r.blocked
+                                    ? `${icoL} ${ctxL} : <b>${esc(tL)}</b> — on s'arrête, la mise suivante (${r.amount} 💰) dépasserait ton max ou une limite.`
+                                    : `⚠️ ${ctxL} échouée : <b>${esc(tL)}</b> · ${esc(r.reason)}`);
+                            }
+                        } catch (e) {
+                            legendEntry.failAt = Date.now();
+                        } finally {
+                            bidLockSet.delete(a.id);
+                        }
+                        continue;
                     }
                 }
             }
@@ -4417,7 +6627,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     const refundFragment = (refund && refund.deltaTotal > 0)
                         ? ` · <span style="color:#4ade80;font-weight:700;">+${refund.deltaTotal.toLocaleString('fr-FR')} 💰</span> (solde ${refund.newBalance.toLocaleString('fr-FR')} 💰)`
                         : '';
-                    wmLog(`⚡ Hot-lane : surenchéri sur <b>${titleOb}</b> [${rarOb}] · <b>${bidder}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>${refundFragment}`);
+                    wmLog(`⚡ Hot-lane : surenchéri sur <b>${esc(titleOb)}</b> [${rarOb}] · <b>${esc(bidder)}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>${refundFragment}`);
 
                     // 🔴 Feedback visuel INSTANTANÉ : on patche le cache d'affichage avec les
                     // données fraîches de la hot lane et on re-render tout de suite (la ligne
@@ -4437,34 +6647,28 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // Riposte instantanée si auto-bid activé sur cette enchère ET sous le plafond.
                 // ⚠️ NE PAS faire `continue` si le plafond est atteint : ça sauterait la MàJ de
                 // leadingBidsMap plus bas → l'outbid serait re-détecté au tick suivant.
-                if (autoBidSet.has(a.id) && wikibidousBalance > 0 && !bidLockSet.has(a.id)) {
+                if (autoBidSet.has(a.id) && wikibidousBalance > 0 && !bidLockSet.has(a.id)
+                    && !skipIfAuctionOver(a, 'Hot-lane bid')) {
                     const bidAmount = bidIncrement(bidOb);
-                    if (autoBidWithinCap(a, bidAmount)) { // ne riposte que sous le plafond
+                    if (autoBidAllowed(a, bidAmount, 'Hot-lane')) { // plafond + limite horaire + interrupteur
                         bidLockSet.add(a.id);
                         try {
                             // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane)
-                            const res = await fetch(
-                                `${MARKET_API_BASE}/${a.id}/bid`,
-                                { method: "POST", credentials: "include",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ amount: bidAmount }) }
-                            );
-                            if (res.ok) {
-                                markAuctionAsMine(a.id, bidAmount, a);
-                                wmLog(`⚡ Hot-lane bid : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                            const r = await placeBid(a, bidAmount, 'Riposte hot-lane');
+                            if (r.ok) {
+                                wmLog(`⚡ Hot-lane bid : <b>${esc(titleOb)}</b> [${rarOb}] → <span style="color:#fbbf24;">${r.amount} 💰</span>${bidRetryNote(r)}`);
                                 // Refresh balance en arrière-plan, sans bloquer le tick
                                 fetchBalance().catch(() => {});
                                 sendToDiscord(
-                                    "⚡ Hot-lane bid : **" + titleOb + "** → **" + bidAmount + " 💰**",
+                                    "⚡ Hot-lane bid : **" + titleOb + "** → **" + r.amount + " 💰**",
                                     5763719,
                                     'market'
                                 );
                             } else {
-                                const errData = await res.json().catch(() => ({}));
-                                wmLog(`⚠️ Hot-lane bid échoué : <b>${titleOb}</b> [${rarOb}] · ${errData?.error || 'erreur'}`);
+                                wmLog(`⚠️ Hot-lane bid échoué : <b>${esc(titleOb)}</b> [${rarOb}] · ${esc(r.reason)}`);
                             }
                         } catch(e) {
-                            wmLog(`⚠️ Hot-lane bid exception : <b>${titleOb}</b> · ${e.message}`);
+                            wmLog(`⚠️ Hot-lane bid exception : <b>${esc(titleOb)}</b> · ${esc(e.message)}`);
                         } finally {
                             bidLockSet.delete(a.id);
                         }
@@ -4533,7 +6737,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // prendre du temps sur les gros comptes) pour ne rater aucune enchère. Les infos
         // de possession (✔ ×N) se rempliront dès que la collection est chargée en parallèle.
         startCountdownTicker(marketAlertEl);
-        runMarketScanLoop(marketAlertEl, marketStatusEl);
+        runMarketScanLoop(marketAlertEl, marketStatusEl, marketLoopGen);
+        startLegendHunt();
         // Hot lane : démarre peu après (elle ne fait rien tant qu'aucune enchère n'est suivie)
         setTimeout(() => { if (marketWatcherActive) startHotLane(); }, 1000);
 
@@ -4562,27 +6767,92 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     let marketWatcherTimeout = null;
     let marketScanInProgress = false;
+    let lastScanPageCount = 1; // pages du dernier scan → espacement du suivant
 
-    async function runMarketScanLoop(marketAlertEl, marketStatusEl) {
-        if (!marketWatcherActive || marketScanInProgress) return;
+    /* Génération de scan. Incrémentée à chaque démarrage/arrêt du Market Watcher et à
+       chaque changement de la liste de mots-clés. Un scan capture la valeur à son départ :
+       dès qu'elle change, il s'interrompt à la page suivante et n'affiche RIEN.
+
+       Constat du 28/09 : un balayage complet lancé à 19:59 pour « eiffage » a tourné
+       7 minutes ; pendant ce temps l'utilisateur avait remplacé le mot-clé par « Marcel
+       Dassault » et relancé le Market Watcher — dont le premier scan avait été abandonné
+       en silence (« un scan est déjà en cours »). À 20:07, c'est le vieux balayage qui a
+       affiché ses résultats, après même un STOP. */
+    // (marketScanGen / marketLoopGen sont déclarés tout en haut, avec marketWatcherActive :
+    //  saveWatchlist() peut être appelé dès le chargement — migration des anciennes listes —
+    //  bien avant cette ligne, et un `let` pas encore atteint y lèverait une erreur.)
+    function isScanStale(gen) { return gen !== marketScanGen; }
+
+    // Demande un nouveau scan TOUT DE SUITE (changement de mots-clés) : le scan en cours
+    // devient périmé et la boucle repart sans attendre sa cadence normale.
+    function requestMarketRescan() {
+        marketScanGen++;
+        if (!marketWatcherActive || !window.__wmMarketEls) return;
+        if (marketWatcherTimeout) { clearTimeout(marketWatcherTimeout); marketWatcherTimeout = null; }
+        const { alertEl, statusEl } = window.__wmMarketEls;
+        const loop = marketLoopGen;
+        marketWatcherTimeout = setTimeout(() => runMarketScanLoop(alertEl, statusEl, loop), 300);
+    }
+
+    async function runMarketScanLoop(marketAlertEl, marketStatusEl, loopGen) {
+        if (loopGen === undefined) loopGen = marketLoopGen;
+        // Une boucle d'un démarrage précédent ne programme plus rien : une seule boucle vit.
+        if (!marketWatcherActive || loopGen !== marketLoopGen) return;
+        window.__wmMarketEls = { alertEl: marketAlertEl, statusEl: marketStatusEl };
+        // Pause anti-bot : aucun scan ; la boucle repasse à la fin de la pause.
+        if (botNetPaused()) {
+            if (marketStatusEl) marketStatusEl.innerHTML = `<span style="color:#ef4444;font-size:10px;white-space:nowrap;">🛡️ pause anti-bot</span>`;
+            marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl, loopGen),
+                Math.max(500, botNet.pausedUntil - Date.now() + 300));
+            return;
+        }
+        if (marketScanInProgress) {
+            // Un scan (périmé) finit sa page en cours : on repasse dans un instant au lieu
+            // d'abandonner — avant, ce `return` tuait la boucle jusqu'à la fin du vieux scan.
+            marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl, loopGen), 500);
+            return;
+        }
         marketScanInProgress = true;
         const startedAt = Date.now();
+        let nextWaitOverride = null;
         try {
-            await checkMarketplace(marketAlertEl, marketStatusEl);
+            nextWaitOverride = await checkMarketplace(marketAlertEl, marketStatusEl, marketScanGen);
         } catch (e) {
-            wmLog(`⚠️ scan échoué : ${e.message || e}`);
+            wmLog(`⚠️ scan échoué : ${esc(e.message || e)}`);
         } finally {
             marketScanInProgress = false;
         }
-        if (!marketWatcherActive) return;
-        // Vise MARKET_REFRESH_MS entre deux DÉBUTS de scan ; si le scan a déjà
-        // pris plus longtemps, on enchaîne après un minimum de souffle.
+        if (!marketWatcherActive || loopGen !== marketLoopGen) return;
+
+        /* Espacement PROPORTIONNEL au coût du scan. Avec l'ancien calcul (viser 10 s
+           entre deux débuts), un scan de 136 pages repartait 1,5 s après avoir fini :
+           le marché était interrogé en continu. Les enchères suivies restent, elles,
+           rafraîchies à la seconde par la hot lane — la réactivité ne dépend pas de
+           la fréquence du scan complet. */
+        if (marketScanRefusals > 0) {
+            const before = marketThrottleFactor;
+            marketThrottleFactor = Math.min(MARKET_THROTTLE_MAX, marketThrottleFactor * 2);
+            if (marketThrottleFactor !== before) {
+                wmLog(`🐢 Le site a refusé ${marketScanRefusals} page(s) du scan — scan ralenti (×${marketThrottleFactor}). Ça protège aussi l'ouverture de paquets.`);
+            }
+        } else if (marketThrottleFactor > 1) {
+            marketThrottleFactor = Math.max(1, marketThrottleFactor / 2);
+            wmLog(`🐇 Scan propre — cadence remontée (×${marketThrottleFactor}).`);
+        }
+        marketScanRefusals = 0;
+
         const elapsed = Date.now() - startedAt;
-        const wait = Math.max(MARKET_MIN_GAP_MS, MARKET_REFRESH_MS - elapsed);
-        marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl), wait);
+        const budget = Math.max(MARKET_REFRESH_MS, lastScanPageCount * MARKET_MS_PER_PAGE) * marketThrottleFactor;
+        let wait = Math.max(MARKET_MIN_GAP_MS, budget - elapsed);
+        // Recherche refusée : nouvel essai rapproché (mais pas en rafale), plutôt que
+        // d'attendre la cadence normale ou de basculer sur le balayage complet.
+        if (Number.isFinite(nextWaitOverride)) wait = nextWaitOverride;
+        marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl, loopGen), wait);
     }
 
     function stopMarketWatcher(persist = true) {
+        marketScanGen++;   // le scan en cours ne doit plus rien afficher
+        marketLoopGen++;   // …ni reprogrammer quoi que ce soit
         if (persist) {
             sessionStorage.removeItem('wm_watcher_active');
             sessionStorage.removeItem('wm_hits_cache');
@@ -4591,12 +6861,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (marketWatcherTimeout)    { clearTimeout(marketWatcherTimeout);     marketWatcherTimeout = null; }
         if (marketCountdownInterval) { clearInterval(marketCountdownInterval); marketCountdownInterval = null; }
         stopHotLane();
+        stopLegendHunt();
         marketWatcherActive = false;
     }
 
     /* ===================== TRASH SELLER ===================== */
 
     let trashSellerRunning = false;
+    let trashSellerGen = 0;    // génération de la boucle du Trash Seller (cf. sellTrashCards)
     let lastTrashCardIds = new Set(); // pour détecter les nouvelles cartes tagguées "Trash"
 
     // Cartes temporairement non-listables : le site renvoie 409 « déjà engagée dans un échange
@@ -4638,10 +6910,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Point d'entrée à utiliser à la place d'un appel direct à fetchTrashCards() dans les
     // boucles/actions répétées : ne re-scanne que si le pool n'a jamais été chargé ou a dépassé
     // l'intervalle de réconciliation.
-    async function getTrashPool(onProgress) {
-        const stale = !trashPoolCacheReady || (Date.now() - trashPoolCacheTs) > TRASH_POOL_RESCAN_INTERVAL_MS;
+    /* `opts.shouldAbort` : seul le Trash Seller en marche l'utilise (arrêt = on coupe le
+       scan). `opts.force` : rescan complet même si le cache est frais (aperçu manuel).
+
+       Bug du 29/09 (« il ne détecte que 2 cartes Trash, j'en ai une quinzaine ») : le scan
+       s'interrompait après la 1re page dès que le Trash Seller n'était PAS démarré — cas de
+       l'aperçu et du « Refresh ventes ». Il ne lisait donc que les 50 premières cartes de la
+       collection (triée par rareté : les plus rares), et ce pool tronqué était ensuite
+       gardé 12 min en cache, y compris pour le vendeur une fois lancé. */
+    async function getTrashPool(onProgress, opts) {
+        const o = opts || {};
+        const stale = o.force || !trashPoolCacheReady || (Date.now() - trashPoolCacheTs) > TRASH_POOL_RESCAN_INTERVAL_MS;
         if (stale) {
-            trashPoolCache = await fetchTrashCards(onProgress);
+            const cards = await fetchTrashCards(onProgress, o.shouldAbort);
+            if (cards.aborted) return cards;   // scan coupé : on ne l'érige pas en vérité
+            trashPoolCache = cards;
             trashPoolCacheTs = Date.now();
             trashPoolCacheReady = true;
         }
@@ -4667,16 +6950,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (idx !== -1) trashPoolCache.splice(idx, 1);
     }
 
-    async function fetchTrashCards(onProgress) {
+    async function fetchTrashCards(onProgress, shouldAbort) {
+        const abort = typeof shouldAbort === 'function' ? shouldAbort : () => false;
         const limit = 50;
         let trashCards = [];
+        let aborted = false;
 
         const url = (p) => `https://www.wiki-masters.com/api/my-collection?page=${p}&limit=${limit}&sort=rarity&pending=1`;
 
         // Fetch une page avec retry automatique (3 tentatives, backoff linéaire)
         async function fetchPage(p) {
             for (let attempt = 0; attempt < 3; attempt++) {
-                if (!trashSellerRunning) return null;
+                if (abort()) return null;
                 try {
                     const res = await fetch(url(p), { credentials: "include" });
                     if (!res.ok) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); continue; }
@@ -4728,7 +7013,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             let reachedEnd = false;
             const failedPageNums = [];
             for (let start = 1; start < upperLimit && !reachedEnd; start += BATCH) {
-                if (!trashSellerRunning) break;
+                if (abort()) { aborted = true; break; }
                 const pages = [];
                 for (let p = start; p < Math.min(start + BATCH, upperLimit); p++) pages.push(p);
                 const results = await Promise.all(pages.map(fetchPage));
@@ -4749,11 +7034,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // 2e passe : on RE-TENTE les pages échouées une à une. Crucial avec sort=rarity :
             // un échec non rattrapé prive le pool d'une tranche entière de rareté, ce qui
             // biaise la sélection équitable et fait grimper le compteur des cartes chargées.
-            if (failedPageNums.length > 0 && trashSellerRunning && !reachedEnd) {
+            if (failedPageNums.length > 0 && !abort() && !reachedEnd) {
                 wmLog(`🔁 Scan Trash : 2e tentative sur ${failedPageNums.length} page(s) échouée(s)…`);
                 const stillFailed = [];
                 for (const p of failedPageNums) {
-                    if (!trashSellerRunning) break;
+                    if (abort()) { aborted = true; break; }
                     const items = await fetchPage(p);
                     if (items === null) { stillFailed.push(p); continue; }
                     trashCards = trashCards.concat(filterTrash(items));
@@ -4782,7 +7067,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             .map(([r, n]) => `${r}:${n}`).join(' · ');
         wmLog(`🔍 Scan Trash : <b>${trashCards.length}</b> cartes tagguées (${newlyTagged.length > 0 ? `+${newlyTagged.length} depuis dernier scan` : 'inchangé'})${rarityStr ? ` — <span style="color:#888;">${rarityStr}</span>` : ''}`);
         if (skippedMultiTag > 0) {
-            wmLog(`🛡️ Filet de sécurité : <b>${skippedMultiTag}</b> carte(s) « ${sellTag} » ignorée(s) (elles portent aussi un autre tag)`);
+            wmLog(`🛡️ Filet de sécurité : <b>${skippedMultiTag}</b> carte(s) « ${esc(sellTag)} » ignorée(s) (elles portent aussi un autre tag)`);
         }
         if (skippedPendingTrade > 0) {
             wmLog(`⏸️ <b>${skippedPendingTrade}</b> carte(s) exclue(s) temporairement (engagée(s) dans un échange en attente) — réessai après ${PENDING_TRADE_COOLDOWN_MS / 60000} min`);
@@ -4798,6 +7083,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         lastTrashCardIds = currentIds;
 
+        if (aborted) trashCards.aborted = true;
         return trashCards;
     }
 
@@ -4881,6 +7167,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Le compteur serveur prime sur la longueur de liste : il est exact même quand
             // le détail n'est pas fourni.
             count: Number.isFinite(count) ? count : list.length,
+            // …mais il arrive qu'il vaille `null` ({"sellingCount":null}). Sans ce drapeau,
+            // « je ne sais pas » se lisait « 0 vente active » : le bot se croyait tous ses
+            // créneaux libres et listait en boucle dans un plafond déjà plein, chaque essai
+            // étant refusé par le site.
+            countKnown: Number.isFinite(count),
             max: Number.isFinite(max) ? max : null,
             detailed: list.length > 0 || !Number.isFinite(count)
         };
@@ -4952,7 +7243,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         wmLog(`🔬 <b>/mine</b> : 0 vente active retenue. Champs racine : <span style="color:#fbbf24;">${describe(data)}</span>`);
         wmLog(`🔬 Tableau retenu : <b>${key || 'AUCUN'}</b> (${(list || []).length} entrée(s)) · statuts vus : <b>${statuses}</b>`);
         if (list && list[0]) wmLog(`🔬 Champs d'une entrée : <span style="color:#888;">${describe(list[0])}</span>`);
-        wmLog(`🔬 Aperçu brut : <span style="color:#888;font-family:'JetBrains Mono',monospace;font-size:9px;">${String(raw).replace(/</g, '&lt;')}</span>`);
+        wmLog(`🔬 Aperçu brut : <span style="color:#888;font-family:'JetBrains Mono',monospace;font-size:9px;">${esc(raw)}</span>`);
     }
 
     // Rejoue le diagnostic à la demande, avec une requête fraîche. Utilisable depuis la console
@@ -4976,7 +7267,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     let _detailCache = null;
     let _detailCacheAt = 0;
     const DETAIL_CACHE_MS = 10000;
-    function invalidateSalesDetail() { _detailCacheAt = 0; }
+    // Une vente créée ou annulée rend TOUT ce qui a été lu avant périmé : détail ET état.
+    function invalidateSalesDetail() { _detailCacheAt = 0; invalidateSellingState(); }
     async function activeSalesDetail(expectedCount) {
         if (_detailCache && Date.now() - _detailCacheAt < DETAIL_CACHE_MS) return _detailCache;
         // Source primaire : la base. Filet : rejouer nos propres auctionId.
@@ -4988,10 +7280,64 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return list;
     }
 
-    async function fetchSellingState() {
+    /* Compte les ventes actives quand /mine ne donne plus son compteur. La BASE fait
+       autorité : elle voit aussi les ventes créées à la main sur le site, que sellHistory
+       ignore. Repli sur nos propres identifiants d'enchères si la base est illisible. */
+    async function countActiveSalesFallback(maxExpected) {
+        const fromDb = await fetchActiveSalesFromDb();
+        if (Array.isArray(fromDb)) return { count: fromDb.length, list: fromDb, source: 'base' };
+        const rebuilt = (await rebuildActiveSalesFromHistory(maxExpected)) || [];
+        return { count: rebuilt.length, list: rebuilt, source: 'historique du bot' };
+    }
+
+    let _unknownCountLogTs = 0;
+
+    /* ── Lecture PARTAGÉE de l'état des ventes ──
+       Capture réseau du 01/10 : /mine suivi d'un recomptage en base (3 à 7 s chacun) était
+       demandé ~11 fois en 93 s par trois modules qui ne se voyaient pas (rafraîchissement
+       30 s, Revente, Trash Seller). Désormais :
+         · deux demandes simultanées partagent la MÊME requête en cours ;
+         · une requête lancée AVANT une mise en vente ou une annulation n'est jamais servie
+           après elle (génération) — un créneau ne peut donc pas être compté libre à tort ;
+         · seul l'affichage périodique accepte un résultat récent (maxAge) ; les décisions
+           de mise en vente redemandent toujours (maxAge 0), au pire en partageant la requête
+           en vol de la même génération.
+       Un échec (null) n'est jamais mis en cache. */
+    let _ssCache = null, _ssCacheAt = 0, _ssGen = 0, _ssFlight = null;
+    function invalidateSellingState() { _ssGen++; _ssCache = null; _ssCacheAt = 0; }
+    function copySellingState(st) {
+        return st ? { ...st, list: Array.isArray(st.list) ? st.list.slice() : [] } : st;
+    }
+    async function fetchSellingState(opts) {
+        const maxAge = (opts && opts.maxAge) || 0;
+        if (maxAge > 0 && _ssCache && Date.now() - _ssCacheAt <= maxAge) return copySellingState(_ssCache);
+        if (!_ssFlight || _ssFlight.gen !== _ssGen) {
+            const gen = _ssGen;
+            const p = _fetchSellingStateRaw()
+                .then(st => { if (st && gen === _ssGen) { _ssCache = st; _ssCacheAt = Date.now(); } return st; }, () => null)
+                .finally(() => { if (_ssFlight && _ssFlight.p === p) _ssFlight = null; });
+            _ssFlight = { gen, p };
+        }
+        return copySellingState(await _ssFlight.p);
+    }
+
+    async function _fetchSellingStateRaw() {
         const data = await fetchMine();
         if (!data) return null;
         const st = mineSellingState(data);
+
+        // Compteur absent → on le reconstruit AVANT tout calcul de créneaux libres.
+        if (!st.countKnown) {
+            const fb = await countActiveSalesFallback(effectiveMaxActive(st.max));
+            st.count = fb.count;
+            st.list = fb.list;
+            st.estimated = true;
+            st.detailed = fb.list.length > 0;
+            if (Date.now() - _unknownCountLogTs > 180000) {
+                _unknownCountLogTs = Date.now();
+                wmLog(`🔬 Le site ne renvoie plus le nombre de ventes actives (<code>sellingCount: null</code>) — recompté via ${esc(fb.source)} : <b>${fb.count}</b>.`);
+            }
+        }
         // Le détail est complété ICI, dans l'accesseur, et non chez l'appelant : il y a sept
         // points d'appel, et n'en équiper qu'un faisait clignoter l'affichage — chaque tick du
         // Trash Seller réécrivait la liste avec le [] de /mine, effacé puis restauré 30 s plus
@@ -5022,6 +7368,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     : '';
                 wmLog(`🚫 Carte retirée manuellement de la vente : <b>${label}</b>${remainingFrag}`);
                 invalidateSalesDetail(); // la vente annulée doit disparaître immédiatement
+                // Vente de la Revente Légendaire retirée à la main : c'est un choix de
+                // l'utilisateur → elle sort de la revente (sinon elle restait « en vente »).
+                const lrc = legendResellByListing(auctionId);
+                if (lrc) {
+                    lrc.status = 'removed';
+                    lrc.listedAuctionId = null;
+                    saveLegendResell();
+                    renderLegendResell();
+                    wmLog(`👑 Revente Légendaire : <b>${esc(lrc.title)}</b> retirée de la revente (tu l'as retirée de la vente — le bot ne la remettra pas).`);
+                }
                 // Purge l'entrée de sellHistory pour bloquer le retag auto
                 const before = sellHistory.length;
                 sellHistory = sellHistory.filter(s => s.auctionId !== auctionId);
@@ -5040,7 +7396,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 wmLog(`❌ Annulation impossible : <b>${label}</b> · HTTP ${res.status}${body ? ' · ' + body.slice(0, 80) : ''}`);
             }
         } catch(e) {
-            wmLog(`❌ Annulation exception : <b>${label}</b> · ${e.message}`);
+            wmLog(`❌ Annulation exception : <b>${label}</b> · ${esc(e.message)}`);
         }
     }
     window.wmCancelSale = cancelSale;
@@ -5094,7 +7450,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const hasBid = bidder !== null;
             const marketUrl = `https://www.wiki-masters.com/marketplace/${a.id}`;
             // Échappe le titre pour l'attribut data-* (peut contenir guillemets, apostrophes…)
-            const titleAttr = String(title).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+            const titleAttr = esc(title);
             // Badge compteur de remises en vente (nombre de fois invendue+retaguée)
             const cid = a.card?.id ?? a.card_id;
             const retagN = getRetagCount(cid);
@@ -5112,7 +7468,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 animation:fadeIn 0.3s ease;
             ">
                 <div style="display:flex;align-items:center;gap:5px;margin-bottom:2px;">
-                    <a href="${marketUrl}" target="wm-card-view" rel="noopener" style="color:#fff;font-size:11px;font-weight:700;flex:1;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;">${title}</a>
+                    <a href="${escUrl(marketUrl)}" target="wm-card-view" rel="noopener" style="color:#fff;font-size:11px;font-weight:700;flex:1;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;">${esc(title)}</a>
                     ${retagBadge}
                     ${badge(rarity)}
                     ${!hasBid ? `<button
@@ -5126,8 +7482,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:10px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;flex-shrink:0;">✕</button>` : ''}
                 </div>
                 <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;gap:6px;">
-                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${hasBid ? bidder : 'aucune mise'}">
-                        ${hasBid ? `👤 ${bidder}` : '— pas de mise'}
+                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${hasBid ? esc(bidder) : 'aucune mise'}">
+                        ${hasBid ? `👤 ${esc(bidder)}` : '— pas de mise'}
                     </span>
                     <span style="color:#fbbf24;font-weight:700;white-space:nowrap;">
                         ${hasBid ? `${bid} 💰` : `base ${bid} 💰`}
@@ -5150,29 +7506,57 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             result = { price: manual, source: 'table' };
         } else {
             let entry = getCachedSales(cardId);
-            if (!entry) entry = await fetchCardSales(cardId); // récupère l'historique si pas en cache
-            if (entry && entry.count > 0 && Number.isFinite(entry.avg) && entry.avg > 0) {
-                const pct = getSetting('sellMarketPricePct');
-                let price = Math.max(1, Math.round(entry.avg * (pct / 100)));
-                // Plancher : le prix marché ne descend jamais sous le prix du tableau par rareté.
-                let floored = false;
-                if (getSetting('sellMarketFloor') && price < manual) { price = manual; floored = true; }
-                result = { price, source: 'market', avg: entry.avg, count: entry.count, pct, floored, floor: manual };
+            if (!entry) entry = await fetchCardSales(cardId, { priority: SALES_PRIO.normal }); // récupère l'historique si pas en cache
+            /* La cote du site est donnée PAR RARETÉ ({"SR":{"average":668}}) : une carte ne
+               vaut pas la même chose selon la sienne. Prendre `entry.avg` (la première
+               rareté rencontrée) reviendrait à vendre une SR au prix d'une commune. */
+            const rar = (rarity || '').toUpperCase();
+            const marketAvg = (entry && entry.byRarity && Number.isFinite(entry.byRarity[rar]))
+                ? entry.byRarity[rar]
+                : (entry && !entry.byRarity ? entry.avg : null);
+            if (entry && entry.count > 0 && Number.isFinite(marketAvg) && marketAvg > 0) {
+                // % PAR RARETÉ (réglable dans le panneau), à défaut le % global.
+                const pct = getSellPct(rar);
+                const marketPrice = Math.max(1, Math.round(marketAvg * (pct / 100)));
+                result = { price: marketPrice, source: 'market', avg: marketAvg, marketPrice,
+                           count: entry.count, pct, floored: false, floor: manual };
             } else {
                 result = { price: manual, source: 'table' };
             }
         }
-        // Prix dégressif : -15% par tranche de 10 remises en vente (invendus récurrents 🔁).
-        // Volontairement APRÈS le plancher (le but est justement de brader ce qui ne part pas).
-        // Plafonné à -75% et jamais sous 1 wkb.
-        if (getSetting('sellDegressive') && cardId) {
-            const retag = getRetagCount(cardId);
-            const steps = Math.floor(retag / 10);
-            if (steps > 0) {
-                const discountPct = Math.min(75, steps * 15);
-                const before = result.price;
-                result.price = Math.max(1, Math.round(before * (1 - discountPct / 100)));
-                result.degressive = { retag, discountPct, before };
+
+        /* ── Invendus : baisse, puis plancher limité dans le temps ──
+           Constat des logs du 28/09 : la plupart des R partaient au plancher (15 💰) pour une
+           cote de 1 à 10 💰, revenaient invendues, et repartaient au même prix — en boucle.
+           L'ancienne baisse (-15 % par tranche de 10 remises) n'arrivait jamais : les cartes
+           en étaient à 2 ou 3 remises.
+
+           · k = nombre d'invendus déjà subis par cette carte ;
+           · baisse de `sellDecayStepPct` % par invendu, jamais sous `sellDecayMinPct` % du
+             prix de base ;
+           · le plancher du tableau ne protège que les `sellFloorTries` premières mises en
+             vente (0 = toujours) : on tente d'abord d'en tirer plus, puis on laisse le
+             marché décider plutôt que de bloquer la carte indéfiniment. */
+        const k = cardId ? getRetagCount(cardId) : 0;
+        const base = result.price;
+        if (getSetting('sellDegressive') && k > 0) {
+            const step = Math.max(0, getSetting('sellDecayStepPct')) / 100;
+            const minF = Math.min(1, Math.max(0, getSetting('sellDecayMinPct')) / 100);
+            const factor = Math.max(minF, 1 - step * k);
+            if (factor < 1) {
+                result.price = Math.max(1, Math.round(base * factor));
+                result.degressive = { retag: k, discountPct: Math.round((1 - factor) * 100), before: base };
+            }
+        }
+        if (getSetting('sellMarketFloor') && result.price < manual) {
+            const tries = getSetting('sellFloorTries');
+            if (!(tries > 0) || k < tries) {
+                result.price = manual;
+                result.floored = true;
+                result.floor = manual;
+                result.floorTriesLeft = tries > 0 ? tries - k : null; // null = plancher permanent
+            } else {
+                result.floorLifted = { after: tries, floor: manual };
             }
         }
         return result;
@@ -5225,14 +7609,76 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         setter.call(el, value);
         el.dispatchEvent(new Event('input', { bubbles: true }));
     }
+    // Le dashboard du bot affiche lui aussi des titres de cartes (aperçu de vente, résultats
+    // du Market Watcher, logs…) : si findLeafByExactText tombait sur un de CES noeuds, on
+    // remonterait ensuite jusqu'à un ancêtre .cursor-pointer du panneau et on cliquerait dans
+    // notre propre interface au lieu de la tuile du site. Tout ce que le script injecte vit
+    // sous un id/classe préfixé wm- → on l'exclut systématiquement de la recherche DOM.
+    function isBotOwnNode(el) {
+        return !!(el && el.closest && el.closest('[id^="wm-"], [class*="wm-"]'));
+    }
     function findLeafByExactText(text) {
+        const want = normTitle(text);
         for (const el of document.querySelectorAll('*')) {
-            if (el.children.length === 0 && el.textContent.trim() === text) return el;
+            if (el.children.length !== 0) continue;
+            // Filtre bon marché avant la normalisation : appelée ~30 fois par vente sur une
+            // page de plusieurs milliers de nœuds, elle doit rester légère.
+            const raw = el.textContent;
+            if (!raw || Math.abs(raw.length - want.length) > 12) continue;
+            if (normTitle(raw) === want && !isBotOwnNode(el)) return el;
         }
         return null;
     }
+
+    // Conteneur de la modale qui porte `el` : on remonte jusqu'au premier ancêtre positionné
+    // en fixed ou marqué role="dialog". Sert à VÉRIFIER le contenu de la modale sans se faire
+    // piéger par le reste de la page (remonter jusqu'à <body> reviendrait à chercher le titre
+    // dans la grille affichée derrière, qui le contient forcément).
+    function findModalRoot(el) {
+        let node = el;
+        while (node && node !== document.body) {
+            if (node.getAttribute && node.getAttribute('role') === 'dialog') return node;
+            try {
+                if (getComputedStyle(node).position === 'fixed') return node;
+            } catch(e) {}
+            node = node.parentElement;
+        }
+        return null;
+    }
+
+    // Titre de la carte affiché dans la modale de mise en vente
+    // (<p class="font-semibold text-sm truncate">Chauchat</p>).
+    function modalCardTitle(modal) {
+        const el = modal.querySelector('p.font-semibold.text-sm.truncate');
+        const t = el && el.textContent.trim();
+        return t || null;
+    }
+
+    // Ferme une modale ouverte par erreur pour ne pas bloquer la carte suivante.
+    function dismissModal(modal) {
+        const cancel = modal && [...modal.querySelectorAll('button')]
+            .find(b => /^(Annuler|Fermer)$/i.test(b.textContent.trim()));
+        if (cancel) { cancel.click(); return; }
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    }
+    // Exclut aussi le DOM du bot : le dashboard porte des libellés qui peuvent coïncider avec
+    // ceux du site (durées « 1 h », « 30 min »…) — on ne veut cliquer QUE dans l'UI du site.
     function findButtonByText(text) {
-        return [...document.querySelectorAll('button')].find(b => b.textContent.trim() === text) || null;
+        const want = normTitle(text);
+        return [...document.querySelectorAll('button')]
+            .find(b => normTitle(b.textContent) === want && !isBotOwnNode(b)) || null;
+    }
+
+    /* Terme tapé dans la barre de recherche du site. Un titre avec apostrophe ou tiret
+       peut y être stocké sous sa forme typographique : taper la forme ASCII ne trouvait
+       alors rien (card_not_found). On tape le plus long morceau SANS ponctuation — la
+       comparaison exacte qui suit départage les homonymes éventuels. */
+    function searchTermFor(title) {
+        const t = String(title || '').trim();
+        if (!/['\u2018\u2019\u02bc"\u201c\u201d\u00ab\u00bb\u2010-\u2014\u2212-]/.test(t)) return t;
+        const best = t.split(/['\u2018\u2019\u02bc"\u201c\u201d\u00ab\u00bb\u2010-\u2014\u2212-]/)
+            .map(x => x.trim()).sort((a, b) => b.length - a.length)[0] || '';
+        return best.length >= 4 ? best : t;
     }
 
     // Sondage périodique de l'API directe : le contournement DOM est lent et dépend d'une
@@ -5266,32 +7712,94 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // pas une "mauvaise page" au sens d'une navigation manuelle de l'utilisateur ailleurs. On
     // retente donc le retour ici avant de conclure à un vrai blocage (réutilisé aussi en fin de
     // sellCardViaUI, juste après avoir cliqué "Lancer l'enchère").
+    function onCollectionPage() { return location.pathname.startsWith('/collection'); }
+
+    async function waitForCollection(ms) {
+        const deadline = Date.now() + ms;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 120));
+            if (onCollectionPage()) return true;
+        }
+        return onCollectionPage();
+    }
+
     async function ensureOnCollectionPage() {
-        if (location.pathname.startsWith('/collection')) return true;
+        if (onCollectionPage()) return true;
+
+        // 1) Retour arrière : la page de l'enchère a été EMPILÉE par-dessus /collection par le
+        //    routeur du site. C'est le chemin le plus fiable — pas de bouton à deviner, et la
+        //    page n'est pas rechargée (le bot reste en vie).
+        try { history.back(); } catch(e) {}
+        if (await waitForCollection(2500)) return true;
+
+        // 2) Bouton du site, quand il existe.
         const backBtn = findButtonByText('Retour au marché');
         if (backBtn) {
             backBtn.click();
-            for (let i = 0; i < 20; i++) {
-                await new Promise(r => setTimeout(r, 150));
-                if (location.pathname.startsWith('/collection')) return true;
-            }
+            if (await waitForCollection(2500)) return true;
         }
-        return location.pathname.startsWith('/collection');
+
+        // 3) N'importe quel lien de navigation vers la collection (navigation SPA, pas de
+        //    rechargement non plus).
+        const link = [...document.querySelectorAll('a[href]')]
+            .find(a => /^\/collection(\?|#|$)/.test(a.getAttribute('href') || '') && !isBotOwnNode(a));
+        if (link) {
+            link.click();
+            if (await waitForCollection(2500)) return true;
+        }
+
+        // 4) Dernier recours : navigation dure. Elle RECHARGE la page, donc le script repart de
+        //    zéro — on pose un marqueur horodaté pour que le Trash Seller reprenne malgré la
+        //    reprise auto désactivée. Le marqueur ne vaut que pour une navigation déclenchée
+        //    par le bot, et pour une minute : un F5 de l'utilisateur ne relance toujours rien.
+        if (trashSellerRunning || legendResellRunning) {
+            try {
+                if (legendResellRunning) sessionStorage.setItem('wm_lresell_selfnav', String(Date.now()));
+                if (trashSellerRunning) sessionStorage.setItem('wm_trashseller_selfnav', String(Date.now()));
+                wmLog('↩️ Retour forcé sur <code>/collection</code> (le site avait navigué ailleurs après la mise en vente).');
+                location.assign('/collection');
+            } catch(e) {}
+            await new Promise(r => setTimeout(r, 3000)); // la page part, on n'ira pas plus loin
+        }
+        return onCollectionPage();
+    }
+
+    // La barre de recherche de /collection n'est rendue qu'une fois les données chargées :
+    // après un retour de navigation, elle met une à deux secondes à apparaître. La chercher
+    // une seule fois produisait le `no_search_input` en rafale des logs — on l'attend.
+    const COLLECTION_SEARCH_SELECTOR = 'input[placeholder="Rechercher par titre ou catégorie..."]';
+    function findCollectionSearchInput() {
+        const exact = document.querySelector(COLLECTION_SEARCH_SELECTOR);
+        if (exact) return exact;
+        // Repli tolérant : le libellé exact du site peut changer d'une version à l'autre.
+        return [...document.querySelectorAll('input[placeholder]')]
+            .find(i => /recherch/i.test(i.getAttribute('placeholder') || '') && !isBotOwnNode(i)) || null;
+    }
+    async function waitForCollectionSearchInput(ms) {
+        const deadline = Date.now() + ms;
+        for (;;) {
+            const el = findCollectionSearchInput();
+            if (el) return el;
+            if (Date.now() >= deadline) return null;
+            await new Promise(r => setTimeout(r, 150));
+        }
     }
 
     async function sellCardViaUI(cardId, title, rarity, price, duration) {
         if (!(await ensureOnCollectionPage())) return { ok: false, reason: 'wrong_page' };
 
-        const searchInput = document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]');
+        const searchInput = await waitForCollectionSearchInput(6000);
         if (!searchInput) return { ok: false, reason: 'no_search_input' };
-        setReactInputValue(searchInput, title);
+        setReactInputValue(searchInput, searchTermFor(title));
 
         // Le filtrage du site peut prendre plus d'une seconde (debounce + requête) : on sonde
         // plutôt qu'un délai fixe, jusqu'à trouver une tuile cliquable pour ce titre. Redemande
         // findLeafByExactText à chaque tour : un match "orphelin" trouvé trop tôt (avant que le
         // rendu ne se termine) disparaît une fois les vrais résultats affichés.
+        // 8 s au lieu de 5 : sous charge (refus 403 en série), la recherche du site met
+        // parfois plus longtemps à répondre — « Argentavis » échouait puis passait 1 min après.
         let tile = null;
-        for (let i = 0; i < 20 && !tile; i++) {
+        for (let i = 0; i < 32 && !tile; i++) {
             await new Promise(r => setTimeout(r, 250));
             const titleEl = findLeafByExactText(title);
             if (!titleEl) continue;
@@ -5300,11 +7808,29 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (candidate) tile = candidate;
         }
         if (!tile) return { ok: false, reason: 'card_not_found' };
+        // Double contrôle avant le clic : la tuile résolue doit bien porter le titre attendu
+        // (un re-render React entre la recherche du titre et la remontée vers .cursor-pointer
+        // peut nous laisser un ancêtre appartenant à une AUTRE carte).
+        if (!normTitle(tile.textContent).includes(normTitle(title))) {
+            wmLog(`🛡️ Vente annulée : la tuile trouvée ne correspond pas à <b>${esc(title)}</b>`);
+            return { ok: false, reason: 'tile_mismatch' };
+        }
         tile.click();
-        await new Promise(r => setTimeout(r, 600));
 
-        const sellBtn = findButtonByText('Mettre aux enchères');
-        if (!sellBtn) return { ok: false, reason: 'no_sell_button' };
+        // La fiche de la carte s'ouvre avec un temps variable : on ATTEND le bouton (3 s)
+        // au lieu de le chercher une seule fois après 600 ms (`no_sell_button`).
+        let sellBtn = null;
+        for (let i = 0; i < 20 && !sellBtn; i++) {
+            await new Promise(r => setTimeout(r, 150));
+            sellBtn = findButtonByText('Mettre aux enchères');
+        }
+        if (!sellBtn) {
+            // Fiche ouverte sans bouton de vente (carte engagée ailleurs, etc.) : on la
+            // referme, sinon elle masquerait la grille pour la carte suivante.
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            await new Promise(r => setTimeout(r, 300));
+            return { ok: false, reason: 'no_sell_button' };
+        }
         sellBtn.click();
         await new Promise(r => setTimeout(r, 500));
 
@@ -5319,44 +7845,130 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         const launchBtn = findButtonByText("Lancer l'enchère");
         if (!launchBtn) return { ok: false, reason: 'no_launch_button' };
+
+        // 🛡️ DERNIER filet avant le clic irréversible : la modale ouverte doit afficher la carte
+        // qu'on a l'intention de vendre. Sans ce contrôle, n'importe quel décalage (grille encore
+        // en cours de filtrage, tuile recyclée par React, recherche non appliquée) se traduisait
+        // par la mise en vente d'une carte qu'on ne voulait PAS vendre — irrécupérable.
+        const modal = findModalRoot(launchBtn);
+        const shownTitle = modal && modalCardTitle(modal);
+        if (shownTitle
+            ? normTitle(shownTitle) !== normTitle(title)
+            : !(modal && normTitle(modal.textContent).includes(normTitle(title)))) {
+            wmLog(`🛡️ Vente annulée : la fenêtre affiche <b>${esc(shownTitle || '?')}</b> au lieu de <b>${esc(title)}</b>`);
+            if (modal) dismissModal(modal);
+            await new Promise(r => setTimeout(r, 300));
+            return { ok: false, reason: 'wrong_card_in_modal' };
+        }
+
         _lastUiListingAuctionId = null;
         launchBtn.click();
-        await new Promise(r => setTimeout(r, 900)); // laisse la requête + navigation vers la page de l'enchère se faire
 
-        // Sur succès, le site NAVIGUE vers la page de l'enchère créée (le bouton et toute la
-        // page collection disparaissent avec elle). Toujours présent → refusé côté site
-        // (impossible de lire le message d'erreur exact depuis ce flux, contrairement au POST).
-        if (document.body.contains(launchBtn)) return { ok: false, reason: 'modal_still_open' };
+        // Succès = le POST /api/marketplace du SITE a répondu OK (l'intercepteur remplit
+        // _lastUiListingAuctionId). C'est le seul signal fiable : juger sur la disparition du
+        // bouton dépendait du temps de démontage React et déclarait « échec » des ventes
+        // pourtant créées — elles n'étaient alors ni enregistrées ni comptées, et la carte
+        // suivante repartait sur une page qui n'était plus /collection.
+        let listedId = null, modalGoneAt = 0;
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 150));
+            if (_lastUiListingAuctionId) { listedId = _lastUiListingAuctionId; break; }
+            if (!document.body.contains(launchBtn)) {
+                // Fenêtre fermée : on laisse un délai de grâce à la réponse réseau avant de
+                // conclure sans identifiant (la vente existe, mais on ne pourra pas la suivre).
+                if (!modalGoneAt) modalGoneAt = Date.now();
+                else if (Date.now() - modalGoneAt > 2000) break;
+            }
+        }
+        if (!listedId && !modalGoneAt) {
+            // La fenêtre reste ouverte : le site affiche presque toujours POURQUOI. Le lire
+            // vaut mieux que de rendre un « modal_still_open » qui n'apprend rien — et si
+            // c'est le plafond de ventes simultanées, inutile d'enchaîner les cartes suivantes.
+            const modalTxt = (modal && modal.innerText) || '';
+            const line = (modalTxt.match(/[^\n]*(limite|maximum|simultan|atteint|impossible|erreur|insuffis)[^\n]*/i) || [])[0];
+            const capReached = /limite|maximum|simultan|atteint/i.test(line || '');
+            if (modal) dismissModal(modal);
+            await new Promise(r => setTimeout(r, 300));
+            return { ok: false, limitReached: capReached,
+                     reason: line ? line.trim().slice(0, 120) : 'modal_still_open' };
+        }
+        if (!listedId) wmLog(`⚠️ <b>${esc(title)}</b> mise en vente sans identifiant d'enchère lisible — elle ne pourra pas être suivie automatiquement.`);
 
         // Revient sur /collection (sinon la carte suivante ne retrouverait plus la barre de
         // recherche). Pas bloquant si ça échoue : la prochaine sellCardViaUI() retentera via
         // ensureOnCollectionPage() avant de conclure à un vrai blocage.
         await ensureOnCollectionPage();
 
-        const nextSearchInput = document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]');
+        const nextSearchInput = findCollectionSearchInput();
         if (nextSearchInput) setReactInputValue(nextSearchInput, ''); // nettoie pour la prochaine carte
 
-        return { ok: true, auctionId: _lastUiListingAuctionId };
+        return { ok: true, auctionId: listedId };
     }
+
+    // Au-delà de ce nombre d'échecs D'AFFILÉE, on arrête le lot : les logs du 27/09 montrent
+    // 50 minutes d'échecs en rafale (le site refusait tout, plafond déjà plein). Enchaîner
+    // n'aidait pas et alimentait la protection anti-bot du site.
+    const SELL_MAX_CONSECUTIVE_FAILURES = 3;
 
     async function sellBatch(cards, statusEl) {
         let sold = 0, skipped = 0, deferred = 0;
+        let consecutiveFailures = 0;
+        let aborted = false;      // lot coupé sur échecs en rafale → pause avant de réessayer
         let limitReached = false; // 409 « plafond serveur atteint » → inutile d'insister
         for (const item of cards) {
             if (limitReached) { skipped++; continue; }
+            // Pause anti-bot : la mise en vente par l'interface passe par les requêtes du SITE
+            // (non retenues par fetch du bot) — on attend donc ici la fin de la pause.
+            await waitBotNetResume();
             const rarity = (item.card_id ? (item.card?.rarity || "C") : "C").toUpperCase();
             const cardId = item.card_id || item.card?.id;
             const duration = getSellDuration(rarity);
             const title = item.card?.wikipedia_title || item.wikipedia_title || '?';
-            if (!cardId) { skipped++; wmLog(`⚠️ Carte ignorée (ID manquant) : ${title}`); continue; }
+            if (!cardId) { skipped++; wmLog(`⚠️ Carte ignorée (ID manquant) : ${esc(title)}`); continue; }
 
-            // Prix de base : marché (moyenne × %) si activé & historique dispo, sinon tableau
-            const priceInfo = await resolveSellBasePrice(rarity, cardId);
+            // 👑 Revente Légendaire : son propre prix (moyenne L, plancher payé + marge), et
+            // pas d'undercut — il ferait passer sous le plancher.
+            const lr = item._legendResell || null;
+            let priceInfo;
+            if (lr) {
+                priceInfo = await resolveLegendResellPrice(lr);
+                if (priceInfo.skip) {
+                    skipped++;
+                    lr.checkedAt = Date.now();
+                    if (priceInfo.reason === 'no_cote') {
+                        lr.status = 'no_cote';
+                        if (!lr.noCoteLogged) {
+                            lr.noCoteLogged = true;
+                            wmLog(`👑 Revente Légendaire : <b>${esc(title)}</b> n'a aucune vente connue en ${esc(rarity)} — pas mise en vente (recontrôle toutes les heures).`);
+                        }
+                    } else {
+                        lr.retryAt = Date.now() + 5 * 60 * 1000;
+                        wmLog(`👑 Revente Légendaire : cote de <b>${esc(title)}</b> illisible (refus du site) — nouvel essai dans 5 min.`);
+                    }
+                    saveLegendResell();
+                    renderLegendResell();
+                    continue;
+                }
+            } else {
+                // Cote inconnue et lecture impossible pour l'instant (pause imposée par le site) :
+                // on reporte la carte au lieu de la vendre au prix minimum du tableau.
+                if (getSetting('sellUseMarketPrice') && !getCachedSales(cardId) && Date.now() < salesEndpointCooldownUntil) {
+                    skipped++;
+                    if (Date.now() - (sellBatch._pauseLogTs || 0) > 60000) {
+                        sellBatch._pauseLogTs = Date.now();
+                        wmLog(`⏸️ Cote de <b>${esc(title)}</b> illisible pour l'instant (le site a mis les cotes en pause) — mise en vente reportée plutôt qu'au prix minimum.`);
+                    }
+                    continue;
+                }
+                // Prix de base : marché (moyenne × %) si activé & historique dispo, sinon tableau
+                priceInfo = await resolveSellBasePrice(rarity, cardId);
+            }
             let price = priceInfo.price;
 
             // Undercut : si une annonce active existe déjà pour cette carte, se placer juste en
             // dessous de la plus basse (−1) pour vendre plus vite. Uniquement si ça BAISSE le prix.
-            if (getSetting('sellUndercutMarket')) {
+            if (!lr && getSetting('sellUndercutMarket')) {
                 const lowest = await fetchLowestActiveListing(cardId);
                 if (lowest != null && (lowest - 1) < price) {
                     priceInfo.undercut = { from: price, market: lowest };
@@ -5403,14 +8015,45 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 while (attempt <= MAX_ATTEMPTS) {
                     result = await sellCardViaUI(cardId, title, rarity, price, duration);
                     if (result.ok) { success = true; break; }
+                    if (result.limitReached) break;   // plafond côté site : insister ne sert à rien
                     if (result.reason === 'wrong_page' || attempt === MAX_ATTEMPTS) break;
-                    wmLog(`⚠️ Mise en vente <b>${title}</b> échouée (${result.reason}), retry ${attempt}/${MAX_ATTEMPTS-1}…`);
+                    wmLog(`⚠️ Mise en vente <b>${esc(title)}</b> échouée (${esc(result.reason)}), retry ${attempt}/${MAX_ATTEMPTS-1}…`);
                     await new Promise(r => setTimeout(r, 1500));
                     attempt++;
                 }
             }
 
-            if (success) {
+            if (result && result.limitReached) {
+                // Le site dit lui-même que le plafond est atteint : on arrête le lot ici.
+                // Le décompte des créneaux repartira au prochain passage.
+                limitReached = true;
+                skipped++;
+                wmLog(`🛑 Plafond de ventes atteint côté site (<span style="color:#888;font-size:9px;">${esc(result.reason)}</span>) — lot interrompu, reprise au prochain créneau libre.`);
+                continue;
+            }
+
+            if (success && lr) {
+                consecutiveFailures = 0;
+                sold++;
+                lr.status = 'listed';
+                lr.listedAuctionId = result.auctionId || null;
+                lr.listedPrice = price;
+                lr.listedAt = Date.now();
+                lr.listedDuration = duration;
+                lr.listings = (lr.listings || 0) + 1;
+                lr.noCoteLogged = false;
+                saveLegendResell();
+                renderLegendResell();
+                recordSale(item, price, 'pending', result.auctionId || null);
+                invalidateSalesDetail();
+                const dec = priceInfo.decay ? ` · 📉 -${priceInfo.decay.totalPct} % après ${priceInfo.decay.unsold} invendu(s)` : '';
+                wmLog(priceInfo.manual
+                    ? `👑 Revente Légendaire : <b>${esc(title)}</b> mise en vente ${price} 💰 <span style="color:#888;font-size:9px;">(✋ prix manuel · payée ${lr.paid} 💰)</span>`
+                    : `👑 Revente Légendaire : <b>${esc(title)}</b> mise en vente ${price} 💰 <span style="color:#888;font-size:9px;">(${priceInfo.floored
+                    ? `🛡️ moy. ${esc(rarity)} ${priceInfo.avg} 💰${dec} → plancher ${priceInfo.floor} 💰`
+                    : `💹 moy. ${esc(rarity)} ${priceInfo.avg} 💰${dec} · plancher ${priceInfo.floor} 💰`} · payée ${lr.paid} 💰)</span>`);
+            } else if (success) {
+                consecutiveFailures = 0;
                 sold++;
                 incrementListedCount(cardId); // couverture équitable du pool Trash
                 removeFromTrashPoolCache(cardId); // vendue → sort du pool incrémental
@@ -5423,23 +8066,36 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         ? ` <span style="color:#fbbf24;font-size:9px;">(🛡️ plancher tableau ${priceInfo.floor} 💰 · moy. marché ${priceInfo.avg} 💰)</span>`
                         : ` <span style="color:#4ade80;font-size:9px;">(💹 ${priceInfo.pct}% de la moy. ${priceInfo.avg} 💰)</span>`)
                     : '';
-                const degrTag = priceInfo.degressive
-                    ? ` <span style="color:#f97316;font-size:9px;">(📉 -${priceInfo.degressive.discountPct}% invendus 🔁${priceInfo.degressive.retag} · avant ${priceInfo.degressive.before} 💰)</span>`
-                    : '';
+                const degrTag = (priceInfo.degressive
+                    ? ` <span style="color:#f97316;font-size:9px;">(📉 -${priceInfo.degressive.discountPct}% après ${priceInfo.degressive.retag} invendu(s) · avant ${priceInfo.degressive.before} 💰)</span>`
+                    : '')
+                    + (priceInfo.floorLifted
+                    ? ` <span style="color:#22d3ee;font-size:9px;">(🔓 plancher ${priceInfo.floorLifted.floor} 💰 levé après ${priceInfo.floorLifted.after} invendus)</span>`
+                    : '');
                 const underTag = priceInfo.undercut
                     ? ` <span style="color:#22d3ee;font-size:9px;">(🃏 undercut : marché ${priceInfo.undercut.market} 💰)</span>`
                     : '';
-                wmLog(`🏷️ Mis en vente : <b>${title}</b> [${rarity}] · base ${price} 💰${priceSrc}${degrTag}${underTag}${retagTag}`);
+                wmLog(`🏷️ Mis en vente : <b>${esc(title)}</b> [${rarity}] · base ${price} 💰${priceSrc}${degrTag}${underTag}${retagTag}`);
             } else if (result && result.reason === 'wrong_page') {
                 skipped++;
                 wmLog(`⚠️ <b>Trash Seller en pause</b> — reste sur <code>/collection</code> pour que la mise en vente automatique fonctionne (elle simule un clic sur tes cartes).`);
                 break; // toutes les cartes suivantes échoueraient pour la même raison
             } else {
                 skipped++;
-                wmLog(`❌ Échec mise en vente : <b>${title}</b> [${rarity}] · <span style="color:#888;font-size:9px;">${result ? result.reason : '?'}</span>`);
+                consecutiveFailures++;
+                if (lr) { lr.retryAt = Date.now() + 2 * 60 * 1000; saveLegendResell(); }
+                wmLog(`❌ Échec mise en vente : <b>${esc(title)}</b> [${rarity}] · <span style="color:#888;font-size:9px;">${esc(result ? result.reason : '?')}</span>`);
+                if (consecutiveFailures >= SELL_MAX_CONSECUTIVE_FAILURES) {
+                    aborted = true;
+                    wmLog(`⏸️ <b>${consecutiveFailures} échecs d'affilée</b> — lot interrompu. Le Trash Seller recomptera les ventes actives avant de réessayer.`);
+                    break;
+                }
             }
         }
-        return { sold, skipped, deferred, limitReached };
+        // Quoi qu'il se soit passé (succès, plafond, délai dépassé alors que le site a peut-
+        // être créé la vente), l'état lu avant ce lot n'est plus fiable.
+        invalidateSalesDetail();
+        return { sold, skipped, deferred, limitReached, aborted };
     }
 
     /* ══════════ TEST : ciblage d'exemplaire précis à la mise en vente ══════════
@@ -5510,7 +8166,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             wmLog(`🧪 Test ciblage : aucun cas trouvé (il faut un exemplaire taggué Trash avec un doublon plus ancien non-taggué du même card_id). Rien tenté, aucun risque.`);
             return;
         }
-        wmLog(`🧪 Cas trouvé : <b>${candidate.title}</b> — exemplaire taggué ${candidate.taggedId.slice(0,8)}… (${candidate.taggedCreated}) vs plus ancien ${candidate.oldId.slice(0,8)}… (${candidate.oldCreated}).`);
+        wmLog(`🧪 Cas trouvé : <b>${esc(candidate.title)}</b> — exemplaire taggué ${candidate.taggedId.slice(0,8)}… (${candidate.taggedCreated}) vs plus ancien ${candidate.oldId.slice(0,8)}… (${candidate.oldCreated}).`);
 
         // 3) Snapshot AVANT : mes exemplaires de ce card_id encore possédés.
         const before = await supabaseSelect(`user_cards?card_id=eq.${candidate.cardId}&user_id=eq.${uid}&select=id`);
@@ -5532,13 +8188,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
-                wmLog(`🧪 Test ciblage : mise en vente refusée · HTTP ${res.status} ${data?.error || ''}. Le paramètre supplémentaire fait peut-être planter la requête (schéma strict) — à noter. Aucune vente créée.`);
+                wmLog(`🧪 Test ciblage : mise en vente refusée · HTTP ${res.status} ${esc(data?.error || '')}. Le paramètre supplémentaire fait peut-être planter la requête (schéma strict) — à noter. Aucune vente créée.`);
                 return;
             }
             auctionId = data.auction_id || null;
             wmLog(`🧪 Vente créée${auctionId ? ' (' + auctionId.slice(0,8) + '…)' : ''} — vérification en base dans 3s…`);
         } catch(e) {
-            wmLog(`🧪 Test ciblage : exception réseau à la mise en vente — ${e.message}. Aucune vente créée.`);
+            wmLog(`🧪 Test ciblage : exception réseau à la mise en vente — ${esc(e.message)}. Aucune vente créée.`);
             return;
         }
 
@@ -5563,7 +8219,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             wmLog(`🧪 <b style="color:#ef4444;">RÉSULTAT : ÇA NE MARCHE PAS.</b> Le site a quand même consommé le doublon plus ancien (non-taggué) — le paramètre est ignoré. Annulation immédiate de la vente pour te rendre ta carte…`);
             if (auctionId) {
                 await cancelSale(auctionId, candidate.title, null);
-                wmLog(`🧪 Vente annulée : <b>${candidate.title}</b> restituée (si aucune mise n'a été placée entre-temps — vérifie le log d'annulation ci-dessus).`);
+                wmLog(`🧪 Vente annulée : <b>${esc(candidate.title)}</b> restituée (si aucune mise n'a été placée entre-temps — vérifie le log d'annulation ci-dessus).`);
             } else {
                 wmLog(`🧪 Impossible d'annuler automatiquement (id d'enchère non reçu à la création) — vérifie et annule manuellement sur le site si besoin.`);
             }
@@ -5606,10 +8262,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (!r1.ok) { wmLog(`🧪 Catalogue (cards) : <b style="color:#ef4444;">HTTP ${r1.status}</b> — ${r1.body}`); return; }
         const cardRows = r1.data;
         if (!Array.isArray(cardRows) || cardRows.length === 0) {
-            wmLog(`🧪 Catalogue (cards) : aucune ligne pour "${title}" — vérifie l'orthographe exacte (accents, ponctuation).`);
+            wmLog(`🧪 Catalogue (cards) : aucune ligne pour "${esc(title)}" — vérifie l'orthographe exacte (accents, ponctuation).`);
             return;
         }
-        wmLog(`🧪 Catalogue (cards) pour "${title}" : <b>${cardRows.length}</b> ligne(s) → ${cardRows.map(c => `${c.id} [${c.rarity}]`).join(' · ')}`);
+        wmLog(`🧪 Catalogue (cards) pour "${esc(title)}" : <b>${cardRows.length}</b> ligne(s) → ${cardRows.map(c => `${c.id} [${c.rarity}]`).join(' · ')}`);
 
         for (const c of cardRows) {
             const r2 = await supabaseSelectDebug(`user_cards?card_id=eq.${c.id}&user_id=eq.${uid}&select=id`);
@@ -5622,7 +8278,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!r3.ok) {
                 wmLog(`🧪 Ancien card_id <b>${staleCardId}</b> : <b style="color:#ef4444;">HTTP ${r3.status}</b> — ${r3.body}`);
             } else if (Array.isArray(r3.data) && r3.data.length > 0) {
-                wmLog(`🧪 Ancien card_id <b>${staleCardId}</b> : existe encore dans cards → "${r3.data[0].wikipedia_title}" [${r3.data[0].rarity}]`);
+                wmLog(`🧪 Ancien card_id <b>${staleCardId}</b> : existe encore dans cards → "${esc(r3.data[0].wikipedia_title)}" [${r3.data[0].rarity}]`);
             } else {
                 wmLog(`🧪 Ancien card_id <b>${staleCardId}</b> : <b style="color:#ef4444;">n'existe plus</b> dans la table cards (ligne supprimée/remplacée).`);
             }
@@ -5640,7 +8296,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const r = await supabaseSelectDebug(`cards?id=eq.${cardId}&select=wikipedia_title,rarity`);
         if (!r.ok) { wmLog(`🧪 wmCardTitle : <b style="color:#ef4444;">HTTP ${r.status}</b> — ${r.body}`); return; }
         if (Array.isArray(r.data) && r.data.length > 0) {
-            wmLog(`🧪 ${cardId} → <b>${r.data[0].wikipedia_title}</b> [${r.data[0].rarity}]`);
+            wmLog(`🧪 ${cardId} → <b>${esc(r.data[0].wikipedia_title)}</b> [${r.data[0].rarity}]`);
         } else {
             wmLog(`🧪 ${cardId} → aucune ligne dans cards (id inexistant/supprimé).`);
         }
@@ -5673,7 +8329,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const body = await res.text();
             wmLog(`🧪 POST marketplace après précurseur : ${res.ok ? `<b style="color:#4ade80;">${res.status} — ${body}</b>` : `<b style="color:#ef4444;">${res.status} — ${body}</b>`}`);
         } catch(e) {
-            wmLog(`🧪 POST marketplace : exception — ${e.message}`);
+            wmLog(`🧪 POST marketplace : exception — ${esc(e.message)}`);
         }
     };
 
@@ -5687,7 +8343,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // les ex æquo, puis trié. Retourne les `slots` premières. Async : la stratégie
     // « value » récupère les prix marché manquants avant de trier.
     async function selectTrashBatch(trashCards, slots) {
-        const shuffled = [...trashCards];
+        // Point de passage commun (vente, aperçu, refresh) : une carte mise de côté n'est
+        // jamais sélectionnée, quel que soit le chemin.
+        const shuffled = trashCards.filter(c => {
+            const id = c.card_id || c.card?.id;
+            return !isSetAside(id, c.card?.wikipedia_title, c.card?.rarity || c.rarity);
+        });
         for (let i = shuffled.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
@@ -5716,7 +8377,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const CONC = 4;
                 for (let i = 0; i < toFetch.length; i += CONC) {
                     const grp = toFetch.slice(i, i + CONC);
-                    await Promise.all(grp.map(c => fetchCardSales(cardIdOf(c)).catch(() => null)));
+                    await Promise.all(grp.map(c => fetchCardSales(cardIdOf(c), { priority: SALES_PRIO.normal }).catch(() => null)));
                     if (i + CONC < toFetch.length) await new Promise(r => setTimeout(r, 200 + Math.random() * 200));
                 }
             }
@@ -5731,6 +8392,308 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return shuffled.slice(0, Math.max(0, slots));
     }
 
+    /* ═══════ 💎 CARTES LES PLUS CHÈRES (ma collection) ═══════
+       Demande du 30/09 : un bouton qui charge la cote de toutes mes cartes et les classe de la
+       plus chère à la moins chère. Choix de l'utilisateur : ma collection, top 50 + valeur
+       totale, filtre par rareté, cartes sans cote comptées à part.
+       Cote = celle de la surcouche Collection : la moyenne `?scope=summary` que le site donne
+       à tous, pour la rareté de MON exemplaire. Une requête par carte, cache partagé (le
+       2e calcul est quasi immédiat). Si le site freine (403/429), on attend la fin de la pause
+       et on reprend, plutôt que d'insister. */
+    let topCardsRunning = false, topCardsStop = false, topCardsResult = null, topCardsRarity = 'ALL';
+    const TOP_CARDS_SHOWN = 50;
+    const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // Toute la collection (exemplaires), page par page. null si arrêté.
+    async function fetchAllCollectionItems(onProgress, shouldAbort) {
+        const limit = 50;
+        const url = (p) => `https://www.wiki-masters.com/api/my-collection?page=${p}&limit=${limit}&sort=rarity&pending=1`;
+        const getPage = async (p) => {
+            for (let i = 0; i < 3; i++) {
+                if (shouldAbort()) return null;
+                try {
+                    const r = await fetch(url(p), { credentials: 'include' });
+                    if (r.ok) {
+                        const d = await r.json();
+                        return { items: d.collection || [], total: parseInt(d.total, 10) };
+                    }
+                } catch (e) {}
+                await sleepMs(600 * (i + 1));
+            }
+            return null;
+        };
+        const first = await getPage(0);
+        if (!first) { if (shouldAbort()) return null; throw new Error('collection illisible'); }
+        const items = first.items.slice();
+        const total = Number.isFinite(first.total) && first.total > 0 ? first.total : null;
+        const pages = total ? Math.ceil(total / limit) : null;
+        if (onProgress) onProgress(items.length, total);
+        if (first.items.length >= limit) {
+            let p = 1, end = false;
+            const failed = [];
+            while (!end && (pages ? p < pages : p < 2000)) {
+                if (shouldAbort()) return null;
+                const batch = [];
+                for (let i = 0; i < 6 && (pages ? p < pages : true); i++) batch.push(p++);
+                const res = await Promise.all(batch.map(getPage));
+                res.forEach((r, i) => {
+                    if (!r) { failed.push(batch[i]); return; }
+                    items.push(...r.items);
+                    if (!pages && r.items.length < limit) end = true;
+                });
+                if (onProgress) onProgress(items.length, total);
+                await sleepMs(120);
+            }
+            for (const fp of failed) {           // 2e essai des pages refusées
+                if (shouldAbort()) return null;
+                const r = await getPage(fp);
+                if (r) items.push(...r.items);
+            }
+        }
+        return items;
+    }
+
+    async function computeTopCards(onStatus) {
+        const say = onStatus || (() => {});
+        say('📚 Lecture de la collection…');
+        const items = await fetchAllCollectionItems((n, total) => {
+            say(`📚 Lecture de la collection… ${n.toLocaleString('fr-FR')}${total ? ' / ' + total.toLocaleString('fr-FR') : ''} cartes`);
+        }, () => topCardsStop);
+        if (!items) return null;
+
+        // Une ligne par carte ET par rareté : deux exemplaires de raretés différentes n'ont
+        // pas la même cote.
+        const byKey = new Map();
+        for (const it of items) {
+            const id = it.card_id || it.card?.id;
+            if (!id) continue;
+            const rar = String(it.card?.rarity || it.rarity || '').toUpperCase() || '?';
+            const k = id + '|' + rar;
+            const e = byKey.get(k) || { cardId: id, title: it.card?.wikipedia_title || it.wikipedia_title || '?', rarity: rar, count: 0 };
+            e.count += Math.max(1, Number(it.count) || 1);
+            byKey.set(k, e);
+        }
+        const rows = [...byKey.values()];
+        const ids = [...new Set(rows.map(r => r.cardId))];
+        const queue = ids.filter(id => !getCachedSales(id));
+        let done = ids.length - queue.length, retried = false;
+        const failed = [];
+        while (queue.length && !topCardsStop) {
+            const wait = salesEndpointCooldownUntil - Date.now();
+            if (wait > 0) {
+                say(`🐢 Le site freine les cotes — reprise dans ${Math.ceil(wait / 1000)} s (${done}/${ids.length})…`);
+                await sleepMs(Math.min(1000, wait));
+                continue;
+            }
+            const grp = queue.splice(0, 5);
+            const res = await Promise.all(grp.map(id => fetchCardSales(id, { priority: SALES_PRIO.normal }).catch(() => null)));
+            res.forEach((r, i) => { if (r) done++; else failed.push(grp[i]); });
+            say(`💹 Cotes : ${done.toLocaleString('fr-FR')} / ${ids.length.toLocaleString('fr-FR')}…`);
+            await sleepMs(200);
+            if (!queue.length && failed.length && !retried) { retried = true; queue.push(...failed.splice(0)); }
+        }
+
+        const rated = [];
+        let noCote = 0, unreadable = 0;
+        for (const r of rows) {
+            const entry = getCachedSales(r.cardId);
+            if (!entry) { unreadable += r.count; continue; }
+            const cote = entry.byRarity ? entry.byRarity[r.rarity] : (entry.count > 0 ? entry.avg : null);
+            if (Number.isFinite(cote) && cote > 0) rated.push({ ...r, cote, value: cote * r.count });
+            else noCote += r.count;
+        }
+        rated.sort((a, b) => b.cote - a.cote || b.value - a.value);
+        return { rated, noCote, unreadable, partial: topCardsStop,
+                 cards: rows.reduce((s, r) => s + r.count, 0), at: Date.now() };
+    }
+
+    function renderTopCards() {
+        const el = document.getElementById('wm-top-result');
+        if (!el) return;
+        const d = topCardsResult;
+        if (!d) { el.innerHTML = '<div style="color:#555;font-size:10px;font-style:italic;">Clique « 💎 Calculer » : le bot lit ta collection et la cote de chaque carte (quelques minutes la première fois).</div>'; return; }
+        const rars = ['ALL', 'L', 'UR', 'SR', 'R', 'PC', 'C'];
+        const list = topCardsRarity === 'ALL' ? d.rated : d.rated.filter(r => r.rarity === topCardsRarity);
+        const sum = (arr) => arr.reduce((s, r) => s + r.value, 0);
+        const pills = rars.map(r => {
+            const on = r === topCardsRarity;
+            const c = r === 'ALL' ? '#ccc' : (RARITY[r] || { color: '#888' }).color;
+            const n = r === 'ALL' ? d.rated.length : d.rated.filter(x => x.rarity === r).length;
+            return `<button data-wm-top-rar="${r}" style="font-size:9px;padding:1px 7px;border-radius:4px;cursor:pointer;border:1px solid ${on ? c : 'rgba(255,255,255,0.12)'};background:${on ? 'rgba(255,255,255,0.08)' : 'none'};color:${c};font-weight:${on ? 700 : 400};">${r === 'ALL' ? 'Toutes' : r} <span style="color:#666;">${n}</span></button>`;
+        }).join('');
+        const rows = list.slice(0, TOP_CARDS_SHOWN).map((r, i) => {
+            const rc = RARITY[r.rarity] || { color: '#888' };
+            return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;">
+                <span style="color:#555;min-width:18px;text-align:right;font-family:'JetBrains Mono',monospace;">${i + 1}</span>
+                <span style="color:${rc.color};font-weight:700;min-width:22px;">${esc(r.rarity)}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;" title="${esc(r.title)}">${esc(r.title)}${r.count > 1 ? ` <span style="color:#888;">×${r.count}</span>` : ''}</span>
+                <span style="color:#fbbf24;font-weight:700;white-space:nowrap;min-width:52px;text-align:right;" title="Cote moyenne du marché en ${esc(r.rarity)}">${r.cote.toLocaleString('fr-FR')} 💰</span>
+                ${r.count > 1 ? `<span style="color:#888;white-space:nowrap;font-size:9px;" title="${r.count} exemplaires">= ${r.value.toLocaleString('fr-FR')}</span>` : ''}
+            </div>`;
+        }).join('');
+        const when = new Date(d.at).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        el.innerHTML = `
+            <div style="font-size:10px;color:#aaa;margin-bottom:4px;">
+                Valeur totale estimée : <b style="color:#fbbf24;">${sum(d.rated).toLocaleString('fr-FR')} 💰</b>
+                <span style="color:#666;">· ${d.rated.reduce((s, r) => s + r.count, 0).toLocaleString('fr-FR')} carte(s) cotée(s) sur ${d.cards.toLocaleString('fr-FR')}</span>
+                ${topCardsRarity !== 'ALL' ? `<br>En ${esc(topCardsRarity)} : <b style="color:#fbbf24;">${sum(list).toLocaleString('fr-FR')} 💰</b>` : ''}
+            </div>
+            <div style="font-size:9px;color:#666;margin-bottom:6px;">
+                ${d.noCote ? `📋 ${d.noCote.toLocaleString('fr-FR')} carte(s) sans cote (jamais vendues dans leur rareté) — hors classement` : 'Toutes les cartes ont une cote'}${d.unreadable ? ` · ⚠️ ${d.unreadable} cote(s) illisible(s) (refus du site) — relance plus tard` : ''}${d.partial ? ' · ⏹ calcul arrêté avant la fin' : ''} · calculé à ${when}
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">${pills}</div>
+            ${rows || '<div style="color:#555;font-size:10px;">Aucune carte cotée dans cette rareté.</div>'}
+            ${list.length > TOP_CARDS_SHOWN ? `<div style="font-size:9px;color:#555;margin-top:3px;">… ${list.length - TOP_CARDS_SHOWN} autre(s), moins chère(s)</div>` : ''}`;
+        el.querySelectorAll('[data-wm-top-rar]').forEach(b => {
+            b.onclick = () => { topCardsRarity = b.getAttribute('data-wm-top-rar'); renderTopCards(); };
+        });
+    }
+
+    async function runTopCards(btn) {
+        const status = document.getElementById('wm-top-status');
+        const say = (t) => { if (status) status.innerHTML = t; };
+        if (topCardsRunning) { topCardsStop = true; say('⏹ Arrêt demandé…'); return; }
+        topCardsRunning = true;
+        topCardsStop = false;
+        if (btn) { btn.innerText = '⏹ Arrêter'; }
+        try {
+            const r = await computeTopCards(say);
+            if (r) {
+                topCardsResult = r;
+                say(r.partial ? '⏹ Arrêté — résultat partiel.' : '✔ Terminé.');
+                wmLog(`💎 Cartes les plus chères : ${r.rated.length} carte(s) cotée(s), valeur totale ${r.rated.reduce((s, x) => s + x.value, 0).toLocaleString('fr-FR')} 💰${r.noCote ? ` · ${r.noCote} sans cote` : ''}.`);
+            } else {
+                say('⏹ Arrêté.');
+            }
+        } catch (e) {
+            say(`<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`);
+        } finally {
+            topCardsRunning = false;
+            topCardsStop = false;
+            if (btn) btn.innerText = '💎 Calculer';
+            renderTopCards();
+        }
+    }
+    window.wmTopCards = () => topCardsResult;
+
+    /* ═══════ APERÇU DE L'ORDRE DE VENTE ═══════
+       Montre, SANS rien vendre, ce que le Trash Seller ferait s'il partait maintenant :
+       quelles cartes, dans quel ordre, à quel prix et pour combien de temps.
+
+       Réutilise `selectTrashBatch()` et `resolveSellBasePrice()` — les fonctions du vrai
+       parcours de vente, pas une réimplémentation. Un aperçu qui calculerait le prix
+       autrement que la vente elle-même serait pire qu'aucun aperçu : il donnerait
+       confiance dans un chiffre faux. Seule différence assumée : rien n'est envoyé. */
+    async function buildSalePreview() {
+        const pool = await getTrashPool(null, { force: true });
+        if (!Array.isArray(pool) || pool.length === 0) return { rows: [], poolSize: 0, slots: 0 };
+
+        // Mêmes créneaux que la vente réelle : plafond de ventes simultanées moins
+        // celles déjà en cours.
+        // Même source que la vente réelle : le COMPTEUR serveur fait autorité (le site ne
+        // détaille plus la liste des ventes actives, donc sa longueur vaut 0 alors que des
+        // ventes tournent — l'aperçu annonçait alors des créneaux libres qui n'existaient pas).
+        const state = await fetchSellingState().catch(() => null);
+        const maxActive = Math.max(1, effectiveMaxActive(state && state.max));
+        const active = state && Number.isFinite(state.count)
+            ? state.count
+            : (Array.isArray(lastActiveSales) ? lastActiveSales.length : 0);
+        const slots = Math.max(0, maxActive - active);
+
+        // Tout le pool, dans l'ordre réel de passage — c'est la question à laquelle l'aperçu
+        // doit répondre (« lesquelles vont être vendues, dans quel sens »). N'afficher que la
+        // prochaine fournée revenait à montrer 1 ligne sur 8 dès que les créneaux étaient pleins.
+        const ordered = await selectTrashBatch(pool, pool.length);
+        // La cote se lit carte par carte : on borne pour ne pas lancer 300 requêtes sur un
+        // gros pool. Au-delà, on annonce le reste sans prix.
+        const PREVIEW_MAX = 60;
+        const batch = ordered.slice(0, PREVIEW_MAX);
+        const rows = [];
+        for (const item of batch) {
+            const cardId = item.card_id || item.card?.id;
+            const title = item.card?.wikipedia_title || item.title || '?';
+            const rarity = (item.card?.rarity || item.rarity || 'C').toUpperCase();
+            const info = await resolveSellBasePrice(rarity, cardId);
+            rows.push({ title, rarity, price: info.price, info, duration: getSellDuration(rarity) });
+        }
+        return { rows, poolSize: pool.length, slots, active, maxActive,
+                 truncated: Math.max(0, ordered.length - batch.length) };
+    }
+
+    function renderSalePreview(data) {
+        const el = document.getElementById('wm-sale-preview');
+        if (!el) return;
+        if (!data || !data.rows.length) {
+            el.innerHTML = `<div style="color:#555;font-size:10px;font-style:italic;padding:3px 0;">
+                Aucune carte à vendre : le pool est vide (aucune carte étiquetée « ${esc(getSellTagName())} »).</div>`;
+            return;
+        }
+        const fmtDur = (m) => m >= 60 ? `${Math.round(m / 60)} h` : `${m} min`;
+        const rows = data.rows.map((r, i) => {
+            const rc = RARITY[r.rarity] || { color: '#888' };
+            const now = i < (data.slots || 0); // part à la prochaine passe
+            // D'où vient le prix : c'est l'information la plus utile de l'aperçu.
+            const pctNote = r.info.pct !== undefined && r.info.pct !== 100
+                ? ` × ${r.info.pct} % → ${r.info.marketPrice} 💰` : '';
+            const triesNote = r.info.floorTriesLeft != null
+                ? ` Le plancher s'applique encore ${r.info.floorTriesLeft} fois, puis la carte partira au prix du marché.` : '';
+            const src = r.info.floorLifted
+                ? `<span style="color:#22d3ee;" title="Invendue ${r.info.floorLifted.after} fois au minimum de ${r.info.floorLifted.floor} 💰 : le plancher est levé, on laisse le marché décider.">🔓 plancher levé${r.info.source === 'market' ? ` · marché ${r.info.marketPrice}` : ''}</span>`
+                : r.info.source === 'market'
+                ? (r.info.floored
+                    // On affiche les DEUX chiffres : la cote trouvée, et le minimum qui la
+                    // remplace. Sans ça « plancher » se lit comme « aucune cote trouvée ».
+                    ? `<span style="color:#fbbf24;" title="Cote du marché en ${r.rarity} : ${r.info.avg} 💰 (sur ${r.info.count} vente(s))${pctNote}. C'est sous ton minimum de ${r.info.floor} 💰 pour cette rareté → on vend au minimum.${triesNote}">🛡️ marché ${r.info.marketPrice} → min ${r.info.floor}${r.info.floorTriesLeft != null ? ` (${r.info.floorTriesLeft}×)` : ''}</span>`
+                    : `<span style="color:#4ade80;" title="Cote du marché en ${r.rarity} : ${r.info.avg} 💰, sur ${r.info.count} vente(s)${pctNote}. Au-dessus de ton minimum de ${r.info.floor} 💰 → on vend au prix du marché.">💹 marché ${r.info.avg}</span>`)
+                : `<span style="color:#888;" title="Aucune cote connue pour cette carte en ${r.rarity} — on applique le minimum du tableau par rareté.">📋 pas de cote → min</span>`;
+            const degr = r.info.degressive
+                ? ` <span style="color:#f97316;" title="Invendue ${r.info.degressive.retag} fois : -${r.info.degressive.discountPct} % (avant ${r.info.degressive.before} 💰)">📉-${r.info.degressive.discountPct}%</span>`
+                : '';
+            return `<div style="display:flex;align-items:center;gap:6px;padding:2px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;${now ? 'background:rgba(74,222,128,0.06);' : ''}">
+                <span style="color:${now ? '#4ade80' : '#555'};min-width:14px;text-align:right;font-family:'JetBrains Mono',monospace;"
+                    title="${now ? 'Part à la prochaine passe' : 'En attente d\'un créneau libre'}">${i + 1}</span>
+                <span style="color:${rc.color};font-weight:700;min-width:22px;">${r.rarity}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;" title="${esc(r.title)}">${esc(r.title)}</span>
+                <span style="font-size:9px;white-space:nowrap;">${src}${degr}</span>
+                <span style="color:#fbbf24;font-weight:700;white-space:nowrap;min-width:46px;text-align:right;">${r.price.toLocaleString('fr-FR')} 💰</span>
+                <span style="color:#888;white-space:nowrap;min-width:38px;text-align:right;">${fmtDur(r.duration)}</span>
+            </div>`;
+        }).join('');
+        const total = data.rows.reduce((s, r) => s + r.price, 0);
+        const marketPct = getSetting('sellMarketPricePct');
+        el.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;color:#5dade2;
+                text-transform:uppercase;letter-spacing:1px;margin:2px 0 3px;">
+                <span>👁️ Ordre de vente — aperçu</span>
+                <button id="wm-preview-close" title="Fermer l'aperçu"
+                    style="background:none;border:none;color:#666;cursor:pointer;font-size:12px;line-height:1;padding:0 2px;">×</button>
+            </div>
+            <div style="font-size:9px;color:#666;margin-bottom:3px;">
+                ${data.poolSize} carte(s) dans le pool · ${data.rows.length} affichée(s)${data.truncated ? ` (+${data.truncated} sans prix)` : ''}${Object.keys(setAsideCards).length ? ` · 🗃️ ${Object.keys(setAsideCards).length} mise(s) de côté` : ''} ·
+                <b style="color:#4ade80;">${data.slots}</b> partiront tout de suite
+                (${data.active}/${data.maxActive} ventes en cours) ·
+                stratégie « ${esc(getSetting('trashSellStrategy'))} » · total <b style="color:#fbbf24;">${total.toLocaleString('fr-FR')} 💰</b>
+            </div>
+            <div style="font-size:9px;color:#666;margin-bottom:3px;">
+                Les <b>${data.slots || 0}</b> premières lignes partent dès qu'un créneau se libère ; les suivantes
+                attendent leur tour, dans cet ordre.
+            </div>
+            ${marketPct !== 100 ? `<div style="font-size:9px;color:#fbbf24;margin-bottom:3px;">
+                ⚠️ Réglages : <b>${marketPct} %</b> de la cote sont appliqués, donc le prix n'est pas la moyenne du marché.
+                Mets ce pourcentage à <b>100</b> dans Paramètres pour vendre exactement au prix moyen.
+            </div>` : ''}
+            <div style="font-size:9px;color:#666;margin-bottom:4px;">
+                Règle : prix du marché, relevé à ton <b>minimum par rareté</b> s'il passe dessous ;
+                minimum aussi quand aucune cote n'est connue.
+            </div>
+            ${rows}
+            <div style="font-size:9px;color:#555;font-style:italic;margin-top:3px;">
+                Rien n'a été vendu. Les prix marché peuvent bouger d'ici la mise en vente réelle.
+            </div>`;
+        const close = document.getElementById('wm-preview-close');
+        if (close) close.onclick = () => { el.innerHTML = ''; };
+    }
+
     // Annule une vente SANS mise dans le cadre d'un "Refresh ventes" : DELETE l'enchère,
     // purge sellHistory, et REMET le tag Trash sur la carte (sinon elle reviendrait sans
     // tag et sortirait du pool). Retourne true si l'annulation a réussi.
@@ -5740,7 +8703,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 method: 'DELETE', credentials: 'include'
             });
             if (!res.ok) {
-                wmLog(`❌ Annulation (refresh) échouée : <b>${a.card?.wikipedia_title || '?'}</b> · HTTP ${res.status}`);
+                wmLog(`❌ Annulation (refresh) échouée : <b>${esc(a.card?.wikipedia_title || '?')}</b> · HTTP ${res.status}`);
                 return false;
             }
             // Retire l'entrée sellHistory correspondante (n'est plus en vente)
@@ -5759,7 +8722,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
             return true;
         } catch(e) {
-            wmLog(`❌ Annulation (refresh) exception : <b>${a.card?.wikipedia_title || '?'}</b> · ${e.message}`);
+            wmLog(`❌ Annulation (refresh) exception : <b>${esc(a.card?.wikipedia_title || '?')}</b> · ${esc(e.message)}`);
             return false;
         }
     }
@@ -5788,7 +8751,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // plutôt que d'annuler à l'aveugle, et on va directement re-lister ce qui rentre.
             let cancelled = 0, keptWithBids = 0;
             if (st.detailed) {
-                const cancellable = st.list.filter(a => !(a.current_bidder && a.current_bidder.username));
+                // Les ventes de la Revente Légendaire ne sont pas au Trash Seller : on n'y touche
+                // pas (les annuler leur remettrait le tag Trash).
+                const cancellable = st.list.filter(a => !(a.current_bidder && a.current_bidder.username)
+                    && !legendResellByListing(a.id));
                 keptWithBids = st.list.length - cancellable.length;
                 for (const a of cancellable) {
                     const ok = await cancelSaleForRefresh(a);
@@ -5823,7 +8789,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
             const batch = await selectTrashBatch(trashCards, slots);
             if (statusEl) statusEl.innerHTML = `<span style="color:#06b6d4;">🛒 Mise en vente de ${batch.length} carte(s)…</span>`;
-            const { sold, skipped, deferred } = await sellBatch(batch, statusEl);
+            const { sold, skipped, deferred } = await withSellLock(() => sellBatch(batch, statusEl));
             const afterSell = await fetchSellingState();
             if (afterSell) renderActiveSales(afterSell.list, afterSell);
 
@@ -5834,11 +8800,160 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 (skipped ? ` <span style="color:#888;">· ${skipped} ignorée(s)</span>` : '');
             wmLog(`🔄 Refresh ventes : ${cancelled} annulée(s), ${sold} remise(s) en vente${keptWithBids ? `, ${keptWithBids} gardée(s) (avec mise)` : ''}`);
         } catch(e) {
-            if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+            if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
         } finally {
             refreshSalesRunning = false;
             if (btn) { btn.disabled = false; btn.innerText = prevLabel || '🔄 Refresh ventes'; }
         }
+    }
+
+    /* Trash Seller et Revente Légendaire vendent tous deux en cliquant dans /collection : un
+       seul lot à la fois, sinon les deux se disputeraient la barre de recherche et la fiche. */
+    let _sellLock = Promise.resolve();
+    function withSellLock(fn) {
+        const run = _sellLock.then(fn, fn);
+        _sellLock = run.catch(() => {});
+        return run;
+    }
+
+    /* ── Boucle de la Revente Légendaire ──
+       Tourne tant que le mode « Chasse + Revente » est actif dans cet onglet. Même moteur que
+       le Trash Seller (sellBatch → mise en vente dans /collection), sa propre file. */
+    async function legendResellLoop() {
+        const statusEl = () => document.getElementById('wm-lresell-status');
+        const say = (html) => { const el = statusEl(); if (el) el.innerHTML = html; };
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const myGen = legendResellGen;   // une seule boucle vivante (Stop puis Start pendant une pause)
+        const alive = () => legendResellRunning && myGen === legendResellGen;
+        let firstPass = true;
+        while (alive()) {
+            try {
+                // Les victoires : lues ici aussi (le Market Watcher n'est pas forcément lancé),
+                // derrière la même porte « une fois par minute » que le reste du bot — avant,
+                // la Revente avait sa propre porte et doublait la synchro. Exception : au
+                // démarrage de la boucle, lecture immédiate (la porte vient souvent d'être
+                // franchie par le chargement de la page, AVANT l'activation de la revente).
+                if (firstPass || Date.now() - lastWonSync > 60000) {
+                    firstPass = false;
+                    lastWonSync = Date.now();
+                    await syncWonAuctions().catch(() => {});
+                }
+                await checkSellHistoryResults();
+                await reviewStaleLegendListings();
+                await reconcileLegendResell();
+                if (!alive()) break;
+                const ready = legendResellReady();
+                if (!ready.length) {
+                    const listed = legendResell.filter(e => e.status === 'listed').length;
+                    say(`<span style="color:#888;">🏷️ En attente d'un achat de la Chasse${listed ? ` · ${listed} en vente` : ''}…</span>`);
+                    await sleep(30000);
+                    continue;
+                }
+                const state = await fetchSellingState();
+                if (!state) { say('<span style="color:#fbbf24;">⚠ Ventes actives illisibles — nouvel essai dans 15 s…</span>'); await sleep(15000); continue; }
+                const mx = effectiveMaxActive(state.max);
+                const slots = Math.max(0, mx - state.count);
+                if (!slots) { say(`<span style="color:#888;">⏳ ${state.count}/${mx} ventes actives — ${ready.length} L en attente d'une place (prioritaire)…</span>`); await sleep(15000); continue; }
+                const batch = ready.slice(0, slots).map(legendResellItem);
+                say(`<span style="color:#06b6d4;">👑 Mise en vente de ${batch.length} Légendaire(s)…</span>`);
+                const r = await withSellLock(() => alive() ? sellBatch(batch, null) : { sold: 0 });
+                say(`<span style="color:#4ade80;">👑 ${r.sold || 0} Légendaire(s) mise(s) en vente</span>`);
+                // Rien listé (page, plafond, échecs) : on souffle une minute au lieu d'insister.
+                await sleep(!r.sold || r.limitReached || r.aborted ? 60000 : 5000);
+            } catch (e) {
+                say(`<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`);
+                await sleep(15000);
+            }
+        }
+        if (myGen === legendResellGen) say('<span style="color:#888;">Revente Légendaire arrêtée.</span>');
+    }
+    // Vente sans identifiant (ou annulée à la main) : au-delà de sa durée, on regarde si la
+    // carte est revenue dans la collection pour trancher vendue / à relister.
+    async function reviewStaleLegendListings() {
+        const now = Date.now();
+        for (const e of legendResell) {
+            if (e.status !== 'listed') continue;
+            const pending = e.listedAuctionId && sellHistory.some(s => s.auctionId === e.listedAuctionId && s.status === 'pending');
+            const limit = (e.listedAt || 0) + ((e.listedDuration || 1440) + 10) * 60000;
+            if (pending || now < limit) continue;
+            // null = plus dans la collection (ou illisible) → considérée vendue : on ne
+            // relance jamais à l'aveugle une carte qu'on ne retrouve pas.
+            const back = await findCurrentUserCardId(e.cardId, e.title).catch(() => null);
+            legendResellSettled({ legend: e.wonAuctionId, price: e.listedPrice }, !back, null);
+        }
+    }
+    /* La liste ne doit montrer que du VRAI : une L vendue ou cédée hors du bot, ou une vente
+       supprimée sur le site, y restait indéfiniment (« à vendre », « en vente »).
+         · en vente : l'annonce existe-t-elle encore ? vendue → bilan ; disparue (retirée à la
+           main) → sort de la liste ; terminée sans acheteur → à relister ;
+         · à vendre / sans cote : la carte est-elle encore dans la collection ? (délai de grâce
+           après la victoire, le temps qu'elle arrive). */
+    let _lrReconcileAt = 0, _lrReconcileRunning = false;
+    async function reconcileLegendResell(force) {
+        if (_lrReconcileRunning) return;
+        if (!force && Date.now() - _lrReconcileAt < 2 * 60 * 1000) return;
+        if (!legendResell.some(e => LEGEND_RESELL_LIVE.has(e.status))) return;
+        const uid = currentUserId();
+        if (!uid) return;
+        _lrReconcileRunning = true;
+        _lrReconcileAt = Date.now();
+        let changed = false;
+        try {
+            const listed = legendResell.filter(e => e.status === 'listed' && e.listedAuctionId);
+            if (listed.length) {
+                const byId = await fetchAuctionsByIds(listed.map(e => e.listedAuctionId));
+                if (byId) for (const e of listed) {
+                    const row = byId.get(e.listedAuctionId);
+                    if (auctionRowStillActive(row)) continue;
+                    if (row && auctionRowSettledSold(row)) {
+                        legendResellSettled({ legend: e.wonAuctionId, price: e.listedPrice }, true, row.final_price);
+                        continue;
+                    }
+                    if (!row) {
+                        e.status = 'removed';
+                        e.listedAuctionId = null;
+                        changed = true;
+                        wmLog(`👑 Revente Légendaire : la vente de <b>${esc(e.title)}</b> n'existe plus sur le site (retirée à la main ?) — sortie de la revente.`);
+                        continue;
+                    }
+                    legendResellSettled({ legend: e.wonAuctionId, price: e.listedPrice }, false);
+                }
+            }
+            const now = Date.now();
+            const check = legendResell.filter(e => (e.status === 'waiting' || e.status === 'no_cote')
+                && now - (e.wonAt || 0) > LEGEND_OWN_GRACE_MS);
+            if (check.length) {
+                const ids = [...new Set(check.map(e => e.cardId))];
+                const rows = await supabaseSelect(`user_cards?user_id=eq.${uid}&card_id=in.(${ids.join(',')})&select=card_id`);
+                if (Array.isArray(rows)) {   // null = illisible → on ne tranche pas
+                    const owned = new Set(rows.map(r => r.card_id));
+                    for (const e of check) {
+                        if (owned.has(e.cardId)) continue;
+                        e.status = 'gone';
+                        changed = true;
+                        wmLog(`👑 Revente Légendaire : <b>${esc(e.title)}</b> n'est plus dans ta collection — sortie de la revente.`);
+                    }
+                }
+            }
+        } catch (e) {
+        } finally {
+            _lrReconcileRunning = false;
+            if (changed) { saveLegendResell(); renderLegendResell(); }
+        }
+    }
+    window.wmReconcileLegendResell = () => reconcileLegendResell(true);
+
+    function startLegendResell(reason) {
+        if (legendResellRunning) return;
+        legendResellRunning = true;
+        legendResellGen++;
+        try { sessionStorage.setItem('wm_lresell_active', '1'); } catch(e) {}
+        wmLog(`👑 Revente Légendaire en marche${reason ? ` (${reason})` : ''} : les L gagnées depuis l'activation sont remises en vente — moyenne L du marché, jamais sous payé + ${getSetting('legendResellMarginPct')} %. Reste sur <code>/collection</code> pendant les mises en vente.`);
+        legendResellLoop();
+    }
+    function stopLegendResell() {
+        legendResellRunning = false;
+        try { sessionStorage.removeItem('wm_lresell_active'); } catch(e) {}
     }
 
     async function sellTrashCards(btn, statusEl) {
@@ -5852,6 +8967,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
 
         trashSellerRunning = true;
+        // Génération : un Stop puis Start pendant une pause de la boucle (15 s à 2 min) la
+        // laissait repartir à son réveil — deux boucles, puis l'ancienne, en finissant,
+        // remettait trashSellerRunning à false et arrêtait la nouvelle.
+        const myGen = ++trashSellerGen;
+        const alive = () => trashSellerRunning && myGen === trashSellerGen;
         btn.innerText = "⏹ STOP";
         btn.className = "wm-btn wm-r wm-sm";
         btn.style.background = "";
@@ -5861,8 +8981,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const scanPool = async (showProgress) => {
             const cards = await getTrashPool((page, total) => {
                 if (showProgress) statusEl.innerHTML = `<span style="color:#888;">🔍 Recherche cartes Trash… ${Math.round((page / total) * 100)}% (p.${page}/${total})</span>`;
-            });
-            if (!trashSellerRunning) return [];
+            }, { shouldAbort: () => !alive() });
+            if (!alive()) return [];
             return await selectTrashBatch(cards, cards.length); // tout le pool, trié
         };
 
@@ -5873,7 +8993,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         let pendingScan = null;
 
         try {
-            while (trashSellerRunning) {
+            while (alive()) {
                 // 1) Récupère le lot : le scan préfetché (déjà prêt → instantané) sinon un scan.
                 if (pendingScan) {
                     buffer = await pendingScan;
@@ -5882,7 +9002,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     statusEl.innerHTML = '<span style="color:#888;">🔍 Recherche cartes Trash… 0%</span>';
                     buffer = await scanPool(true);
                 }
-                if (!trashSellerRunning) break;
+                if (!alive()) break;
                 if (buffer.length === 0) {
                     // Plus rien à lister MAIS des cartes sont exclues (échange en attente) →
                     // on ne stoppe pas : on patiente et on réessaie (le cooldown finira par expirer).
@@ -5907,10 +9027,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // plus les ventes, la liste est vide alors que 10 ventes sont bien actives.
                 const activeCount = state.count;
                 const maxActive = effectiveMaxActive(state.max);
-                const slots = Math.max(0, maxActive - activeCount);
+                // 👑 Priorité à la Revente Légendaire : les créneaux qu'elle attend ne sont pas
+                // pris par le Trash.
+                const lWaiting = legendResellRunning ? legendResellReady().length : 0;
+                const slots = Math.max(0, maxActive - activeCount - lWaiting);
 
                 if (slots === 0) {
-                    statusEl.innerHTML = `<span style="color:#888;">⏳ ${activeCount}/${maxActive} ventes actives — vérif dans 15s…</span>`;
+                    statusEl.innerHTML = `<span style="color:#888;">⏳ ${activeCount}/${maxActive} ventes actives${lWaiting ? ` · ${lWaiting} place(s) gardée(s) pour la Revente Légendaire` : ''} — vérif dans 15s…</span>`;
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
                 }
@@ -5919,7 +9042,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const batch = buffer.slice(0, slots);
                 statusEl.innerHTML = `<span style="color:#06b6d4;">🛒 Mise en vente de ${batch.length} carte(s) (${activeCount} actives)…</span>`;
 
-                const { sold, skipped, deferred, limitReached } = await sellBatch(batch, statusEl);
+                const { sold, skipped, deferred, limitReached, aborted } = await withSellLock(() => sellBatch(batch, statusEl));
                 const newActive = activeCount + sold;
 
                 statusEl.innerHTML =
@@ -5930,25 +9053,34 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
                 // 4) 🔮 PRÉFETCH du prochain lot EN FOND. Les cartes qu'on vient de lister ont
                 //    perdu leur tag → exclues du scan → pas de doublon. Il tourne pendant l'attente.
-                if (!pendingScan && trashSellerRunning) pendingScan = scanPool(false).catch(() => []);
+                if (!pendingScan && alive()) pendingScan = scanPool(false).catch(() => []);
 
                 // 4a) Le serveur s'est déclaré PLEIN. Il fait autorité, pas notre décompte local :
                 //     l'attente en (5) sortirait aussitôt (elle compare un compteur possiblement
                 //     faux au plafond) et on repartirait pour un 409 toutes les 15 s. Pause ferme.
-                if (limitReached && trashSellerRunning) {
+                if (limitReached && alive()) {
                     statusEl.innerHTML = `<span style="color:#fbbf24;">🛑 Plafond serveur atteint — pause de 2 min avant nouvelle tentative…</span>`;
                     await new Promise(r => setTimeout(r, 120000));
+                    continue;
+                }
+
+                // 4a-bis) Échecs en rafale sans que le site annonce un plafond : on souffle une
+                //     minute plutôt que de relancer aussitôt le même mur (et d'alimenter la
+                //     protection anti-bot). Le décompte des ventes actives est refait ensuite.
+                if (aborted && !limitReached && alive()) {
+                    statusEl.innerHTML = `<span style="color:#fbbf24;">⏸️ Échecs en rafale — pause d'1 min, puis nouveau décompte des ventes actives…</span>`;
+                    await new Promise(r => setTimeout(r, 60000));
                     continue;
                 }
 
                 // 4b) Des cartes ont été reportées (échange) et il reste des slots libres → on
                 //     repioche TOUT DE SUITE d'autres cartes (le préfetch les exclut) au lieu
                 //     d'attendre 30s, pour atteindre le plafond de ventes malgré les reports.
-                if (deferred > 0 && newActive < maxActive && trashSellerRunning) continue;
+                if (deferred > 0 && newActive < maxActive && alive()) continue;
 
                 // 5) Attendre qu'un slot se libère (le préfetch tourne pendant ce temps)
                 statusEl.innerHTML += '<br><span style="color:#888;">⏳ Surveillance ventes actives… <span style="color:#555;">(prochain lot en préparation)</span></span>';
-                while (trashSellerRunning) {
+                while (alive()) {
                     await new Promise(r => setTimeout(r, 15000));
                     await checkSellHistoryResults(); // met à jour sold/unsold
                     const cur = await fetchSellingState();
@@ -5963,6 +9095,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             statusEl.innerHTML = '<span style="color:#ef4444;">Erreur : ' + e.message + '</span>';
         }
 
+        // Une boucle périmée (Stop puis Start) s'efface sans toucher à la nouvelle.
+        if (myGen !== trashSellerGen) return;
         if (trashSellerRunning) {
             statusEl.innerHTML += '<br><span style="color:#4ade80;">✔ Terminé !</span>';
         }
@@ -6013,6 +9147,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function recordSale(item, price, status, auctionId) {
         // status : 'pending' | 'sold' | 'unsold'
         sellHistory.push({
+            // Vente de la Revente Légendaire : ni re-tag Trash à l'invendu, ni compteur Trash.
+            ...(item._legendResell ? { legend: item._legendResell.wonAuctionId } : {}),
             title: item.card?.wikipedia_title || "?",
             rarity: (item.card?.rarity || "C").toUpperCase(),
             price,
@@ -6091,7 +9227,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
         } catch(e) {}
 
-        wmLog(`⚠️ Tag "<b>${getSellTagName()}</b>" introuvable sur ton compte — crée-le sur wiki-masters pour activer le retag auto`);
+        wmLog(`⚠️ Tag "<b>${esc(getSellTagName())}</b>" introuvable sur ton compte — crée-le sur wiki-masters pour activer le retag auto`);
         return null;
     }
 
@@ -6131,7 +9267,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (name.length > MAX_TAG_LEN) {
             const full = name;
             name = name.slice(0, MAX_TAG_LEN).trim();
-            wmLog(`✂️ Tag tronqué à ${MAX_TAG_LEN} car. : « ${full} » → « ${name} »`);
+            wmLog(`✂️ Tag tronqué à ${MAX_TAG_LEN} car. : « ${full} » → « ${esc(name)} »`);
         }
 
         const { token } = getSupabaseAccessToken();
@@ -6339,7 +9475,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const found = untagged?.id || items[0]?.id;
                         if (found) {
                             const retryNote = attempt > 0 ? ` <span style="color:#888;font-size:9px;">(tentative ${attempt+1}/${MAX_ATTEMPTS})</span>` : '';
-                            wmLog(`🔎 user_card_id résolu via Supabase : <b>${cardTitle || cardId.slice(0,8)}</b> · ${items.length} exemplaire(s), ${untagged ? 'sans tag' : 'déjà taggué'} → ${found.slice(0,8)}…${retryNote}`);
+                            wmLog(`🔎 user_card_id résolu via Supabase : <b>${esc(cardTitle || cardId.slice(0,8))}</b> · ${items.length} exemplaire(s), ${untagged ? 'sans tag' : 'déjà taggué'} → ${found.slice(0,8)}…${retryNote}`);
                             return found;
                         }
                     }
@@ -6350,7 +9486,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // Erreur réseau/auth : on continue les retries
                 }
             } catch(e) {
-                wmLog(`⚠️ findUserCardId Supabase exception : ${e.message}`);
+                wmLog(`⚠️ findUserCardId Supabase exception : ${esc(e.message)}`);
             }
         }
 
@@ -6373,7 +9509,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
         } catch(e) {}
 
-        wmLog(`🔍 Aucun exemplaire trouvé pour <b>${cardTitle || cardId.slice(0,8)}</b> après ${MAX_ATTEMPTS} tentatives Supabase`);
+        wmLog(`🔍 Aucun exemplaire trouvé pour <b>${esc(cardTitle || cardId.slice(0,8))}</b> après ${MAX_ATTEMPTS} tentatives Supabase`);
         return null;
     }
 
@@ -6444,7 +9580,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!res.ok) { wmLog(`🔬 Introspection Supabase : <b>HTTP ${res.status}</b>${token ? '' : ' (aucun token utilisateur trouvé — es-tu connecté au site ?)'}`); return null; }
             spec = await res.json();
         } catch(e) {
-            wmLog(`🔬 Introspection Supabase échouée : ${e.message}`);
+            wmLog(`🔬 Introspection Supabase échouée : ${esc(e.message)}`);
             return null;
         }
         const defs = spec.definitions || (spec.components && spec.components.schemas) || {};
@@ -6704,7 +9840,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 });
                 body = await res.text();
             } catch(e) {
-                wmLog(`🔬 <b>${t}</b> → erreur réseau : ${e.message}`);
+                wmLog(`🔬 <b>${t}</b> → erreur réseau : ${esc(e.message)}`);
                 continue;
             }
             if (res.ok) {
@@ -6718,7 +9854,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             } else if (/42P01/.test(body)) {
                 absent++; // n'existe pas : normal pour la plupart des noms testés, on compte sans logguer
             } else {
-                wmLog(`🔬 ❔ <b>${t}</b> → HTTP ${res.status} · <span style="color:#888;font-size:9px;">${body.slice(0, 120).replace(/</g, '&lt;')}</span>`);
+                wmLog(`🔬 ❔ <b>${t}</b> → HTTP ${res.status} · <span style="color:#888;font-size:9px;">${esc(body.slice(0, 120))}</span>`);
             }
             await new Promise(r => setTimeout(r, 250)); // on ne martèle pas le serveur
         }
@@ -6834,7 +9970,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     function logRarityDriftResult(row) {
         if (row.error) {
-            wmLog(`🔭 <b>${row.title}</b> : échec · <span style="color:#ef4444;">${row.error}</span>${row.url ? ` <span style="color:#555;font-size:9px;">(${row.url})</span>` : ''}`);
+            wmLog(`🔭 <b>${esc(row.title)}</b> : échec · <span style="color:#ef4444;">${esc(row.error)}</span>${row.url ? ` <span style="color:#555;font-size:9px;">(${row.url})</span>` : ''}`);
             if (/failed to fetch|typeerror/i.test(row.error)) {
                 wmLog(`🔭 Ouvre F12 → Console, regarde s'il y a une ligne rouge <b>CORS</b> ou <b>Content Security Policy</b> — ça confirme un blocage par la page (le script tourne en @grant none, sans moyen natif de le contourner).`);
             }
@@ -6842,8 +9978,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         const dir = row.match ? '' : (RARITY_ORDER[row.impliedRarity] > RARITY_ORDER[row.cachedRarity] ? ' ⬆️ va probablement MONTER' : ' ⬇️ va probablement descendre');
         wmLog(row.match
-            ? `🔭 ✅ <b>${row.title}</b> : WikiMasters dit <b>${row.cachedRarity}</b>, vues réelles (${row.realViews.toLocaleString('fr-FR')}/mois) impliquent aussi <b>${row.impliedRarity}</b> — cohérent.`
-            : `🔭 ⚠️ <b>${row.title}</b> : WikiMasters dit <b>${row.cachedRarity}</b> (cache vieux de ${row.staleness}, ${row.cachedViews ?? '?'} vues mémorisées), mais les vues RÉELLES actuelles (${row.realViews.toLocaleString('fr-FR')}/mois) impliquent <b style="color:#fbbf24;">${row.impliedRarity}</b>.${dir}`);
+            ? `🔭 ✅ <b>${esc(row.title)}</b> : WikiMasters dit <b>${row.cachedRarity}</b>, vues réelles (${row.realViews.toLocaleString('fr-FR')}/mois) impliquent aussi <b>${row.impliedRarity}</b> — cohérent.`
+            : `🔭 ⚠️ <b>${esc(row.title)}</b> : WikiMasters dit <b>${row.cachedRarity}</b> (cache vieux de ${row.staleness}, ${row.cachedViews ?? '?'} vues mémorisées), mais les vues RÉELLES actuelles (${row.realViews.toLocaleString('fr-FR')}/mois) impliquent <b style="color:#fbbf24;">${row.impliedRarity}</b>.${dir}`);
     }
 
     // Console : wmCheckRarityDrift('Anatolie') ou wmCheckRarityDrift(['Anatolie', 'Autre titre'])
@@ -6855,7 +9991,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         const results = [];
         for (const title of list) {
-            wmLog(`🔭 Vérification : <b>${title}</b>…`);
+            wmLog(`🔭 Vérification : <b>${esc(title)}</b>…`);
             const row = await computeCardRarityDrift(title);
             results.push(row);
             logRarityDriftResult(row);
@@ -6886,7 +10022,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function rarityDriftBadgeHtml(row) {
         if (!row) return '';
         if (row.error) {
-            return `<span style="color:#ef4444;font-size:9px;cursor:help;" title="${String(row.error).replace(/"/g, '&quot;')}">⚠️ erreur</span>`;
+            return `<span style="color:#ef4444;font-size:9px;cursor:help;" title="${esc(row.error)}">⚠️ erreur</span>`;
         }
         if (row.match) {
             return `<span style="color:#4ade80;font-size:9px;cursor:help;"
@@ -6954,7 +10090,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             localStorage.removeItem(probeKey);
             wmLog(`💾 ✅ Test d'écriture (10 Ko) réussi — le quota n'est <b>probablement pas</b> la cause.`);
         } catch(e) {
-            wmLog(`💾 ⚠️ <b style="color:#ef4444;">Test d'écriture ÉCHOUÉ</b> : ${e.name || 'Erreur'} — ${e.message || 'inconnue'}. Le quota localStorage est très probablement atteint ou dépassé.`);
+            wmLog(`💾 ⚠️ <b style="color:#ef4444;">Test d'écriture ÉCHOUÉ</b> : ${esc(e.name || 'Erreur')} — ${esc(e.message || 'inconnue')}. Le quota localStorage est très probablement atteint ou dépassé.`);
         }
         console.table(rows);
         return rows;
@@ -7023,11 +10159,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Erreur réseau → retry aussi
             if (attempt < MAX_ATTEMPTS) {
                 const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-                wmLog(`⚠️ Re-tag Trash exception (${e.message}), retry ${attempt}/${MAX_ATTEMPTS-1} dans ${(backoff/1000).toFixed(0)}s…`);
+                wmLog(`⚠️ Re-tag Trash exception (${esc(e.message)}), retry ${attempt}/${MAX_ATTEMPTS-1} dans ${(backoff/1000).toFixed(0)}s…`);
                 await new Promise(r => setTimeout(r, backoff));
                 return reapplyTrashTag(userCardId, attempt + 1);
             }
-            wmLog(`❌ Re-tag Trash exception finale : ${e.message}`);
+            wmLog(`❌ Re-tag Trash exception finale : ${esc(e.message)}`);
             return false;
         }
     }
@@ -7061,7 +10197,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (auctionRowSettledSold(h)) {
                     s.status = 'sold';
                     creditSoldSale(s, h.final_price ?? s.finalPrice ?? null);
+                    if (s.legend) legendResellSettled(s, true, h.final_price);
                     changed = true; soldN++;
+                    continue;
+                }
+                // Revente Légendaire terminée sans acheteur : jamais de tag Trash, elle
+                // repart dans la file de la revente.
+                if (s.legend && h) {
+                    s.status = 'unsold';
+                    creditUnsoldSale(s);
+                    legendResellSettled(s, false);
+                    changed = true;
                     continue;
                 }
 
@@ -7073,6 +10219,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // Plus dans la collection → considérée vendue (prix inconnu si absent de l'historique).
                     s.status = 'sold';
                     if (h && Number.isFinite(h.final_price)) creditSoldSale(s, h.final_price);
+                    if (s.legend) legendResellSettled(s, true, h ? h.final_price : null);
                     changed = true; soldN++;
                     continue;
                 }
@@ -7080,10 +10227,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 s.status = 'unsold';
                 creditUnsoldSale(s);
                 changed = true;
+                if (s.legend) { legendResellSettled(s, false); continue; }
                 if (retagOn) {
                     const ok = await reapplyTrashTag(targetId); // idempotent
                     if (ok) { incrementRetagCount(s.cardId, s.title, s.rarity); retagged++; }
-                    else wmLog(`⚠️ Reprise démarrage : re-tag échoué pour <b>${s.title}</b>`);
+                    else wmLog(`⚠️ Reprise démarrage : re-tag échoué pour <b>${esc(s.title)}</b>`);
                 }
             }
 
@@ -7096,9 +10244,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
     }
 
+    // Appelée par le Trash Seller ET la Revente Légendaire : une seule passe à la fois, sinon
+    // une même vente serait conclue (et journalisée) deux fois.
+    let _checkSellRunning = false;
     async function checkSellHistoryResults() {
+        if (_checkSellRunning) return;
         const pending = sellHistory.filter(s => s.status === 'pending' && s.auctionId);
         if (pending.length === 0) return;
+        _checkSellRunning = true;
         try {
             // Ex-`data.history` de /mine, disparu : lecture par ID exact sur `auctions`.
             const byId = await fetchAuctionsByIds(pending.map(s => s.auctionId));
@@ -7113,11 +10266,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     s.finalPrice = match.final_price ?? null;
                     changed      = true;
 
-                    if (s.status === 'sold') {
+                    if (s.legend) {
+                        // Revente Légendaire : son propre bilan (vs prix payé), jamais de re-tag.
+                        if (s.status === 'sold') creditSoldSale(s, null);
+                        else creditUnsoldSale(s);
+                        legendResellSettled(s, s.status === 'sold', s.finalPrice);
+                        if (s.status === 'sold') sendToDiscord("👑 **Revente Légendaire — VENDU**\n**" + s.title + "** → **" + s.finalPrice + " 💰**", 5763719);
+                    } else if (s.status === 'sold') {
                         creditSoldSale(s, null);
                         const gain = (s.finalPrice || 0) - s.price;
                         const gainStr = gain > 0 ? ` <span style="color:#4ade80;">(+${gain} 💰 🔥)</span>` : '';
-                        wmLog(`💰 Vendu : <b>${s.title}</b> [${s.rarity}] · base ${s.price} → <span style="color:#fbbf24;">${s.finalPrice} 💰</span>${gainStr}`);
+                        wmLog(`💰 Vendu : <b>${esc(s.title)}</b> [${s.rarity}] · base ${s.price} → <span style="color:#fbbf24;">${s.finalPrice} 💰</span>${gainStr}`);
                         sendToDiscord(
                             "💰 **VENDU !**\n" +
                             "**" + s.title + "** [" + s.rarity + "]\n" +
@@ -7130,7 +10289,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         // on ne loggue pas Invendu et on ne déclenche pas le retag.
                         if (!sellHistory.some(h => h.auctionId === s.auctionId)) return;
                         creditUnsoldSale(s);
-                        wmLog(`📭 Invendu : <b>${s.title}</b> [${s.rarity}] · base ${s.price} 💰`);
+                        wmLog(`📭 Invendu : <b>${esc(s.title)}</b> [${s.rarity}] · base ${s.price} 💰`);
                         // Skip le retag si désactivé dans Paramètres
                         if (!getSetting('autoRetagEnabled')) return;
                         // Le user_card_id d'origine peut être stale (transfert lors du listing)
@@ -7152,7 +10311,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                                 sourceTag = 'stale-cache';
                             }
                             if (!targetId) {
-                                wmLog(`⚠️ Re-tag impossible (carte introuvable) : <b>${s.title}</b>`);
+                                wmLog(`⚠️ Re-tag impossible (carte introuvable) : <b>${esc(s.title)}</b>`);
                                 return;
                             }
                             // Dernier check avant l'appel réseau au retag
@@ -7160,16 +10319,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             const ok = await reapplyTrashTag(targetId);
                             if (ok) {
                                 incrementRetagCount(s.cardId, s.title, s.rarity);
-                                wmLog(`🏷️ Tag Trash remis : <b>${s.title}</b> [${s.rarity}] <span style="color:#555;font-size:9px;">(${sourceTag})</span>`);
+                                wmLog(`🏷️ Tag Trash remis : <b>${esc(s.title)}</b> [${s.rarity}] <span style="color:#555;font-size:9px;">(${esc(sourceTag)})</span>`);
                             } else {
-                                wmLog(`💀 Re-tag définitivement échoué : <b>${s.title}</b> · ID tenté : ${targetId.slice(0,8)}… (${sourceTag})`);
+                                wmLog(`💀 Re-tag définitivement échoué : <b>${esc(s.title)}</b> · ID tenté : ${targetId.slice(0,8)}… (${esc(sourceTag)})`);
                             }
                         })();
                     }
                 }
             });
             if (changed) { saveSellHistory(); renderSellHistory(); }
-        } catch(e) {}
+        } catch(e) {
+        } finally {
+            _checkSellRunning = false;
+        }
     }
 
     function renderSellHistory() {
@@ -7211,6 +10373,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const settled = soldItems.length + unsoldItems.length;
         const txRate  = settled > 0 ? Math.round((soldItems.length / settled) * 100) : 0;
 
+        // Les ventes lancées aujourd'hui et pas encore conclues : sans elles, le panneau
+        // affichait « — » toute la journée alors que des enchères tournaient.
+        const pendingRows = pendingItems.length ? `
+            <div style="margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,0.05);">
+                <div style="color:#888;font-size:9px;margin-bottom:2px;">⏳ ${pendingItems.length} en vente (lancée(s) aujourd'hui)</div>
+                ${pendingItems.slice(-6).reverse().map(s => {
+                    const rc = RARITY[(s.rarity || '').toUpperCase()] || { color: '#888' };
+                    return `<div style="display:flex;gap:6px;font-size:10px;padding:1px 0;">
+                        <span style="color:${rc.color};font-weight:700;min-width:22px;">${esc((s.rarity || '?').toUpperCase())}</span>
+                        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bbb;">${esc(s.title || '?')}</span>
+                        <span style="color:#fbbf24;white-space:nowrap;">${Number(s.price || 0).toLocaleString('fr-FR')} 💰</span>
+                    </div>`;
+                }).join('')}
+                ${pendingItems.length > 6 ? `<div style="color:#555;font-size:9px;">… et ${pendingItems.length - 6} autre(s)</div>` : ''}
+            </div>` : '';
+
         el.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                 <span style="color:#4ade80;font-weight:700;font-size:12px;">+${totalGained} 💰</span>
@@ -7218,7 +10396,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     ${soldItems.length}✔ / ${unsoldItems.length}✗${pendingItems.length > 0 ? ` / ${pendingItems.length}⏳` : ''} · ${txRate}% vendues
                 </span>
             </div>
-            <div style="line-height:1.8;">${rarityRows || '<span style="color:#444;font-size:10px;">—</span>'}</div>`;
+            <div style="line-height:1.8;">${rarityRows || '<span style="color:#444;font-size:10px;">Rien de vendu pour l\'instant.</span>'}</div>
+            ${pendingRows}`;
     }
 
     /* ===================== UI ===================== */
@@ -7309,7 +10488,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const rc = RARITY[(e.rarity || '').toUpperCase()] || { color: '#888' };
             return `<div style="display:flex;align-items:center;gap:6px;margin:3px 0;">
                 <span style="color:${rc.color};font-weight:700;font-size:9px;min-width:24px;">${(e.rarity || '').toUpperCase()}</span>
-                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;font-size:9px;" title="${e.title}">${e.title}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ccc;font-size:9px;" title="${esc(e.title)}">${esc(e.title)}</span>
                 ${bar(e.count, maxRetag, '#fbbf24')}
                 <span style="color:#fbbf24;font-weight:700;font-size:9px;min-width:28px;text-align:right;">🔁${e.count}</span>
             </div>`;
@@ -7431,7 +10610,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 <div style="font-size:10px;color:#888;line-height:1.7;">
                     Dernier scan marché : <b style="color:#ccc;">${fmtAgo(apiHealth.lastMarketScanTs)}</b><br>
                     Dernier scan collection : <b style="color:#ccc;">${fmtAgo(apiHealth.lastCollectionTs)}</b><br>
-                    Erreurs : <span style="color:#fbbf24;">429×${apiHealth.err429}</span> · <span style="color:#ef4444;">5xx×${apiHealth.err5xx}</span> · <span style="color:#f97316;">réseau×${apiHealth.errNet}</span>${apiHealth.lastErrTs ? ` <span style="color:#666;">(dernière ${fmtAgo(apiHealth.lastErrTs)} : ${String(apiHealth.lastErrMsg).replace(/</g, '&lt;')})</span>` : ''}
+                    Erreurs : <span style="color:#fbbf24;">429×${apiHealth.err429}</span> · <span style="color:#ef4444;">5xx×${apiHealth.err5xx}</span> · <span style="color:#f97316;">réseau×${apiHealth.errNet}</span>${apiHealth.lastErrTs ? ` <span style="color:#666;">(dernière ${fmtAgo(apiHealth.lastErrTs)} : ${esc(apiHealth.lastErrMsg)})</span>` : ''}
                 </div>`;
             })()}
 
@@ -7569,10 +10748,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     ? `<span style="color:#4ade80;">+${fmt(gain)}</span>`
                     : gain < 0 ? `<span style="color:#ef4444;">${fmt(gain)}</span>` : `<span style="color:#666;">=</span>`)
                 : '';
-            const safeTitle = String(s.title).replace(/"/g, '&quot;');
+            const safeTitle = esc(s.title);
             const titleHtml = s.id
-                ? `<a href="https://www.wiki-masters.com/marketplace/${encodeURIComponent(s.id)}" target="_blank" rel="noopener" title="Ouvrir l'enchère : ${safeTitle}" style="color:#8ab4f8;text-decoration:none;">${s.title} <span style="font-size:8px;opacity:0.7;">🔗</span></a>`
-                : `<span title="${safeTitle}">${s.title}</span>`;
+                ? `<a href="https://www.wiki-masters.com/marketplace/${encodeURIComponent(s.id)}" target="_blank" rel="noopener" title="Ouvrir l'enchère : ${safeTitle}" style="color:#8ab4f8;text-decoration:none;">${safeTitle} <span style="font-size:8px;opacity:0.7;">🔗</span></a>`
+                : `<span title="${safeTitle}">${safeTitle}</span>`;
             return `<div style="display:flex;align-items:center;gap:6px;padding:3px 4px;border-bottom:1px solid rgba(255,255,255,0.04);font-size:10px;">
                 <span style="color:#666;font-size:9px;font-family:'JetBrains Mono',monospace;white-space:nowrap;min-width:64px;">${fmtDate(s.soldAt)}</span>
                 <span style="color:${rc.color};font-weight:700;font-size:9px;min-width:22px;">${s.rarity || '?'}</span>
@@ -7706,6 +10885,25 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             #wm-settings-body .wm-set-section {
                 padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.05);
             }
+
+            /* ── Panneau Cartes les plus chères (jumeau du panneau Statistiques) ── */
+            #wm-top-panel {
+                flex-shrink:0; margin:0 10px 10px;
+                background:rgba(12,12,16,0.98); border:1px solid rgba(255,255,255,0.07);
+                border-radius:10px; overflow:hidden;
+            }
+            #wm-top-hdr {
+                padding:8px 13px; font-size:10px; font-weight:700;
+                text-transform:uppercase; letter-spacing:1px; color:#888;
+                cursor:pointer; background:rgba(255,255,255,0.02);
+                display:flex; justify-content:space-between; align-items:center;
+                user-select:none; transition:all 0.15s;
+            }
+            #wm-top-hdr:hover { background:rgba(255,255,255,0.04); color:#bbb; }
+            #wm-top-body { padding:12px 13px; border-top:1px solid rgba(255,255,255,0.06); display:none; max-height:var(--wm-top-h, 60vh); overflow-y:auto; }
+            #wm-top-body.open { display:block; }
+            #wm-top-body::-webkit-scrollbar { width:8px; }
+            #wm-top-body::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.12); border-radius:4px; }
 
             /* ── Panneau Statistiques (jumeau du panneau Paramètres) ── */
             #wm-stats-panel {
@@ -7988,11 +11186,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <button id="wm-raz-btn" style="width:100%;margin-top:8px;padding:4px;border:1px solid rgba(239,68,68,0.3);border-radius:5px;background:rgba(239,68,68,0.05);color:#666;font-size:9px;cursor:pointer;letter-spacing:1px;text-transform:uppercase;flex-shrink:0;">⟳ Reset session</button>
                     <div id="wm-alert" style="margin-top:8px;font-size:11px;font-weight:600;flex-shrink:0;"></div>
                     <div class="wm-sep" style="flex-shrink:0;"></div>
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;flex-shrink:0;">
-                        <div class="wm-lbl" style="margin:0;">Matchs mots-clés</div>
-                        <span id="wm-pack-kw-count" style="font-size:9px;color:#888;font-family:monospace;">0</span>
+                    <!-- Log : déplacé ici depuis le Trash Seller (30/09) — la colonne Pack Opener a de la
+                         place libre, le log y gagne toute la hauteur. « Matchs mots-clés » retiré. -->
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;flex-shrink:0;">
+                        <div class="wm-lbl" style="margin:0;">Log</div>
+                        <button id="wm-log-export" title="Exporter le log en .txt"
+                            style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#aaa;font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;font-family:inherit;">
+                            Export logs 💾
+                        </button>
                     </div>
-                    <div id="wm-pack-kw-hits" style="flex:1;min-height:60px;overflow-y:auto;scrollbar-width:thin;"></div>
+                    <div id="wm-log" class="wm-log" style="min-height:240px;"></div>
                 </div>
             </div>
             <div class="wm-col-resizer" data-resizer="0" title="Glisser pour redimensionner"></div>
@@ -8006,6 +11209,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     </div>
                 </div>
                 <div class="wm-pb">
+                    <div id="wm-antibot-banner" style="display:none;margin-bottom:8px;padding:6px 8px;border:1px solid #ef4444;border-radius:6px;background:rgba(239,68,68,.15);color:#fca5a5;font-size:11px;"></div>
                     <div style="display:flex;gap:6px;margin-bottom:8px;">
                         <button id="wm-autosnipe-btn" class="wm-btn wm-gh" style="flex:1;">⚡ Hunter OFF</button>
                     </div>
@@ -8016,6 +11220,38 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <input type="checkbox" id="wm-hunter-aggro" style="width:13px;height:13px;accent-color:#c084fc;cursor:pointer;margin:0;flex-shrink:0;">
                         <span id="wm-hunter-aggro-lbl">🕵️ Mode fourbe (snipe en fin, pas de mise immédiate)</span>
                     </label>
+                    <div id="wm-legend-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin:-2px 0 8px;padding-left:2px;font-size:10px;color:#888;"
+                        title="Chasse Légendaire : mise automatiquement sur les Légendaires dont l'enchère se termine, tant que la mise reste sous ton maximum — et riposte si quelqu'un surenchérit, jusqu'à ce maximum. Actif quand le Market Watcher tourne, soumis à « Mises auto », au plafond global et à la limite de mises par heure.">
+                        <button id="wm-legend-hunt-btn" type="button" title="Chasse Légendaire seule : achète les L bradées, ne revend rien. Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">👑 Chasse</button>
+                        <button id="wm-legend-resell-btn" type="button" title="Chasse Légendaire + Revente : achète les L bradées, puis remet en vente chaque L gagnée (moyenne L du marché, jamais sous le prix payé + marge — réglée dans le panneau Trash Seller). Met en vente dans /collection, comme le Trash Seller. Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">👑 Chasse + Revente</button>
+                        <button id="wm-legend-resellonly-btn" type="button" title="Revente seule : n'achète plus rien, mais continue de remettre en vente les L gagnées (celles déjà dans la liste, et les prochaines que tu gagnes). Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">🏷️ Revente seule</button>
+                        <span>mise si ≤</span>
+                        <input id="wm-legend-max" type="number" min="1" step="1" style="width:46px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                        <span>💰 dans les</span>
+                        <input id="wm-legend-window" type="number" min="3" max="120" step="1" style="width:38px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                        <span>dernières s</span>
+                        <span title="La Chasse ne mise jamais si la mise ferait descendre ton solde sous ce montant. 0 = pas de réserve.">· réserve</span>
+                        <input id="wm-legend-reserve" type="number" min="0" step="50" title="La Chasse ne mise jamais si la mise ferait descendre ton solde sous ce montant. 0 = pas de réserve." style="width:50px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                        <span>💰</span>
+                    </div>
+                    <div id="wm-opti-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin:-4px 0 8px;padding-left:2px;font-size:10px;color:#888;"
+                        title="Chasse opti : mise en fin d'enchère sur les cartes vendues bien sous leur cote du marché (raretés cochées), pour les revendre plus cher. Plafond par enchère = le plus petit de : cote × %, cote − gain minimum, mise max. Même fenêtre et même réserve que la Chasse L ; soumise à « Mises auto », au plafond global et à la limite par heure.">
+                        <button id="wm-opti-btn" type="button" title="Chasse opti seule : achète les bonnes affaires, ne revend rien. Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">🎯 Chasse opti</button>
+                        <button id="wm-opti-resell-btn" type="button" title="Chasse opti + Revente : achète les bonnes affaires puis les remet en vente à la cote (jamais sous le prix payé + marge). Re-clic pour arrêter."
+                            style="font-size:9px;border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">🎯 Chasse opti + Revente</button>
+                        <span id="wm-opti-rars" style="display:inline-flex;gap:3px;align-items:center;"></span>
+                        <span>· si ≤</span>
+                        <input id="wm-opti-pct" type="number" min="1" max="100" step="5" style="width:36px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(34,211,238,0.35);background:#0f0f13;color:#22d3ee;font-size:9px;text-align:center;">
+                        <span>% cote · gain ≥</span>
+                        <input id="wm-opti-gain" type="number" min="0" step="5" style="width:40px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(34,211,238,0.35);background:#0f0f13;color:#22d3ee;font-size:9px;text-align:center;">
+                        <span>💰 · mise max</span>
+                        <input id="wm-opti-max" type="number" min="1" step="10" title="Jamais une mise au-delà de ce montant, quelle que soit la cote." style="width:50px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(34,211,238,0.35);background:#0f0f13;color:#22d3ee;font-size:9px;text-align:center;">
+                        <span>💰</span>
+                    </div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
                         <div class="wm-lbl" id="wm-kw-label" style="margin:0;">Mots-clés (0)</div>
@@ -8042,6 +11278,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             <option value="rarity_desc">⭐ Rareté (L→C)</option>
                             <option value="rarity_asc">⭐ Rareté (C→L)</option>
                             <option value="title_asc">🔤 Titre A→Z</option>
+                            <option value="keyword_asc">🔍 Mot-clé (groupé)</option>
                             <option value="owned_asc">📚 Possédées ↑ (manquantes d'abord)</option>
                             <option value="owned_desc">📚 Possédées ↓ (doublons d'abord)</option>
                         </select>
@@ -8053,6 +11290,23 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             <option value="compact">☰ Compact</option>
                             <option value="cards">🖼 Cadres</option>
                         </select>
+                    </div>
+                    <!-- Filtres d'affichage : ils ne touchent PAS au scan, seulement à ce
+                         qui est montré. Les raretés sont des bascules indépendantes (on
+                         veut souvent « UR + L » et rien d'autre) ; le mot-clé est une liste
+                         déroulante, puisqu'on regarde les résultats d'un mot à la fois. -->
+                    <div style="display:flex;align-items:center;gap:4px;margin-bottom:6px;flex-wrap:wrap;">
+                        <span class="wm-lbl" style="margin:0;white-space:nowrap;">Rareté</span>
+                        <div id="wm-rarity-filter" style="display:flex;gap:3px;flex-wrap:wrap;"></div>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+                        <span class="wm-lbl" style="margin:0;white-space:nowrap;">Mot-clé</span>
+                        <select id="wm-keyword-filter" title="N'afficher que les annonces trouvées par ce mot-clé"
+                            style="flex:1;min-width:0;padding:3px 6px;border-radius:4px;border:1px solid rgba(255,255,255,0.1);background:#0f0f13;color:#fff;font-size:11px;outline:none;cursor:pointer;">
+                            <option value="">Tous les mots-clés</option>
+                        </select>
+                        <button id="wm-clear-hits" title="Vider la liste affichée. Le scan continue : les annonces encore en vente reviendront au prochain passage, et celles qui reviennent compteront comme nouvelles."
+                            style="padding:3px 8px;border-radius:4px;border:1px solid rgba(239,68,68,0.35);background:rgba(239,68,68,0.08);color:#ef4444;font-size:11px;cursor:pointer;white-space:nowrap;">🧹 Vider</button>
                     </div>
                     <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;font-size:11px;color:#bbb;cursor:pointer;user-select:none;">
                         <input type="checkbox" id="wm-hide-owned" style="width:14px;height:14px;accent-color:#4ade80;cursor:pointer;margin:0;flex-shrink:0;">
@@ -8070,28 +11324,45 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 </div>
                 <div class="wm-pb">
                     <div id="wm-trash-status" style="font-size:10px;color:#888;min-height:14px;margin-bottom:6px;"></div>
+                    <div id="wm-sell-pct-row" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-bottom:6px;font-size:9px;color:#888;"
+                        title="Prix de départ = cote du marché × ce %, par rareté. Au-dessus de 100 : on vend plus cher que la cote ; en dessous : moins cher, pour vendre plus vite."></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px;">
                         <div class="wm-lbl" style="margin:0;">Ventes actives</div>
                         <div style="display:flex;align-items:center;gap:6px;">
+                            <button id="wm-preview-sales-btn" title="Montre, SANS rien vendre, les prochaines cartes qui partiraient : dans quel ordre, à quel prix, et pour combien de temps."
+                                style="font-size:9px;color:#5dade2;background:rgba(52,152,219,0.08);border:1px solid rgba(52,152,219,0.35);border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">👁️ Aperçu</button>
                             <button id="wm-refresh-sales-btn" title="Annule les ventes sans mise et remet en vente les meilleures cartes selon ta stratégie (Paramètres)"
                                 style="font-size:9px;color:#c084fc;background:rgba(192,132,252,0.08);border:1px solid rgba(192,132,252,0.35);border-radius:4px;padding:2px 7px;cursor:pointer;white-space:nowrap;">🔄 Refresh ventes</button>
                             <span id="wm-active-sales-count" style="font-size:9px;color:#888;font-family:'JetBrains Mono',monospace;">0/5</span>
                         </div>
                     </div>
+                    <div id="wm-sale-preview" style="margin-bottom:8px;"></div>
                     <div id="wm-active-sales" style="margin-bottom:8px;"></div>
+                    <div id="wm-set-aside"></div>
+                    <div class="wm-sep"></div>
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px;flex-wrap:wrap;">
+                        <div class="wm-lbl" style="margin:0;color:#FFD700;" title="Mode à part du Trash Seller : revend les cartes achetées par une Chasse (L ou opti). S'active avec « … + Revente » ou « 🏷️ Revente seule » dans le Market Watcher.">🏷️ Revente (achats de la Chasse)</div>
+                        <label style="display:inline-flex;align-items:center;gap:3px;font-size:9px;color:#888;"
+                            title="Plancher : jamais vendue sous le prix payé + ce %. Prix de départ = moyenne L du marché si elle est plus haute.">
+                            jamais sous payé +
+                            <input id="wm-lresell-margin" type="number" min="0" max="1000" step="5" style="width:40px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                            %
+                        </label>
+                        <label style="display:inline-flex;align-items:center;gap:3px;font-size:9px;color:#888;"
+                            title="Invendue : toutes les N mises en vente sans acheteur, le prix baisse de ce % (cumulé), sans jamais passer sous le plancher. 0 % = pas de baisse.">
+                            📉 -
+                            <input id="wm-lresell-decay" type="number" min="0" max="90" step="1" style="width:34px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                            % toutes les
+                            <input id="wm-lresell-decay-every" type="number" min="1" max="50" step="1" style="width:30px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,215,0,0.35);background:#0f0f13;color:#FFD700;font-size:9px;text-align:center;">
+                            invendue(s)
+                        </label>
+                    </div>
+                    <div id="wm-lresell-status" style="font-size:10px;color:#888;min-height:14px;margin-bottom:4px;"></div>
+                    <div id="wm-lresell-list" style="margin-bottom:8px;"></div>
                     <div class="wm-sep"></div>
                     <div class="wm-lbl">Ventes (aujourd'hui)</div>
                     <div id="wm-sell-history" style="margin-bottom:8px;"></div>
-                    <div class="wm-sep"></div>
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                        <div class="wm-lbl" style="margin:0;">Log</div>
-                        <button id="wm-log-export" title="Exporter le log en .txt"
-                            style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#aaa;font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;font-family:inherit;">
-                            Export logs 💾
-                        </button>
-                    </div>
-                    <div id="wm-log" class="wm-log"></div>
                 </div>
             </div>
         </div>
@@ -8154,6 +11425,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 <div id="wm-tagger-presets" style="margin-top:4px;"></div>
                 <div id="wm-tagger-status" class="wm-set-sub" style="margin-top:8px;"></div>
                 <div id="wm-tagger-results" style="margin-top:8px;max-height:220px;overflow-y:auto;"></div>
+            </div>
+        </div>
+        <div id="wm-top-panel">
+            <div class="wm-row-resizer" data-target="wm-top-body" data-var="--wm-top-h"></div>
+            <div id="wm-top-hdr">
+                <span>💎 Cartes les plus chères</span>
+                <span id="wm-top-chevron">▴</span>
+            </div>
+            <div id="wm-top-body">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+                    <button id="wm-top-run" title="Lit ta collection et la cote du marché de chaque carte (celle de sa rareté), puis classe les cartes de la plus chère à la moins chère. Quelques minutes la première fois, bien plus rapide ensuite (cotes en cache)."
+                        style="border:1px solid rgba(251,191,36,0.4);background:rgba(251,191,36,0.08);color:#fbbf24;font-size:10px;padding:3px 10px;border-radius:5px;cursor:pointer;white-space:nowrap;">💎 Calculer</button>
+                    <span id="wm-top-status" style="font-size:10px;color:#888;"></span>
+                </div>
+                <div id="wm-top-result"></div>
             </div>
         </div>
         <div id="wm-stats-panel">
@@ -8269,6 +11555,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <input type="checkbox" id="wm-set-notifications-enabled">
                         <span>Badge de notifications sur le bouton ⚙ (compteur d'événements)</span>
                     </label>
+                    <div class="wm-set-sub" style="margin-top:10px;">🛡️ Vérification anti-bot du site (mises auto en pause quelques secondes) : me prévenir par…</div>
+                    <label class="wm-toggle">
+                        <input type="checkbox" id="wm-set-antibot-banner">
+                        <span>Bandeau rouge dans le Market Watcher</span>
+                    </label>
+                    <label class="wm-toggle">
+                        <input type="checkbox" id="wm-set-antibot-sound">
+                        <span>Son</span>
+                    </label>
+                    <label class="wm-toggle">
+                        <input type="checkbox" id="wm-set-antibot-notif">
+                        <span>Notification Windows (même onglet en arrière-plan)</span>
+                    </label>
                     <div class="wm-set-sub" style="margin-top:10px;">Cooldown entre les packs</div>
                     <label class="wm-toggle"><input type="radio" name="wm-set-pack-cd" value="180"><span>3 minutes (compte abonné)</span></label>
                     <label class="wm-toggle"><input type="radio" name="wm-set-pack-cd" value="600"><span>10 minutes (compte gratuit)</span></label>
@@ -8328,18 +11627,26 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <input type="checkbox" id="wm-set-sell-market">
                         <span>Mettre en vente au prix moyen du marché (× %)</span>
                     </label>
-                    <div class="wm-set-sub" style="margin-top:4px;">% du prix moyen des ventes passées appliqué comme prix de base (ex. 90 = 90% de la moyenne). Si <b>aucune vente</b> n'est connue pour la carte, le prix manuel du tableau ci-dessous est utilisé.</div>
+                    <div class="wm-set-sub" style="margin-top:4px;">% de la cote appliqué comme prix de départ (ex. 90 = 90 % de la moyenne) — valeur <b>par défaut</b> : un % propre à chaque rareté se règle directement dans le panneau Trash Seller. Si <b>aucune vente</b> n'est connue pour la carte, le prix du tableau ci-dessous est utilisé.</div>
                     <input id="wm-set-sell-market-pct" type="number" min="1" max="500" step="5" class="wm-input">
                     <label class="wm-toggle" style="margin-top:6px;">
                         <input type="checkbox" id="wm-set-sell-market-floor">
                         <span>🛡️ Ne jamais vendre sous le prix du tableau (plancher)</span>
                     </label>
                     <div class="wm-set-sub" style="margin-top:2px;">Si le prix marché calculé est inférieur au prix du tableau pour cette rareté, on garde le prix du tableau. Évite de brader une carte sous-cotée.</div>
+                    <div class="wm-set-sub" style="margin-top:4px;">Le plancher ne protège que les <b>N premières</b> mises en vente d'une carte ; ensuite elle part au prix du marché (0 = plancher toujours).</div>
+                    <input id="wm-set-sell-floor-tries" type="number" min="0" max="50" step="1" class="wm-input">
                     <label class="wm-toggle" style="margin-top:6px;">
                         <input type="checkbox" id="wm-set-sell-degressive">
-                        <span>📉 Prix dégressif sur les invendus (-15% / 10 remises)</span>
+                        <span>📉 Baisser le prix à chaque invendu</span>
                     </label>
-                    <div class="wm-set-sub" style="margin-top:2px;">Une carte remise en vente sans être vendue (🔁) voit son prix baisser de <b>15%</b> à chaque tranche de <b>10 remises</b> (plafonné à -75%, jamais sous 1 💰). S'applique après le plancher — le but est d'écouler ce qui stagne.</div>
+                    <div class="wm-set-sub" style="margin-top:2px;">Baisse par invendu (% du prix de départ) — et jamais sous ce % du prix de départ :</div>
+                    <div style="display:flex;gap:6px;">
+                        <input id="wm-set-sell-decay-step" type="number" min="0" max="50" step="1" class="wm-input" title="Baisse par invendu, en %">
+                        <input id="wm-set-sell-decay-min" type="number" min="1" max="100" step="5" class="wm-input" title="Minimum, en % du prix de départ">
+                    </div>
+                    <div class="wm-set-sub" style="margin-top:6px;">Mettre une carte de côté après <b>N invendus</b> — elle sort de la file et attend ta décision dans le panneau (0 = jamais) :</div>
+                    <input id="wm-set-sell-set-aside" type="number" min="0" max="100" step="1" class="wm-input">
                     <label class="wm-toggle" style="margin-top:6px;">
                         <input type="checkbox" id="wm-set-sell-undercut">
                         <span>🃏 Undercut : se placer sous une annonce existante</span>
@@ -8350,6 +11657,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         <span>🛡️ Ne vendre que si le tag de vente est le SEUL tag</span>
                     </label>
                     <div class="wm-set-sub" style="margin-top:2px;">Filet de sécurité : une carte n'est mise en vente que si elle porte <b>uniquement</b> le tag de vente. Si elle a aussi un autre tag, le tag de vente est probablement une erreur → la carte est <b>ignorée</b> et conservée.</div>
+                    <label class="wm-toggle" style="margin-top:10px;">
+                        <input type="checkbox" id="wm-set-sell-auto-resume">
+                        <span>🔄 Reprendre le Trash Seller après un rechargement de page</span>
+                    </label>
+                    <div class="wm-set-sub" style="margin-top:2px;">Désactivé (défaut) : après un F5 ou un rechargement, le Trash Seller reste <b>à l'arrêt</b> et attend un clic sur ▶ START. Activé : il repart tout seul et recommence à mettre des cartes en vente dès le chargement de la page.</div>
                     <div class="wm-set-sub" style="margin-top:10px;">Trash Seller : prix et durée par rareté <span style="color:#666;">(repli si prix marché indisponible · sert aussi de plancher)</span></div>
                     <table id="wm-sell-table" style="width:100%;border-collapse:separate;border-spacing:0 4px;font-size:10px;">
                         <thead>
@@ -8417,7 +11729,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // plus par une relecture de localStorage que les sorties anticipées n'alimentaient pas.
             const source = currentUsernameSource;
             if (currentUsername) {
-                wmLog(`👤 Utilisateur identifié : <b style="color:#4ade80;">${currentUsername}</b> <span style="color:#555;font-size:9px;">(${source})</span>`);
+                wmLog(`👤 Utilisateur identifié : <b style="color:#4ade80;">${esc(currentUsername)}</b> <span style="color:#555;font-size:9px;">(${source})</span>`);
                 // Découverte du tag Trash si pas en cache
                 if (!TRASH_TAG_ID) await discoverTrashTagId();
                 // Réconciliation des ventes en attente (retag des invendues revenues pendant
@@ -8479,6 +11791,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
 
         startBtn.onclick = () => setPackOpenerRunning(!running);
+        // Donne à la loop un moyen d'arrêter le module (session expirée, échecs répétés).
+        packOpenerStopFn = () => setPackOpenerRunning(false);
 
         // Bouton "Ouvrir pack" : ouvre UN seul pack manuellement (utile pour écouler les packs
         // en attente sans lancer la boucle auto). Passe par openPack() → handlePackOpened, donc
@@ -8501,10 +11815,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     await handlePackOpened(data, { animate: true });
                 }
             } catch(err) {
-                if (err && err.message === '403') {
-                    if (alertEl) alertEl.innerHTML = `<span style="color:#EF4444">⛔ 403 — réessaie dans un instant</span>`;
+                if (err && (err.status === 401 || err.status === 403)) {
+                    if (alertEl) alertEl.innerHTML = `<span style="color:#EF4444">⛔ ${err.status} — session expirée ? recharge la page (Ctrl+Shift+R)</span>`;
+                    wmLog(`⛔ Ouverture manuelle refusée (HTTP ${err.status}) — vérifie que tu es toujours connecté au site.`);
                 } else {
-                    if (alertEl) alertEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${err && err.message ? err.message : 'ouverture échouée'}</span>`;
+                    if (alertEl) alertEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(err && err.message ? err.message : 'ouverture échouée')}</span>`;
                 }
             } finally {
                 openPackBtn.disabled = false;
@@ -8531,6 +11846,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         marketBtn.onclick = () => {
             if (!marketWatcherActive) {
+                ensureNotifPermission();   // clic de l'utilisateur : seul moment où le navigateur accepte de demander
                 marketWatcherActive = true;
                 marketBtn.className = "wm-btn wm-r wm-sm"; marketBtn.innerText = "⏹ STOP";
                 document.getElementById('dot-market').classList.add('on');
@@ -8562,6 +11878,210 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (aggroChk) aggroChk.onchange = () => window.wmToggleHunterAggressive();
         paintHunterAggro(); // reflète l'état persisté au chargement (case + libellé du bouton)
 
+        /* 👑 Deux boutons, deux modes (le Trash Seller reste le 3e, à part) :
+             · « Chasse »           : achète les L bradées, ne revend rien ;
+             · « Chasse + Revente » : achète, puis remet en vente les L gagnées.
+           Exclusifs. Un re-clic sur le mode actif l'arrête. Après un rechargement de page, la
+           revente ne reprend PAS toute seule (elle clique dans /collection) : le bouton
+           affiche ⏸ et un clic la relance. */
+        const legendHuntBtn = document.getElementById('wm-legend-hunt-btn');
+        const legendResellBtn = document.getElementById('wm-legend-resell-btn');
+        const legendMax = document.getElementById('wm-legend-max');
+        const legendWin = document.getElementById('wm-legend-window');
+        const optiBtn = document.getElementById('wm-opti-btn');
+        const optiResellBtn = document.getElementById('wm-opti-resell-btn');
+        const legendResellOnlyBtn = document.getElementById('wm-legend-resellonly-btn');
+        const forgetHunt = (kind) => {
+            for (const [id, e] of [...legendHunt.entries()]) if ((e.kind === 'opti') === (kind === 'opti')) forgetLegend(id);
+        };
+        function setLegendHunt(on) {
+            if (on === getSetting('legendHuntEnabled')) return;
+            setSetting('legendHuntEnabled', on);
+            if (on) {
+                wmLog(`👑 Chasse Légendaire ACTIVÉE : mise sur les Légendaires ≤ <b>${getSetting('legendHuntMaxPrice')} 💰</b> dans les <b>${getSetting('legendHuntWindowSec')} dernières secondes</b>, riposte jusqu'à ce maximum.${marketWatcherActive ? '' : ' Démarre le Market Watcher pour qu\'elle tourne.'}`);
+                warnAutoBidsPaused('la Chasse Légendaire');
+                if (marketWatcherActive) discoverLegends().catch(() => {});
+            } else {
+                forgetHunt('legend');
+                wmLog('👑 Chasse Légendaire désactivée.');
+            }
+        }
+        function setOptiHunt(on) {
+            if (on === getSetting('optiHuntEnabled')) return;
+            setSetting('optiHuntEnabled', on);
+            if (on) {
+                wmLog(`🎯 Chasse opti ACTIVÉE : ${optiRarities().join(' / ') || 'aucune rareté cochée !'} · mise si ≤ <b>${getSetting('optiMaxPct')} %</b> de la cote, gain ≥ <b>${getSetting('optiMinGain')} 💰</b>, jamais plus de <b>${getSetting('optiMaxBid')} 💰</b>.${marketWatcherActive ? '' : ' Démarre le Market Watcher pour qu\'elle tourne.'}`);
+                warnAutoBidsPaused('la Chasse opti');
+                if (marketWatcherActive) discoverOpti().catch(() => {});
+            } else {
+                forgetHunt('opti');
+                wmLog('🎯 Chasse opti désactivée.');
+            }
+        }
+        /* Cinq modes exclusifs : 'hunt' (Chasse L), 'both' (Chasse L + Revente), 'opti',
+           'optiboth' (Chasse opti + Revente), 'resell' (Revente seule, pour tous les modes).
+           Passer de l'un à l'autre ne remet la date d'activation de la revente à zéro que si
+           la revente était arrêtée : elle garde sa file et continue d'y ajouter les achats
+           de la Chasse. */
+        function currentLegendMode() {
+            const h = getSetting('legendHuntEnabled'), o = getSetting('optiHuntEnabled'), r = getSetting('legendResellEnabled');
+            if (o) return r ? 'optiboth' : 'opti';
+            if (h) return r ? 'both' : 'hunt';
+            return r ? 'resell' : 'off';
+        }
+        const RESELL_MODES = new Set(['both', 'optiboth', 'resell']);
+        function paintLegendModes() {
+            const mode = currentLegendMode();
+            const paint = (btn, on, paused, col) => {
+                if (!btn) return;
+                btn.style.color = on ? (paused ? '#fbbf24' : '#0f0f13') : col;
+                btn.style.background = on ? (paused ? 'rgba(251,191,36,0.12)' : col) : 'rgba(255,255,255,0.03)';
+                btn.style.border = `1px solid ${on ? (paused ? '#fbbf24' : col) : 'rgba(255,255,255,0.18)'}`;
+                btn.style.fontWeight = on ? '700' : '400';
+            };
+            const mark = (m) => mode !== m ? '' : (RESELL_MODES.has(m) ? (legendResellRunning ? ' ✓' : ' ⏸') : ' ✓');
+            const paused = !legendResellRunning;
+            [[legendHuntBtn, 'hunt', '👑 Chasse', '#FFD700'], [legendResellBtn, 'both', '👑 Chasse + Revente', '#FFD700'],
+             [optiBtn, 'opti', '🎯 Chasse opti', '#22d3ee'], [optiResellBtn, 'optiboth', '🎯 Chasse opti + Revente', '#22d3ee'],
+             [legendResellOnlyBtn, 'resell', '🏷️ Revente seule', '#4ade80']].forEach(([btn, m, label, col]) => {
+                paint(btn, mode === m, RESELL_MODES.has(m) && paused, col);
+                if (btn) btn.innerText = label + mark(m);
+            });
+            const st = document.getElementById('wm-lresell-status');
+            if (st && !legendResellRunning) st.innerHTML = getSetting('legendResellEnabled')
+                ? '<span style="color:#fbbf24;">⏸️ Revente en pause (rechargement de la page) — clique le bouton marqué ⏸ dans le Market Watcher pour reprendre.</span>'
+                : '<span style="color:#555;">Inactive — boutons « … + Revente » ou « 🏷️ Revente seule » du Market Watcher.</span>';
+        }
+        function setLegendMode(mode) {
+            const wantHunt = mode === 'hunt' || mode === 'both';
+            const wantOpti = mode === 'opti' || mode === 'optiboth';
+            const wantResell = RESELL_MODES.has(mode);
+            const hadResell = getSetting('legendResellEnabled');
+            if (wantResell && !hadResell) setSetting('legendResellSince', Date.now()); // « à partir de maintenant »
+            setSetting('legendResellEnabled', wantResell);
+            if (wantResell) startLegendResell(mode === 'resell' ? 'revente seule, la Chasse n\'achète plus' : '');
+            else if (hadResell) { stopLegendResell(); wmLog('🏷️ Revente arrêtée.'); }
+            setLegendHunt(wantHunt);
+            setOptiHunt(wantOpti);
+            paintLegendModes();
+        }
+        function clickLegendMode(mode) {
+            ensureNotifPermission();
+            if (currentLegendMode() === mode) {
+                // Mode déjà actif mais revente en pause (rechargement) → le clic la relance.
+                if (RESELL_MODES.has(mode) && !legendResellRunning) { startLegendResell('reprise'); paintLegendModes(); return; }
+                setLegendMode('off');
+                return;
+            }
+            setLegendMode(mode);
+        }
+        if (legendHuntBtn) legendHuntBtn.onclick = () => clickLegendMode('hunt');
+        if (legendResellBtn) legendResellBtn.onclick = () => clickLegendMode('both');
+        if (optiBtn) optiBtn.onclick = () => clickLegendMode('opti');
+        if (optiResellBtn) optiResellBtn.onclick = () => clickLegendMode('optiboth');
+        if (legendResellOnlyBtn) legendResellOnlyBtn.onclick = () => clickLegendMode('resell');
+        // Raretés de la Chasse opti : une case par rareté.
+        const optiRarsEl = document.getElementById('wm-opti-rars');
+        if (optiRarsEl) {
+            const on = new Set(optiRarities());
+            optiRarsEl.innerHTML = ['L', 'UR', 'SR', 'R', 'PC', 'C'].map(r =>
+                `<label style="display:inline-flex;align-items:center;gap:1px;cursor:pointer;color:${RARITY[r].color};font-weight:700;font-size:9px;">
+                    <input type="checkbox" data-wm-opti-rar="${r}" ${on.has(r) ? 'checked' : ''} style="width:11px;height:11px;margin:0;cursor:pointer;accent-color:${RARITY[r].color};">${r}</label>`).join('');
+            optiRarsEl.querySelectorAll('[data-wm-opti-rar]').forEach(cb => {
+                cb.onchange = () => {
+                    const list = [...optiRarsEl.querySelectorAll('[data-wm-opti-rar]')].filter(x => x.checked).map(x => x.getAttribute('data-wm-opti-rar'));
+                    setSetting('optiRarities', list.join(',') || ' ');
+                    wmLog(`🎯 Chasse opti : raretés ${list.join(' / ') || 'aucune'}`);
+                };
+            });
+        }
+        [['wm-opti-pct', 'optiMaxPct', 1, 100, v => `🎯 Chasse opti : mise si ≤ ${v} % de la cote`],
+         ['wm-opti-gain', 'optiMinGain', 0, 1000000, v => `🎯 Chasse opti : gain minimum ${v} 💰`],
+         ['wm-opti-max', 'optiMaxBid', 1, 100000000, v => `🎯 Chasse opti : jamais une mise au-delà de ${v} 💰`],
+        ].forEach(([id, key, min, max, msg]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.value = getSetting(key);
+            el.onchange = () => {
+                let v = parseInt(el.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS[key];
+                v = Math.min(max, Math.max(min, v));
+                el.value = v;
+                setSetting(key, v);
+                wmLog(msg(v));
+            };
+        });
+        window.wmPaintLegendModes = paintLegendModes;
+        const lresellMargin = document.getElementById('wm-lresell-margin');
+        if (lresellMargin) {
+            lresellMargin.value = getSetting('legendResellMarginPct');
+            lresellMargin.onchange = () => {
+                let v = parseInt(lresellMargin.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS.legendResellMarginPct;
+                v = Math.min(1000, Math.max(0, v));
+                lresellMargin.value = v;
+                setSetting('legendResellMarginPct', v);
+                wmLog(`👑 Revente Légendaire : jamais sous le prix payé + <b>${v} %</b>.`);
+                renderLegendResell();
+            };
+        }
+        [['wm-lresell-decay', 'legendResellDecayPct', 0, 90, v => v > 0 ? `👑 Revente Légendaire : -${v} % par palier d'invendus` : '👑 Revente Légendaire : pas de baisse sur invendu'],
+         ['wm-lresell-decay-every', 'legendResellDecayEvery', 1, 50, v => `👑 Revente Légendaire : baisse toutes les ${v} mise(s) en vente sans acheteur`],
+        ].forEach(([id, key, min, max, msg]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.value = getSetting(key);
+            el.onchange = () => {
+                let v = parseInt(el.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS[key];
+                v = Math.min(max, Math.max(min, v));
+                el.value = v;
+                setSetting(key, v);
+                wmLog(msg(v));
+            };
+        });
+        // Reprise après rechargement : seulement si c'est le bot qui a rechargé la page.
+        if (getSetting('legendResellEnabled')) {
+            let selfNav = false;
+            try {
+                const ts = parseInt(sessionStorage.getItem('wm_lresell_selfnav') || '0', 10);
+                selfNav = !!sessionStorage.getItem('wm_lresell_active') && Number.isFinite(ts) && (Date.now() - ts) < 60000;
+                sessionStorage.removeItem('wm_lresell_selfnav');
+                if (!selfNav) sessionStorage.removeItem('wm_lresell_active');
+            } catch(e) {}
+            if (selfNav) startLegendResell('reprise après le retour sur /collection');
+        }
+        renderLegendResell();
+        paintLegendModes();
+        // Nettoie la liste au chargement, même revente arrêtée (cartes vendues ailleurs…).
+        setTimeout(() => { reconcileLegendResell(true).catch(() => {}); }, 8000);
+        [[legendMax, 'legendHuntMaxPrice', 1, 1000000, v => `👑 Chasse Légendaire : maximum ${v} 💰`],
+         [legendWin, 'legendHuntWindowSec', 3, 120, v => `👑 Chasse Légendaire : fenêtre de ${v} s avant la fin`],
+         [document.getElementById('wm-legend-reserve'), 'legendHuntReserve', 0, 100000000,
+          v => v > 0 ? `👑 Chasse Légendaire : réserve de ${v.toLocaleString('fr-FR')} 💰 — le solde ne descend jamais dessous` : '👑 Chasse Légendaire : pas de réserve'],
+        ].forEach(([el, key, min, max, msg]) => {
+            if (!el) return;
+            el.value = getSetting(key);
+            el.onchange = () => {
+                let v = parseInt(el.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS[key];
+                v = Math.min(max, Math.max(min, v));
+                el.value = v;
+                setSetting(key, v);
+                // Le max change → les plafonds posés par la chasse suivent.
+                if (key === 'legendHuntMaxPrice') {
+                    // Chasse L seulement, et seulement les plafonds encore posés par elle.
+                    for (const [id, e] of legendHunt) {
+                        if (e.kind === 'opti' || !e.setCap || autoBidMaxMap.get(id) !== e.capValue) continue;
+                        autoBidMaxMap.set(id, v);
+                        e.capValue = v;
+                    }
+                    saveAutoBidMax();
+                }
+                wmLog(msg(v));
+            };
+        });
+
         // Tri du watcher market : initialise la valeur sauvegardée et réagit aux changements
         const sortSelect = document.getElementById('wm-sort-select');
         if (sortSelect) {
@@ -8575,6 +12095,72 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 }
             };
         }
+
+        /* Filtre par rareté : une pastille par code, allumée ou éteinte. Re-render à
+           chaque clic, sans attendre le prochain scan — le cache des hits suffit. */
+        function renderRarityFilter() {
+            const box = document.getElementById('wm-rarity-filter');
+            if (!box) return;
+            box.innerHTML = ['L', 'UR', 'SR', 'R', 'PC', 'C'].map(code => {
+                const on = marketRarityFilter.has(code);
+                const c = (RARITY[code] || {}).color || '#888';
+                return `<button data-rar="${code}" title="${on ? 'Afficher aussi les autres raretés' : 'N\'afficher que cette rareté'}"
+                    style="padding:1px 6px;border-radius:4px;cursor:pointer;font-size:10px;font-weight:700;
+                    border:1px solid ${on ? c : 'rgba(255,255,255,0.12)'};
+                    background:${on ? c + '22' : 'transparent'};color:${on ? c : '#666'};">${code}</button>`;
+            }).join('');
+            box.querySelectorAll('button[data-rar]').forEach(b => {
+                b.onclick = () => {
+                    const code = b.dataset.rar;
+                    if (marketRarityFilter.has(code)) marketRarityFilter.delete(code);
+                    else marketRarityFilter.add(code);
+                    try { localStorage.setItem(MARKET_RARITY_FILTER_KEY, JSON.stringify([...marketRarityFilter])); } catch(e) {}
+                    renderRarityFilter();
+                    if (lastHitsCache.length > 0) renderMarketHits(marketAlertEl, lastHitsCache, []);
+                };
+            });
+        }
+        renderRarityFilter();
+
+        /* Liste des mots-clés : reconstruite depuis la liste de surveillance, pour qu'un
+           mot ajouté ou retiré s'y reflète sans recharger la page. */
+        function renderKeywordFilter() {
+            const sel = document.getElementById('wm-keyword-filter');
+            if (!sel) return;
+            const kws = [...new Set(WATCHLIST.filter(e => e.enabled !== false).map(e => e.kw))];
+            // Un mot-clé retiré de la liste ne doit pas rester en filtre actif invisible.
+            if (marketKeywordFilter && !kws.some(k => k.toLowerCase() === marketKeywordFilter.toLowerCase())) {
+                marketKeywordFilter = '';
+                try { localStorage.removeItem(MARKET_KEYWORD_FILTER_KEY); } catch(e) {}
+            }
+            sel.innerHTML = '<option value="">Tous les mots-clés</option>'
+                + kws.map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('');
+            sel.value = marketKeywordFilter;
+            sel.onchange = () => {
+                marketKeywordFilter = sel.value;
+                try { localStorage.setItem(MARKET_KEYWORD_FILTER_KEY, marketKeywordFilter); } catch(e) {}
+                if (lastHitsCache.length > 0) renderMarketHits(marketAlertEl, lastHitsCache, []);
+            };
+        }
+        renderKeywordFilter();
+        window.wmRefreshKeywordFilter = renderKeywordFilter;
+
+        /* Vider la liste. On efface l'affichage ET la mémoire des annonces déjà vues,
+           pour que ce qui revient au prochain scan soit signalé comme nouveau — sinon
+           le bouton ne servirait qu'à masquer une seconde. Le scan lui-même continue. */
+        const clearBtn = document.getElementById('wm-clear-hits');
+        if (clearBtn) clearBtn.onclick = () => {
+            const n = lastHitsCache.length;
+            lastHitsCache = [];
+            activeHitsMap.clear();
+            lastMarketHits.clear();
+            firstSeenMap.clear();
+            outbidSet.clear();
+            try { sessionStorage.removeItem('wm_hits_cache'); } catch(e) {}
+            marketAlertEl.innerHTML = `<div style="color:#555;font-size:11px;text-align:center;padding:4px 0;">
+                Liste vidée — les annonces encore en vente reviendront au prochain scan.</div>`;
+            wmLog(`🧹 Liste des annonces vidée (${n} affichée${n > 1 ? 's' : ''}). Le scan continue.`);
+        };
 
         // Case "masquer les cartes déjà possédées" (persistée)
         const hideOwnedChk = document.getElementById('wm-hide-owned');
@@ -8634,6 +12220,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     marketBtn.className = "wm-btn wm-r wm-sm"; marketBtn.innerText = "⏹ STOP";
                     document.getElementById('dot-market').classList.add('on');
                     runMarketScanLoop(marketAlertEl, marketStatusEl);
+                    startLegendHunt();
                     // Démarre la hot lane (cas reload : on a déjà les hits en cache)
                     setTimeout(() => startHotLane(), 1000);
                     updateDots();
@@ -8654,6 +12241,27 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const trashStatus = document.getElementById("wm-trash-status");
 
         // Bouton "Refresh ventes" : annule les ventes sans mise et re-liste selon la stratégie
+        /* Aperçu de l'ordre de vente. Peut demander des cotes manquantes au marché,
+           d'où l'état d'attente sur le bouton — sans lui on ne saurait pas si le clic
+           a été pris en compte. */
+        const previewBtn = document.getElementById('wm-preview-sales-btn');
+        if (previewBtn) previewBtn.onclick = async () => {
+            if (previewBtn.disabled) return;
+            previewBtn.disabled = true;
+            const prev = previewBtn.innerText;
+            previewBtn.innerText = '⏳ …';
+            try {
+                renderSalePreview(await buildSalePreview());
+            } catch (e) {
+                const el = document.getElementById('wm-sale-preview');
+                if (el) el.innerHTML = `<div style="color:#ef4444;font-size:10px;">Aperçu impossible : ${esc((e && e.message) || e)}</div>`;
+                wmLog(`⚠️ Aperçu de vente : ${esc((e && e.message) || e)}`);
+            } finally {
+                previewBtn.disabled = false;
+                previewBtn.innerText = prev || '👁️ Aperçu';
+            }
+        };
+
         const refreshSalesBtn = document.getElementById('wm-refresh-sales-btn');
         if (refreshSalesBtn) {
             refreshSalesBtn.onclick = () => {
@@ -8684,9 +12292,33 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
         };
 
-        // Auto-restart après F5 si le Trash Seller tournait avant
+        // Reprise après un rechargement de page. PAR DÉFAUT : on ne redémarre PAS.
+        // Avant, le drapeau sessionStorage relançait le Trash Seller à chaque chargement du
+        // script : il suffisait d'arriver sur /collection (F5 ou navigation qui recharge la
+        // page) pour que le bot se remette à cliquer sur les cartes et à les mettre en vente
+        // sans aucune action de l'utilisateur. Une mise en vente est irréversible → la reprise
+        // est désormais explicite (réglage « Reprise auto » ou clic sur ▶ START).
         if (sessionStorage.getItem('wm_trashseller_active')) {
-            startTrashSeller();
+            // Navigation forcée par le bot (retour sur /collection après une mise en vente) :
+            // c'est LUI qui a rechargé la page, pas l'utilisateur → on reprend. Marqueur à
+            // usage unique et périmé au bout d'une minute.
+            let selfNav = false;
+            try {
+                const ts = parseInt(sessionStorage.getItem('wm_trashseller_selfnav') || '0', 10);
+                selfNav = Number.isFinite(ts) && (Date.now() - ts) < 60000;
+                sessionStorage.removeItem('wm_trashseller_selfnav');
+            } catch(e) {}
+            if (selfNav) {
+                wmLog('▶ Trash Seller : reprise après le retour automatique sur /collection');
+                startTrashSeller();
+            } else if (getSetting('sellAutoResume')) {
+                wmLog('▶ Trash Seller : reprise automatique après rechargement (réglage activé)');
+                startTrashSeller();
+            } else {
+                sessionStorage.removeItem('wm_trashseller_active');
+                trashStatus.innerHTML = '<span style="color:#fbbf24;">⏸️ Arrêté par le rechargement de la page — ▶ START pour reprendre.</span>';
+                wmLog('⏸️ Trash Seller non repris après le rechargement de la page (reprise auto désactivée)');
+            }
         }
 
         /* ════════ HEADER CONTROLS ════════ */
@@ -9013,6 +12645,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             wmLog(`💹 Trash Seller : prix au marché réglé à <b>${v}%</b> de la moyenne`);
         };
 
+        // Reprise auto du Trash Seller après un rechargement de page (off par défaut)
+        const sellAutoResumeChk = document.getElementById('wm-set-sell-auto-resume');
+        if (sellAutoResumeChk) {
+            sellAutoResumeChk.checked = getSetting('sellAutoResume');
+            sellAutoResumeChk.onchange = () => {
+                setSetting('sellAutoResume', sellAutoResumeChk.checked);
+                wmLog(sellAutoResumeChk.checked
+                    ? '🔄 Trash Seller : reprise automatique après rechargement ACTIVÉE'
+                    : '🔄 Trash Seller : reprise automatique après rechargement désactivée (▶ START requis)');
+            };
+        }
+
         // Plancher : prix marché jamais sous le tableau
         const sellMarketFloorChk = document.getElementById('wm-set-sell-market-floor');
         if (sellMarketFloorChk) {
@@ -9025,17 +12669,68 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             };
         }
 
-        // Prix dégressif sur les invendus récurrents
+        // Baisse à chaque invendu
         const sellDegressiveChk = document.getElementById('wm-set-sell-degressive');
         if (sellDegressiveChk) {
             sellDegressiveChk.checked = getSetting('sellDegressive');
             sellDegressiveChk.onchange = () => {
                 setSetting('sellDegressive', sellDegressiveChk.checked);
                 wmLog(sellDegressiveChk.checked
-                    ? '📉 Prix dégressif activé : -15% par tranche de 10 remises en vente'
-                    : '📉 Prix dégressif désactivé');
+                    ? `📉 Baisse activée : -${getSetting('sellDecayStepPct')} % par invendu, jamais sous ${getSetting('sellDecayMinPct')} % du prix de départ`
+                    : '📉 Baisse sur invendus désactivée');
             };
         }
+        // Réglages numériques du Trash Seller : même motif pour les quatre.
+        [['wm-set-sell-floor-tries', 'sellFloorTries', 0, 50,
+          v => v === 0 ? '🛡️ Plancher : appliqué à TOUTES les mises en vente' : `🛡️ Plancher : appliqué aux ${v} première(s) mise(s) en vente, puis prix du marché`],
+         ['wm-set-sell-decay-step', 'sellDecayStepPct', 0, 50, v => `📉 Baisse : -${v} % par invendu`],
+         ['wm-set-sell-decay-min', 'sellDecayMinPct', 1, 100, v => `📉 Jamais sous ${v} % du prix de départ`],
+         ['wm-set-sell-set-aside', 'sellSetAsideAfter', 0, 100,
+          v => v === 0 ? '🗃️ Mise de côté désactivée' : `🗃️ Mise de côté après ${v} invendus`],
+        ].forEach(([id, key, min, max, msg]) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.value = getSetting(key);
+            el.onchange = () => {
+                let v = parseInt(el.value, 10);
+                if (!Number.isFinite(v)) v = SETTINGS_DEFAULTS[key];
+                v = Math.min(max, Math.max(min, v));
+                el.value = v;
+                setSetting(key, v);
+                wmLog(msg(v));
+            };
+        });
+
+        // % de la cote PAR RARETÉ, directement dans le panneau Trash Seller.
+        function renderSellPctRow() {
+            const row = document.getElementById('wm-sell-pct-row');
+            if (!row) return;
+            const order = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+            row.innerHTML = '<span style="text-transform:uppercase;letter-spacing:1px;">% cote</span>' + order.map(rar => {
+                const c = RARITY[rar] || { color: '#888' };
+                const v = getSellPct(rar);
+                return `<label style="display:inline-flex;align-items:center;gap:2px;">
+                    <span style="color:${c.color};font-weight:700;">${rar}</span>
+                    <input data-wm-sell-pct="${rar}" type="number" min="1" max="500" step="5" value="${v}"
+                        style="width:42px;height:18px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(255,255,255,0.15);background:#0f0f13;color:${v === 100 ? '#aaa' : (v > 100 ? '#4ade80' : '#fbbf24')};font-size:9px;text-align:center;">
+                </label>`;
+            }).join('');
+            row.querySelectorAll('[data-wm-sell-pct]').forEach(inp => {
+                inp.onchange = () => {
+                    const rar = inp.getAttribute('data-wm-sell-pct');
+                    let v = parseInt(inp.value, 10);
+                    if (!Number.isFinite(v) || v < 1) v = 100;
+                    if (v > 500) v = 500;
+                    const cfg = getSellConfig();
+                    cfg[rar].pct = v;
+                    setSellConfig(cfg);
+                    wmLog(`💹 ${rar} : mise en vente à <b>${v} %</b> de la cote${v > 100 ? ' (au-dessus du marché)' : v < 100 ? ' (sous le marché, pour vendre plus vite)' : ''}`);
+                    renderSellPctRow();
+                };
+            });
+        }
+        renderSellPctRow();
+        renderSetAside();
 
         // Undercut du marché à la mise en vente
         const sellUndercutChk = document.getElementById('wm-set-sell-undercut');
@@ -9081,9 +12776,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const name = getSetting('sellTagName');
             const id = TRASH_TAG_ID;
             if (id) {
-                tagStatusEl.innerHTML = `<span style="color:#4ade80;">✓ Tag "<b>${name}</b>"</span> · <span style="color:#555;font-family:'JetBrains Mono',monospace;font-size:9px;">${id.slice(0,8)}…</span>`;
+                tagStatusEl.innerHTML = `<span style="color:#4ade80;">✓ Tag "<b>${esc(name)}</b>"</span> · <span style="color:#555;font-family:'JetBrains Mono',monospace;font-size:9px;">${id.slice(0,8)}…</span>`;
             } else {
-                tagStatusEl.innerHTML = `<span style="color:#fbbf24;">⚠ Tag "<b>${name}</b>" non découvert — crée-le sur wiki-masters</span>`;
+                tagStatusEl.innerHTML = `<span style="color:#fbbf24;">⚠ Tag "<b>${esc(name)}</b>" non découvert — crée-le sur wiki-masters</span>`;
             }
         }
         refreshTagStatus();
@@ -9104,6 +12799,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             panelOpenState.settings = open;
             savePanelState();
         };
+
+        // -- Panneau Cartes les plus chères --
+        const topHdr = document.getElementById('wm-top-hdr');
+        const topBody = document.getElementById('wm-top-body');
+        const topChevron = document.getElementById('wm-top-chevron');
+        const topRunBtn = document.getElementById('wm-top-run');
+        if (topHdr && topBody) {
+            topHdr.onclick = () => {
+                const open = topBody.classList.toggle('open');
+                if (topChevron) topChevron.innerText = open ? '▾' : '▴';
+                panelOpenState.top = open;
+                savePanelState();
+                document.querySelectorAll('.wm-row-resizer').forEach(rz => {
+                    const b = document.getElementById(rz.dataset.target);
+                    if (b) rz.classList.toggle('show', b.classList.contains('open'));
+                });
+                if (open) renderTopCards();
+            };
+            if (panelOpenState.top) {
+                topBody.classList.add('open');
+                if (topChevron) topChevron.innerText = '▾';
+            }
+            renderTopCards();
+        }
+        if (topRunBtn) topRunBtn.onclick = () => runTopCards(topRunBtn);
 
         // -- Panneau Statistiques (accordéon jumeau) --
         const statsHdr     = document.getElementById('wm-stats-hdr');
@@ -9155,7 +12875,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const TAGGER_DIACRITICS = new RegExp('[\\u0300-\\u036f]', 'g');
         const taggerNorm = (s) => (s || '').toString()
             .normalize('NFD').replace(TAGGER_DIACRITICS, '').toLowerCase();
-        const taggerEsc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+        // Alias de esc() : l'implémentation locale oubliait > et ', un titre de tag
+        // contenant l'un des deux passait donc brut dans l'innerHTML.
+        const taggerEsc = esc;
         // Découpe une saisie "japon; marvel" en termes normalisés (OU logique).
         // Séparateur = POINT-VIRGULE (;) pour ne PAS casser les titres à virgule
         // (ex. « Star Wars, épisode I »). Les anciens présets à virgules sont migrés au chargement.
@@ -9205,7 +12927,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!taggerDatalist) return;
             const tags = await fetchUserTags();
             taggerDatalist.innerHTML = tags
-                .map(t => `<option value="${(t.name || '').replace(/"/g, '&quot;')}">`).join('');
+                .map(t => `<option value="${esc(t.name || '')}">`).join('');
         }
 
         const TAGGER_RENDER_CAP = 800; // au-delà, on n'affiche pas toutes les lignes (perf DOM)
@@ -9219,8 +12941,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const tagNames = (m.tags || []).map(t => t.name).filter(Boolean).join(', ');
                 return `<label style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:10px;cursor:pointer;">
                     <input type="checkbox" class="wm-tagger-cb" data-idx="${i}" checked style="accent-color:#4ade80;flex-shrink:0;">
-                    <span style="flex:1;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${title} <span style="color:#666;">[${rar}]</span></span>
-                    ${tagNames ? `<span style="color:#555;font-size:9px;white-space:nowrap;">${tagNames}</span>` : ''}
+                    <span style="flex:1;color:#ccc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(title)} <span style="color:#666;">[${rar}]</span></span>
+                    ${tagNames ? `<span style="color:#555;font-size:9px;white-space:nowrap;">${esc(tagNames)}</span>` : ''}
                 </label>`;
             }).join('');
             if (taggerMatches.length > TAGGER_RENDER_CAP) {
@@ -9411,11 +13133,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         return kws.some(k => text.includes(k));
                     })
                     .map(e => e.it);
-                if (matches.length === 0) { wmLog(`⭐ « ${p.kw} » → « ${tagName} » : aucune carte`); continue; }
+                if (matches.length === 0) { wmLog(`⭐ « ${esc(p.kw)} » → « ${esc(tagName)} » : aucune carte`); continue; }
                 totalMatched += matches.length;
                 const tag = await createTrashTag(tagName);
                 if (!tag.ok || !tag.id) {
-                    wmLog(`⚠️ Étiquette « ${tagName} » non résolue (${tag.error || 'erreur'}) — ${matches.length} carte(s) non taguée(s)`);
+                    wmLog(`⚠️ Étiquette « ${esc(tagName)} » non résolue (${tag.error || 'erreur'}) — ${matches.length} carte(s) non taguée(s)`);
                     totalFail += matches.length;
                     matches.forEach(m => failures.push({ title: titleOf(m), tag: tagName, status: 0, error: 'étiquette non créée/trouvée : ' + (tag.error || '?') }));
                     continue;
@@ -9439,7 +13161,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     taggerStatus.innerHTML = `<span style="color:#06b6d4;">🏷️ ${pi + 1}/${presetList.length} (${taggerEsc(tagName)}) · ${ok}/${matches.length}${fail ? ` · ${fail} échec` : ''}…</span>`;
                 }
                 totalOk += ok; totalFail += fail;
-                wmLog(`✅ « ${p.kw} » → « ${tagName} » : ${ok} ok${fail ? `, <span style="color:#ef4444;">${fail} échec</span>` : ''}`);
+                wmLog(`✅ « ${esc(p.kw)} » → « ${esc(tagName)} » : ${ok} ok${fail ? `, <span style="color:#ef4444;">${fail} échec</span>` : ''}`);
             }
             return { totalOk, totalFail, totalMatched, failures };
         }
@@ -9487,7 +13209,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 renderTaggerFailures(r.failures); // détail des échecs (carte, tag, raison)
                 await populateTagDatalist();
             } catch(e) {
-                taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+                taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
             } finally {
                 taggerScanBtn.disabled = false;
             }
@@ -9514,7 +13236,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 renderTaggerFailures(r.failures); // détail des échecs (carte, tag, raison)
                 await populateTagDatalist();
             } catch(e) {
-                taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+                taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
             } finally {
                 taggerScanBtn.disabled = false;
             }
@@ -9661,7 +13383,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         taggerApplyBtn.disabled = false;
                     }
                 } catch(e) {
-                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
                 } finally {
                     taggerScanBtn.disabled = false;
                 }
@@ -9714,7 +13436,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         taggerApplyBtn.disabled = false;
                     }
                 } catch(e) {
-                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
+                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${esc(e.message)}</span>`;
                 } finally {
                     taggerScanBtn.disabled = false; taggerDuplicatesBtn.disabled = false;
                 }
@@ -9733,11 +13455,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // createTrashTag est un find-or-create générique (vérifie l'existant puis POST /tags)
                 const tag = await createTrashTag(tagName);
                 if (!tag.ok || !tag.id) {
-                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Impossible de créer/trouver l'étiquette « ${tagName} »${tag.error ? ' : ' + tag.error : ''}.</span>`;
+                    taggerStatus.innerHTML = `<span style="color:#ef4444;">Impossible de créer/trouver l'étiquette « ${esc(tagName)} »${tag.error ? ' : ' + tag.error : ''}.</span>`;
                     taggerScanBtn.disabled = false; taggerApplyBtn.disabled = false;
                     return;
                 }
-                wmLog(`🏷️ Étiquetage en masse : « <b>${tagName}</b> » ${tag.alreadyExists ? '(existante)' : '(créée)'} → ${selected.length} carte(s)`);
+                wmLog(`🏷️ Étiquetage en masse : « <b>${esc(tagName)}</b> » ${tag.alreadyExists ? '(existante)' : '(créée)'} → ${selected.length} carte(s)`);
                 let done = 0, ok = 0, fail = 0;
                 const failures = [];
                 const titleOf = (m) => m.card?.wikipedia_title || m.wikipedia_title || (m.id ? m.id.slice(0, 8) + '…' : '?');
@@ -9752,8 +13474,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     });
                     taggerStatus.innerHTML = `<span style="color:#06b6d4;">🏷️ ${done}/${selected.length} traitées · ${ok} ok${fail ? ` · ${fail} échec` : ''}…</span>`;
                 }
-                taggerStatus.innerHTML = `<span style="color:#4ade80;">✔ « ${tagName} » appliquée à ${ok} carte(s)</span>${fail ? ` <span style="color:#ef4444;">· ${fail} échec(s)</span>` : ''}`;
-                wmLog(`✅ Étiquetage terminé : ${ok} ok, ${fail} échec(s) pour « <b>${tagName}</b> »`);
+                taggerStatus.innerHTML = `<span style="color:#4ade80;">✔ « ${esc(tagName)} » appliquée à ${ok} carte(s)</span>${fail ? ` <span style="color:#ef4444;">· ${fail} échec(s)</span>` : ''}`;
+                wmLog(`✅ Étiquetage terminé : ${ok} ok, ${fail} échec(s) pour « <b>${esc(tagName)}</b> »`);
                 renderTaggerFailures(failures); // détail des échecs (carte, tag, raison)
                 await populateTagDatalist();
                 taggerScanBtn.disabled = false;
@@ -9815,7 +13537,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     settingsStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec : HTTP ${res.status}</span>`;
                 }
             } catch(e) {
-                settingsStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec : ${e.message}</span>`;
+                settingsStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec : ${esc(e.message)}</span>`;
             }
         };
 
@@ -9915,6 +13637,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             wmLog(soundWonChk.checked ? '🔊 Son « enchère gagnée » activé' : '🔇 Son « enchère gagnée » coupé');
         };
 
+        // -- Alertes de vérification anti-bot --
+        [['wm-set-antibot-banner', 'antiBotBanner', 'bandeau'],
+         ['wm-set-antibot-sound', 'antiBotSound', 'son'],
+         ['wm-set-antibot-notif', 'antiBotNotif', 'notification Windows'],
+        ].forEach(([id, key, label]) => {
+            const cb = document.getElementById(id);
+            if (!cb) return;
+            cb.checked = getSetting(key);
+            cb.onchange = () => {
+                setSetting(key, cb.checked);
+                if (key === 'antiBotNotif' && cb.checked) ensureNotifPermission();
+                if (key === 'antiBotBanner') renderHumanCheckBanner();
+                wmLog(`🛡️ Alerte anti-bot (${label}) ${cb.checked ? 'activée' : 'désactivée'}.`);
+            };
+        });
+
         // -- Badge de notifications --
         notifsChk.onchange = () => {
             setSetting('notificationsEnabled', notifsChk.checked);
@@ -9941,8 +13679,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Invalide le cache du tag_id et redécouvre avec le nouveau nom
             TRASH_TAG_ID = null;
             try { localStorage.removeItem(TRASH_TAG_CACHE_KEY); } catch(e) {}
-            tagStatusEl.innerHTML = `<span style="color:#888;">⏳ Découverte du tag "${newName}"…</span>`;
-            wmLog(`🏷️ Nouveau nom de tag : <b>${newName}</b> · redécouverte en cours…`);
+            tagStatusEl.innerHTML = `<span style="color:#888;">⏳ Découverte du tag "${esc(newName)}"…</span>`;
+            wmLog(`🏷️ Nouveau nom de tag : <b>${esc(newName)}</b> · redécouverte en cours…`);
             await discoverTrashTagId();
             refreshTagStatus();
         };
@@ -9959,7 +13697,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!identityInfo) return;
             const ov = (getSetting('usernameOverride') || '').trim();
             identityInfo.innerHTML = currentUsername
-                ? `Reconnu comme : <b style="color:#4ade80;">${currentUsername}</b>${ov ? ' <span style="color:#888;">(forcé)</span>' : ' <span style="color:#888;">(auto)</span>'}`
+                ? `Reconnu comme : <b style="color:#4ade80;">${esc(currentUsername)}</b>${ov ? ' <span style="color:#888;">(forcé)</span>' : ' <span style="color:#888;">(auto)</span>'}`
                 : '<span style="color:#fbbf24;">Aucun pseudo détecté</span>';
         }
         refreshIdentityInfo();
@@ -9997,9 +13735,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             refreshIdentityInfo();
             reapplyIdentityToHits();
             identityStatus.innerHTML = currentUsername
-                ? `<span style="color:#4ade80;">✓ Identité : <b>${currentUsername}</b></span>`
+                ? `<span style="color:#4ade80;">✓ Identité : <b>${esc(currentUsername)}</b></span>`
                 : `<span style="color:#fbbf24;">Toujours aucun pseudo détecté — saisis-le manuellement ci-dessus.</span>`;
-            wmLog(`🔄 Identité rafraîchie : <b>${currentUsername || '— non détecté'}</b>`);
+            wmLog(`🔄 Identité rafraîchie : <b>${esc(currentUsername || '— non détecté')}</b>`);
         };
 
         /* ════════ EXPORT / IMPORT du localStorage ════════ */
@@ -10050,8 +13788,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const a = document.createElement('a');
             a.href = url; a.download = filename; a.click();
             setTimeout(() => URL.revokeObjectURL(url), 1000);
-            ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ Export de <b>${count}</b> clés → <b>${filename}</b></span>`;
-            wmLog(`📤 Export : <b>${count}</b> clés sauvegardées dans <b>${filename}</b>`);
+            ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ Export de <b>${count}</b> clés → <b>${esc(filename)}</b></span>`;
+            wmLog(`📤 Export : <b>${count}</b> clés sauvegardées dans <b>${esc(filename)}</b>`);
         };
 
         // Envoie le backup en pièce jointe via le webhook (multipart). Réutilisé par le
@@ -10071,7 +13809,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 form.append('file', blob, filename);
                 const res = await fetch(webhook, { method: 'POST', body: form });
                 if (res.ok) {
-                    wmLog(`📤 Backup envoyé sur Discord : <b>${filename}</b> (${count} clés)`);
+                    wmLog(`📤 Backup envoyé sur Discord : <b>${esc(filename)}</b> (${count} clés)`);
                     return { ok: true, filename, count };
                 }
                 return { ok: false, error: `HTTP ${res.status}`, status: res.status };
@@ -10093,10 +13831,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             ioxStatus.innerHTML = `<span style="color:#888;">⏳ Envoi du backup sur Discord…</span>`;
             const r = await sendBackupToDiscord();
             if (r.ok) {
-                ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ Backup envoyé sur Discord (<b>${r.filename}</b>)</span>`;
+                ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ Backup envoyé sur Discord (<b>${esc(r.filename)}</b>)</span>`;
             } else {
                 const hint = r.status === 413 ? ' — fichier trop lourd pour le webhook' : '';
-                ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec Discord : ${r.error}${hint}</span>`;
+                ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec Discord : ${esc(r.error)}${hint}</span>`;
             }
             exportDiscordBtn.disabled = false;
             exportDiscordBtn.innerText = prevText;
@@ -10242,11 +13980,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         wmLog(`📥 Import : <b>${written}</b> clés restaurées, <b>${failed.length}</b> ignorée(s) faute de place (${failed.join(', ')}).`);
                     } else {
                         ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ ${written} clés importées${skippedCache ? ` (cache collection ignoré, régénéré au reload)` : ''}. Rechargement…</span>`;
-                        wmLog(`📥 Import : <b>${written}</b> clés restaurées depuis <b>${file.name}</b>${skippedCache ? ` (${skippedCache} clé(s) de cache ignorées)` : ''}. La page va recharger.`);
+                        wmLog(`📥 Import : <b>${written}</b> clés restaurées depuis <b>${esc(file.name)}</b>${skippedCache ? ` (${skippedCache} clé(s) de cache ignorées)` : ''}. La page va recharger.`);
                     }
                     setTimeout(() => location.reload(), 1200);
                 } catch(e) {
-                    ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Erreur : ${e.message}</span>`;
+                    ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Erreur : ${esc(e.message)}</span>`;
                 }
             };
             fileInput.click();
@@ -10283,7 +14021,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     wmLog('🗄️ Backup auto (Tout arrêter) → envoi sur Discord…');
                     window.wmSendBackupToDiscord('(arrêt)').then(r => {
                         if (!r.ok && r.error !== 'no-webhook') {
-                            wmLog(`⚠️ Backup auto Discord échoué : ${r.error}`);
+                            wmLog(`⚠️ Backup auto Discord échoué : ${esc(r.error)}`);
                         }
                     });
                 }
@@ -10398,15 +14136,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // le martèlement de /api/my-collection semble saturer le serveur. Appelle maintenant
         // fetchCollection() directement, sans vider le cache : reste incrémental et léger.
         setInterval(async () => {
-            if (refreshBtn.disabled) return;
+            if (refreshBtn.disabled || botNetPaused()) return;
             await fetchCollection(collProgress);
         }, 3*60*1000);
 
         // Refresh auto des ventes actives toutes les 30s, indépendamment du trash seller.
         // Porte AUSSI la synchro des enchères gagnées, pour ne pas rouvrir une requête /mine.
         const refreshActiveSales = async () => {
+            if (botNetPaused()) return;   // pause anti-bot : pas de requête (et pas d'empilement)
             try {
-                const st = await fetchSellingState(); // complète déjà le détail depuis la base
+                // Affichage seulement : un état lu il y a moins de 25 s (par la Revente ou le
+                // Trash Seller) suffit — pas de nouvelle requête /mine + base.
+                const st = await fetchSellingState({ maxAge: 25000 }); // complète déjà le détail depuis la base
                 if (!st) return; // échec : on garde l'affichage en place (cf. renderActiveSales)
                 renderActiveSales(st.list, st);
                 if (Date.now() - lastWonSync > 60000) {
@@ -10421,7 +14162,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Filet de sécurité : réconcilie les ventes en attente toutes les 5 min (retag des
         // invendues revenues), même si le Trash Seller n'est pas lancé. Sans effet si rien
         // n'est en attente. Complète la passe unique du démarrage.
-        setInterval(() => { reconcilePendingSales().catch(() => {}); }, 5 * 60 * 1000);
+        setInterval(() => { if (!botNetPaused()) reconcilePendingSales().catch(() => {}); }, 5 * 60 * 1000);
 
         // (La synchro des enchères gagnées est portée par refreshActiveSales ci-dessus : elle
         // tourne donc bien même Market Watcher à l'arrêt, sans requête supplémentaire.)
@@ -10595,10 +14336,24 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Ex-`data.history` de /mine, disparu : `fetchSoldFromDb` lit directement `auctions` et
     // filtre déjà sur « gagnant/prix connu » côté serveur (équivalent moderne de settled_sold).
+    // Une passe à la fois : la requête (lourde, 3 à 7 s sur la capture du 01/10) pouvait encore
+    // tourner quand l'intervalle suivant tombait.
+    let _checkRecentSalesRunning = false;
+    // Faux tant que les ventes déjà connues n'ont pas été mémorisées : si la lecture de
+    // démarrage a échoué, la 1re passe réussie mémorise sans notifier (sinon, avec la fenêtre
+    // de 5 min, un rechargement renverrait des « VENDU » déjà annoncés).
+    let _salesMonitorPrimed = false;
     async function checkRecentSales() {
+        if (_checkRecentSalesRunning || botNetPaused()) return;
+        _checkRecentSalesRunning = true;
         try {
             const recentSales = await fetchSoldFromDb(30);
             if (!Array.isArray(recentSales)) return;
+            if (!_salesMonitorPrimed) {
+                recentSales.forEach(sale => knownSoldIds.add(sale.id));
+                _salesMonitorPrimed = true;
+                return;
+            }
 
             for (const sale of recentSales) {
                 if (knownSoldIds.has(sale.id)) continue;
@@ -10608,9 +14363,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // s'en chargera (avec plus de contexte). Évite la double notification.
                 if (sellHistory.some(s => s.auctionId === sale.id)) continue;
 
-                // Ne notifier que les ventes récentes (< 2 minutes)
+                // Ne notifier que les ventes récentes (< 5 minutes : la passe tourne toutes les
+                // 60 s, une requête ratée ne fait plus perdre la notification ; knownSoldIds
+                // empêche tout doublon).
                 const soldAt = new Date(sale.settled_at).getTime();
-                if (!Number.isFinite(soldAt) || Date.now() - soldAt > 2 * 60 * 1000) continue;
+                if (!Number.isFinite(soldAt) || Date.now() - soldAt > 5 * 60 * 1000) continue;
 
                 const title    = sale.card?.wikipedia_title || "?";
                 const rarity   = (sale.snapshot_rarity || sale.card?.rarity || "?").toUpperCase();
@@ -10626,7 +14383,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     5763719
                 );
             }
-        } catch(e) {}
+        } catch(e) {
+        } finally {
+            _checkRecentSalesRunning = false;
+        }
     }
 
     function startSalesMonitor() {
@@ -10634,9 +14394,15 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Pré-remplit les IDs connus pour ne pas notifier les anciennes ventes au démarrage.
         // Le setInterval part dans tous les cas (succès ou échec), comme avant.
         fetchSoldFromDb(50)
-            .then(rows => { (rows || []).forEach(h => knownSoldIds.add(h.id)); })
+            .then(rows => {
+                if (!Array.isArray(rows)) return;
+                rows.forEach(h => knownSoldIds.add(h.id));
+                _salesMonitorPrimed = true;
+            })
             .catch(() => {})
-            .finally(() => { salesMonitorInterval = setInterval(checkRecentSales, 30000); });
+            // 60 s (avant 30 s) : simple notification Discord des ventes faites hors du bot ;
+            // les ventes du bot sont suivies, elles, par checkSellHistoryResults.
+            .finally(() => { salesMonitorInterval = setInterval(checkRecentSales, 60000); });
     }
 
     /* ===================== TIMER ===================== */
@@ -10671,13 +14437,78 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // (déjà comptée par la loop) d'une ouverture MANUELLE faite depuis le site.
     let botPackOpenInFlight = 0;
 
+    /* ── Bornes d'attente du Pack Opener ──
+       Toute durée d'attente (cooldown serveur, Retry-After, backoff) est bornée :
+       un plancher pour ne jamais marteler l'API, un plafond pour qu'une valeur
+       aberrante renvoyée par le site ne gèle pas le module jusqu'au lendemain. */
+    const PACK_WAIT_FLOOR_MS  = 5 * 1000;
+    const PACK_WAIT_CEIL_MS   = 30 * 60 * 1000;
+    const PACK_BACKOFF_BASE_MS = 5 * 1000;   // 1er échec inconnu → 5 s
+    const PACK_BACKOFF_MAX_MS  = 5 * 60 * 1000;
+    // Le module ne s'arrête JAMAIS sur des échecs répétés (403, 5xx, réseau) : ce sont
+    // des incidents transitoires dont il se remet tout seul. Ce seuil ne sert qu'à
+    // prévenir une fois (log + Discord) que quelque chose dure.
+    const PACK_WARN_FAILURES   = 8;
+
+    const PACK_OPEN_URL = "https://www.wiki-masters.com/api/packs/open";
+
+    // Erreur transport/HTTP enrichie : la loop a besoin du statut et du Retry-After
+    // pour décider (arrêt, backoff, cooldown) au lieu de retry à l'aveugle toutes les 5 s.
+    // status === 0 → réseau injoignable ou réponse illisible (HTML Cloudflare, JSON tronqué).
+    class PackApiError extends Error {
+        constructor(status, opts = {}) {
+            super(opts.message || ('HTTP ' + status));
+            this.name = 'PackApiError';
+            this.status = status;
+            this.retryAfterMs = opts.retryAfterMs || 0;
+            this.body = opts.body || '';
+        }
+    }
+
+    // Retry-After : soit un entier de secondes, soit une date HTTP. Plafonné à 30 min
+    // pour qu'un en-tête absurde ne gèle pas le module.
+    function parseRetryAfterMs(header) {
+        if (!header) return 0;
+        const raw = String(header).trim();
+        const secs = Number(raw);
+        if (Number.isFinite(secs)) return Math.min(Math.max(0, secs * 1000), PACK_WAIT_CEIL_MS);
+        const at = Date.parse(raw);
+        return Number.isFinite(at) ? Math.min(Math.max(0, at - Date.now()), PACK_WAIT_CEIL_MS) : 0;
+    }
+
     async function openPack() {
         botPackOpenInFlight++;
         try {
-            const res = await fetch("https://www.wiki-masters.com/api/packs/open",
-                { method: "POST", credentials: "include" });
-            if (res.status === 403) throw new Error("403");
-            return res.json();
+            let res;
+            try {
+                res = await fetch(PACK_OPEN_URL, { method: "POST", credentials: "include" });
+            } catch (e) {
+                throw new PackApiError(0, { message: 'réseau injoignable (' + (e && e.message || 'fetch échoué') + ')' });
+            }
+            const retryAfterMs = parseRetryAfterMs(res.headers.get('retry-after'));
+            const body = await res.text().catch(() => '');
+            if (!res.ok) {
+                throw new PackApiError(res.status, {
+                    message: 'HTTP ' + res.status + ' ' + (res.statusText || ''),
+                    retryAfterMs,
+                    body: body.slice(0, 300),
+                });
+            }
+            // Un 200 ne garantit pas du JSON : page de challenge Cloudflare ou page de
+            // maintenance arrivent en text/html et faisaient exploser res.json().
+            const ctype = (res.headers.get('content-type') || '').toLowerCase();
+            if (!ctype.includes('json')) {
+                throw new PackApiError(0, {
+                    message: 'réponse non-JSON (' + (ctype || 'sans content-type') + ')',
+                    retryAfterMs,
+                    body: body.slice(0, 300),
+                });
+            }
+            try {
+                return JSON.parse(body);
+            } catch (e) {
+                throw new PackApiError(0, { message: 'JSON illisible', retryAfterMs, body: body.slice(0, 300) });
+            }
         } finally {
             botPackOpenInFlight--;
         }
@@ -10757,10 +14588,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (!userCardId) continue;
                 const r = await addTagToUserCard(userCardId, tagId);
                 if (r.ok) {
-                    wmLog(`🏷️ Auto-tag pack : <b>${title}</b> → « <b>${p.tag}</b> » <span style="color:#555;font-size:9px;">(${p.kw})</span>`);
+                    wmLog(`🏷️ Auto-tag pack : <b>${esc(title)}</b> → « <b>${p.tag}</b> » <span style="color:#555;font-size:9px;">(${esc(p.kw)})</span>`);
                     if (tagId === TRASH_TAG_ID) pushToTrashPoolCache(cardId, title, rarity); // ajout direct, sans rescan
                 } else {
-                    wmLog(`⚠️ Auto-tag pack échoué : <b>${title}</b> → « ${p.tag} » · HTTP ${r.status} ${r.error || ''}`);
+                    wmLog(`⚠️ Auto-tag pack échoué : <b>${esc(title)}</b> → « ${p.tag} » · HTTP ${r.status} ${r.error || ''}`);
                 }
             }
         }
@@ -10776,10 +14607,34 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         wmLog(`🔬 Champs carte de pack : <span style="color:#888;font-size:9px;">${Object.keys(sample).join(', ')}</span>`);
     }
 
+    // Message d'erreur porté par une réponse d'API, normalisé en chaîne ('' si aucune).
+    // L'API renvoie selon les cas `error`, `message` ou `detail`.
+    function apiErrorText(data) {
+        if (!data || typeof data !== 'object') return '';
+        for (const k of ['error', 'message', 'detail']) {
+            const v = data[k];
+            if (typeof v === 'string' && v.trim()) return v.trim();
+            if (v && typeof v === 'object') {
+                const m = v.message || v.msg;
+                if (typeof m === 'string' && m.trim()) return m.trim();
+            }
+            if (v === true) return k;
+        }
+        return '';
+    }
+
+    // Retourne true si le pack a bien été comptabilisé. Une réponse portant à la fois
+    // des `cards` et une erreur est une réponse partielle : on ne la compte pas, sinon
+    // les stats de session dérivent silencieusement.
     async function handlePackOpened(data, opts = {}) {
         const { animate = false } = opts;
         const cards = (data && data.cards) || [];
-        if (!cards.length) return;
+        if (!cards.length) return false;
+        const errText = apiErrorText(data);
+        if (errText) {
+            wmLog(`⚠️ Réponse d'ouverture en erreur — pack <b>non comptabilisé</b> : ${esc(errText)}`);
+            return false;
+        }
         logPackCardFields(cards[0]); // diag : quels identifiants sont dispo pour un deep-link
 
         rolloverDailyStatsIfNeeded(); // reset des stats du jour si on a passé minuit
@@ -10847,12 +14702,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // Le site ouvre les cartes de collection dans une popup SANS URL → pas de
                 // deep-link possible vers la collection. On pointe donc vers la page
                 // Wikipédia de la carte (ouverte dans un nouvel onglet).
-                const nameHtml = url
-                    ? `<a href="${url}" target="wm-card-view" rel="noopener"
+                const safeTitle = esc(title);
+                const safeUrl = escUrl(url);
+                const nameHtml = safeUrl
+                    ? `<a href="${safeUrl}" target="wm-card-view" rel="noopener"
                         style="color:${r.color};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none;"
-                        title="Ouvrir « ${title} » sur Wikipédia"
-                        onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${title}</a>`
-                    : `<span style="color:${r.color};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${title}">${title}</span>`;
+                        title="Ouvrir « ${safeTitle} » sur Wikipédia"
+                        onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${safeTitle}</a>`
+                    : `<span style="color:${r.color};flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${safeTitle}">${safeTitle}</span>`;
 
                 return `<div style="padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);
                     display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;">
@@ -10869,7 +14726,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 .map(c => c.wikipedia_title)
                 .join(", ");
 
-            if (alertEl) alertEl.innerHTML = `🚨 MOT-CLÉ : ${cardsNames}`;
+            if (alertEl) alertEl.innerHTML = `🚨 MOT-CLÉ : ${esc(cardsNames)}`;
             sendToDiscord(`🚨 MOT-CLÉ détecté : ${cardsNames}`, 65535);
 
             // Historise chaque carte matchée et log dans le dashboard
@@ -10879,7 +14736,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const rarity = (c.rarity || 'C').toUpperCase();
                 const kw = matchedKeyword(c, true) || '?';
                 packKwHits.push({ title, rarity, keyword: kw, ts: now });
-                wmLog(`🎯 Pack match : <b>${title}</b> [${rarity}] · keyword <span style="color:#00FFFF;">${kw}</span>`);
+                wmLog(`🎯 Pack match : <b>${esc(title)}</b> [${esc(rarity)}] · keyword <span style="color:#00FFFF;">${esc(kw)}</span>`);
             });
             if (packKwHits.length > 100) packKwHits = packKwHits.slice(-100);
             savePackKwHits();
@@ -10890,6 +14747,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // Auto-tag des cartes packées selon les recherches enregistrées (non bloquant).
         autoTagPackedCards(cards).catch(() => {});
+        return true;
     }
 
     // Récupération de tags : quand le SITE échoue à poser des tags en LOT
@@ -11170,11 +15028,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 continue;
             }
             if (KEYWORDS_ALERT.some(k => k.toLowerCase() === title.toLowerCase())) {
-                wmLog(`⭐ Wishlist : <b>${title}</b> déjà dans les mots-clés.`);
+                wmLog(`⭐ Wishlist : <b>${esc(title)}</b> déjà dans les mots-clés.`);
                 continue;
             }
             if (window.wmAddKeyword) window.wmAddKeyword(title);
-            wmLog(`⭐ Wishlist → mot-clé ajouté : <b style="color:#06b6d4;">${title}</b>`);
+            wmLog(`⭐ Wishlist → mot-clé ajouté : <b style="color:#06b6d4;">${esc(title)}</b>`);
         }
     }
 
@@ -11198,6 +15056,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // l'associer à sellHistory. Déclarée ici (comme les variables au-dessus) pour rester
             // accessible après le try — url/method y sont en `const`, portée bloc uniquement.
             let isMarketplaceCreate = false;
+            let isMarketplaceDelete = false;
+            let bidAuctionId = null;   // POST /api/marketplace/{id}/bid (site OU bot)
+            let bidAmount = null;      // montant de cette mise, lu dans le corps de la requête
+            let isCollectionFetch = false;
+            let siteSalesCardId = null;
             try {
                 const req = args[0];
                 const url = (typeof req === 'string') ? req : (req && req.url) || '';
@@ -11210,6 +15073,31 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // stricte sur l'URL absolue ne matchait jamais, donc auctionId restait toujours
                 // null (bug du 2026-08-20 : plus de re-tag Trash sur les invendus).
                 isMarketplaceCreate = method === 'POST' && /\/api\/marketplace(\?|$)/.test(url);
+                // Retrait d'une vente (site ou bot) : DELETE /api/marketplace/{id}.
+                isMarketplaceDelete = method === 'DELETE' && /\/api\/marketplace\/[^/?#]+(\?|$)/.test(url);
+                // Mise sur une enchère : faite à la main sur le site, le bot ne la connaissait
+                // que par le balayage complet du marché (désormais espacé sans mot-clé).
+                if (method === 'POST') {
+                    const bm = url.match(/\/api\/marketplace\/([^/?#]+)\/bid/);
+                    if (bm) {
+                        bidAuctionId = decodeURIComponent(bm[1]);
+                        try {
+                            const b = args[1] && typeof args[1].body === 'string' ? JSON.parse(args[1].body) : null;
+                            if (b && Number.isFinite(Number(b.amount))) bidAmount = Number(b.amount);
+                        } catch(e) {}
+                    }
+                }
+                // Le site charge lui-même sa collection : on lit la réponse au passage pour
+                // alimenter l'index titre → card_id de la surcouche Collection. Le DOM du
+                // site ne portant aucun identifiant, c'est ce qui permet de relier une
+                // tuile à sa carte — et ça ne coûte aucune requête supplémentaire.
+                isCollectionFetch = method === 'GET' && /\/api\/my-collection/.test(url);
+                // Le site récupère lui-même l'historique d'une carte (c'est ce qu'il fait
+                // en ouvrant « Mettre aux enchères », où il affiche MOYENNE). On le capte
+                // au passage : aucune requête ajoutée, et ça donne la cote même quand
+                // NOTRE propre appel se fait refuser.
+                const salesMatch = method === 'GET' && url.match(/\/marketplace\/cards\/([^/?#]+)\/sales/);
+                siteSalesCardId = salesMatch ? salesMatch[1] : null;
                 // Capture le payload d'un POST /rest/v1/... pour le rejouer/exploiter côté bot.
                 const capture = () => {
                     if (args[1] && typeof args[1].body === 'string') return { body: args[1].body };
@@ -11239,6 +15127,28 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
             const p = origFetch.apply(this, args);
 
+            // Une vente créée ou retirée (par le bot ou à la main sur le site) rend périmé
+            // l'état des ventes déjà lu : au départ ET à l'arrivée de la réponse.
+            if (isMarketplaceCreate || isMarketplaceDelete) {
+                try { invalidateSalesDetail(); } catch(e) {}
+                p.then(() => { try { invalidateSalesDetail(); } catch(e) {} },
+                       () => { try { invalidateSalesDetail(); } catch(e) {} });
+            }
+
+            // Mise acceptée → l'enchère est suivie (surenchères, hot lane, liste « mes enchères »).
+            // Le montant est retenu comme « ma dernière mise » : iAmLeading s'en sert, et une
+            // relance du bot ne surenchérit pas sur ma propre mise faite à la main.
+            // (Pas markAuctionAsMine : il compterait la mise dans la limite horaire des mises auto.)
+            if (bidAuctionId) {
+                p.then(res => {
+                    if (!res || !res.ok) return;
+                    try {
+                        trackMyBid(bidAuctionId);
+                        if (Number.isFinite(bidAmount)) myLastBidMap.set(bidAuctionId, bidAmount);
+                    } catch(e) {}
+                }).catch(() => {});
+            }
+
             if (isMarketplaceCreate) {
                 p.then(res => {
                     if (res && res.ok) {
@@ -11246,6 +15156,27 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             if (d && d.auction_id) _lastUiListingAuctionId = d.auction_id;
                         }).catch(() => {});
                     }
+                }).catch(() => {});
+            }
+
+            if (siteSalesCardId) {
+                p.then(res => {
+                    if (!res || !res.ok) return;
+                    res.clone().json().then(d => {
+                        if (storeSalesEntry(siteSalesCardId, d)) refreshCollectionBadges();
+                    }).catch(() => {});
+                }).catch(() => {});
+            }
+
+            if (isCollectionFetch) {
+                p.then(res => {
+                    if (!res || !res.ok) return;
+                    res.clone().json().then(d => {
+                        const n = indexCollectionPayload(d);
+                        // Des cartes nouvellement connues → les tuiles en attente peuvent
+                        // enfin être décorées.
+                        if (n > 0) scheduleCollectionDecorate();
+                    }).catch(() => {});
                 }).catch(() => {});
             }
 
@@ -11331,11 +15262,143 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     /* ===================== LOOP ===================== */
 
+    /* ── Cooldown renvoyé par le serveur (audit #2) ──
+       L'API ne documente pas son champ de temps restant et peut en changer de nom :
+       on sonde les noms plausibles, en acceptant aussi bien un instant absolu qu'une
+       durée relative. Le réglage utilisateur (packCooldown) reste le repli. */
+    const PACK_CD_ABS_KEYS = ['next_pack_at', 'next_pack_time', 'next_pack', 'regen_at',
+        'next_regen_at', 'cooldown_ends_at', 'packs_next_at'];
+    const PACK_CD_REL_KEYS = ['next_pack_in', 'next_pack_in_seconds', 'seconds_until_next_pack',
+        'cooldown_ms', 'cooldown_seconds', 'cooldown_sec', 'cooldown', 'regen_in',
+        'remaining_seconds', 'time_remaining', 'retry_after'];
+
+    // Instant absolu (ISO ou epoch s/ms) → délai restant en ms, ou null si inexploitable.
+    function packCdFromAbsolute(v) {
+        let at = null;
+        if (typeof v === 'number' && Number.isFinite(v)) {
+            // En dessous de 1e9 ce n'est pas un epoch mais une durée : on laisse passer.
+            at = v >= 1e12 ? v : v >= 1e9 ? v * 1000 : null;
+        } else if (typeof v === 'string' && v.trim()) {
+            const parsed = Date.parse(v.trim());
+            if (Number.isFinite(parsed)) at = parsed;
+        }
+        if (at === null) return null;
+        const delta = at - Date.now();
+        return delta >= 0 && delta <= PACK_WAIT_CEIL_MS ? delta : null;
+    }
+
+    // Durée relative → ms. Secondes par défaut, ms si le nom du champ le dit.
+    function packCdFromRelative(v, key) {
+        const n = typeof v === 'string' ? Number(v.trim()) : v;
+        if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return null;
+        const ms = /ms$|millis/i.test(key) ? n : n * 1000;
+        return ms <= PACK_WAIT_CEIL_MS ? ms : null;
+    }
+
+    function readServerCooldownMs(data) {
+        if (!data || typeof data !== 'object') return null;
+        const scopes = [data, data.pack, data.packs, data.user, data.data]
+            .filter(o => o && typeof o === 'object');
+        for (const scope of scopes) {
+            for (const k of PACK_CD_ABS_KEYS) {
+                const ms = packCdFromAbsolute(scope[k]);
+                if (ms !== null) return { ms, source: k };
+            }
+            for (const k of PACK_CD_REL_KEYS) {
+                const ms = packCdFromRelative(scope[k], k);
+                if (ms !== null) return { ms, source: k };
+            }
+        }
+        return null;
+    }
+
+    /* Une erreur d'AUTH est définitive : rien ne se débloquera en attendant, donc le
+       module s'arrête et le dit. Volontairement restrictif : `forbidden` / 403 n'en
+       font PAS partie — sur ce site c'est une protection anti-bot transitoire, dont
+       l'ouverture repart toute seule après une pause. Les y inclure revenait à couper
+       une automatisation qui fonctionnait très bien. */
+    const PACK_AUTH_ERROR_RE = /unauthor|unauthent|not authenticated|not logged|non connect|session (expir|invalid)|invalid token|jwt|\b401\b/i;
+
+    // Backoff exponentiel plafonné, avec un peu de jitter : un retry à intervalle
+    // parfaitement régulier est exactement ce qui fait repérer un bot.
+    function packBackoffMs(failures) {
+        const exp = PACK_BACKOFF_BASE_MS * Math.pow(2, Math.max(0, failures - 1));
+        return Math.min(exp, PACK_BACKOFF_MAX_MS) + Math.random() * 1000;
+    }
+
+    // Arrêt net du module, signalé partout où l'utilisateur peut le voir (panneau,
+    // log, Discord). Sans ça, une session qui expire la nuit = un bot qui tourne
+    // dans le vide jusqu'au matin, en silence.
+    function haltPackOpener(alertEl, title, detail) {
+        if (alertEl) {
+            alertEl.innerHTML = `<span style="color:#EF4444;font-weight:700;">⛔ ${esc(title)}</span>`
+                + `<br><span style="color:#888;font-size:10px;">${esc(detail)}</span>`;
+        }
+        wmLog(`⛔ Pack Opener arrêté — <b>${esc(title)}</b> · ${esc(detail)}`);
+        sendToDiscord(`⛔ **Pack Opener arrêté**\n${title}\n${detail}`, 15158332);
+        if (packOpenerStopFn) packOpenerStopFn();
+        else running = false; // repli si l'UI n'a pas encore branché son hook
+    }
+
     async function loop(revealEl, lastDropEl, rarityEl, alertEl, epoch) {
 
     // `epoch === packLoopEpoch` : cette boucle est-elle toujours la boucle courante ?
     // Un stop→start génère un nouvel epoch ; l'ancienne boucle sort ici au lieu de doubler.
     const isCurrent = () => running && epoch === packLoopEpoch;
+
+    // Échecs consécutifs, remis à zéro dès qu'un cycle se termine normalement.
+    let failures = 0;
+    let http403 = 0;
+
+    // Attente interruptible avec décompte affiché. Retourne false si la boucle a été
+    // stoppée/relancée pendant l'attente (le ticker est nettoyé aussitôt, pas à la fin).
+    const waitWithTicker = async (ms, label, color) => {
+        const endTime = Date.now() + ms;
+        const render = () => {
+            // PERF : rien de visible → on ne touche pas au DOM.
+            if (document.hidden) return;
+            const overlay = document.getElementById('wm-overlay');
+            if (!overlay || overlay.style.display === 'none') return;
+            const remaining = Math.max(0, endTime - Date.now());
+            if (alertEl) {
+                alertEl.innerHTML = `<span style="color:${color}">${label} ${Math.ceil(remaining / 1000)}s…</span>`;
+            }
+        };
+        render();
+        const tickerId = setInterval(render, 1000);
+        try {
+            while (isCurrent() && Date.now() < endTime) {
+                await new Promise(r => setTimeout(r, 1000));
+            }
+        } finally {
+            clearInterval(tickerId);
+        }
+        return isCurrent();
+    };
+
+    // Attente de régénération : temps serveur s'il est exploitable, réglage sinon,
+    // toujours borné par PACK_WAIT_FLOOR_MS / PACK_WAIT_CEIL_MS.
+    const waitPackCooldown = async (data) => {
+        const settingSec = getSetting('packCooldown');
+        const fromServer = readServerCooldownMs(data);
+        // +2 s de marge : le serveur libère le slot une fraction de seconde après.
+        let waitMs = (fromServer ? fromServer.ms : settingSec * 1000) + 2000;
+        waitMs = Math.min(Math.max(waitMs, PACK_WAIT_FLOOR_MS), PACK_WAIT_CEIL_MS);
+        const waitSec = Math.round(waitMs / 1000);
+        const src = fromServer ? `serveur · ${fromServer.source}` : 'réglage';
+
+        // Log au premier passage puis seulement si la source ou la durée change.
+        const logKey = `${src}:${waitSec}`;
+        if (loop._lastLoggedCd !== logKey) {
+            loop._lastLoggedCd = logKey;
+            const hint = fromServer ? ''
+                : settingSec === 180 ? ', 3 min, abonné'
+                : settingSec === 600 ? ', 10 min, non-abonné' : ', custom';
+            wmLog(`📦 Pack regen : <b>${waitSec}s</b> (${src}${hint})`);
+        }
+        return waitWithTicker(waitMs, '⏳ Regen dans', '#888');
+    };
+
     while (isCurrent()) {
         try {
             // Pause propre si le réseau est coupé (évite de spammer des requêtes en échec)
@@ -11345,61 +15408,96 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
             const data = await openPack();
             if (!isCurrent()) break; // stoppé/relancé pendant l'ouverture → on n'enchaîne pas
+            http403 = 0;             // la requête est passée : le compteur de refus repart
+
+            const errText = apiErrorText(data);
+
+            // ── Erreur d'auth dans le corps JSON → arrêt immédiat, pas de cooldown ──
+            if (errText && PACK_AUTH_ERROR_RE.test(errText)) {
+                haltPackOpener(alertEl, 'session expirée ou accès refusé',
+                    `${errText} — reconnecte-toi à wiki-masters.com puis relance le module.`);
+                break;
+            }
 
             // Comptabilisation + affichage + alertes (mutualisé avec les
             // ouvertures manuelles interceptées, cf. handlePackOpened).
-            await handlePackOpened(data, { animate: true });
+            const counted = await handlePackOpened(data, { animate: true });
+            if (!isCurrent()) break;
 
-            // ✅ Regen
-            if (data.packs_remaining === 0 || data.error) {
-                // Le setting utilisateur est la source de vérité (l'API peut renvoyer
-                // des valeurs liées au prochain slot, pas au cooldown complet)
-                const cdSec = getSetting('packCooldown');
-                const waitMs = cdSec * 1000;
-
-                // Log uniquement au premier passage ou si la valeur a changé
-                if (loop._lastLoggedCd !== cdSec) {
-                    wmLog(`📦 Pack regen : <b>${cdSec}s</b> (${cdSec === 180 ? '3 min, abonné' : cdSec === 600 ? '10 min, non-abonné' : 'custom'})`);
-                    loop._lastLoggedCd = cdSec;
-                }
-
-                // Ticker live qui décompte chaque seconde
-                const endTime = Date.now() + waitMs + 2000;
-                const updateAlert = () => {
-                    // PERF : skip si overlay fermé/hidden — l'alert n'est pas visible
-                    if (document.hidden) return;
-                    const overlay = document.getElementById('wm-overlay');
-                    if (!overlay || overlay.style.display === 'none') return;
-                    const remaining = Math.max(0, endTime - Date.now() - 2000);
-                    alertEl.innerHTML = `<span style="color:#888">⏳ Regen dans ${Math.round(remaining/1000)}s…</span>`;
-                };
-                updateAlert();
-                const tickerId = setInterval(updateAlert, 1000);
-                try {
-                    // Attente interruptible : on sort dès que la boucle n'est plus courante
-                    // (stop/restart) → le ticker est nettoyé aussitôt, pas à la fin du cooldown.
-                    while (isCurrent() && Date.now() < endTime) {
-                        await new Promise(r => setTimeout(r, 1000));
-                    }
-                } finally {
-                    clearInterval(tickerId);
-                }
-                if (!isCurrent()) break;
+            if (counted) {
+                failures = 0;
+                await sleep(1200 + Math.random() * 1800); // ✅ délai humanisé
                 continue;
             }
 
-            // ✅ délai humanisé
-            let delay = 1200 + Math.random() * 1800;
-            await sleep(delay);
+            // ── Plus de packs (ou réponse vide sans erreur) → attente de regen ──
+            const noPacksLeft = Number(data && data.packs_remaining) === 0;
+            if (noPacksLeft || !errText) {
+                failures = 0;
+                if (!(await waitPackCooldown(data))) break;
+                continue;
+            }
+
+            // ── Erreur applicative inconnue (maintenance, quota, bug serveur) ──
+            // Même politique que ci-dessous : on réessaie indéfiniment, sans arrêter.
+            failures++;
+            const apiWait = packBackoffMs(failures);
+            if (failures <= 3 || failures % 10 === 0) {
+                wmLog(`⚠️ Ouverture refusée (${failures}× d'affilée) : ${esc(errText)}`
+                    + ` — retry dans ${Math.round(apiWait / 1000)}s`);
+            }
+            if (!(await waitWithTicker(apiWait, '⚠️ Erreur — retry dans', '#fbbf24'))) break;
 
         } catch (err) {
+            if (!isCurrent()) break;
+            const status = err && err.status;
 
-            if (err.message === "403") {
-                alertEl.innerHTML = `<span style="color:#EF4444">⛔ 403 — pause 60s</span>`;
-                await sleep(60000);
-            } else {
-                await sleep(5000);
+            // 401 : la session est morte, aucune attente ne la ressuscitera.
+            if (status === 401) {
+                haltPackOpener(alertEl, 'session expirée (HTTP 401)',
+                    'reconnecte-toi à wiki-masters.com puis relance le module.');
+                break;
             }
+
+            /* 403 : sur ce site c'est un refus TRANSITOIRE (protection anti-bot qui se
+               relâche d'elle-même), pas une perte de droits. Une version intermédiaire
+               arrêtait le module au 3e refus d'affilée : en pratique elle coupait une
+               ouverture automatique qui repartait très bien toute seule après une pause.
+               → on pause et on réessaie indéfiniment, comme à l'origine. */
+            if (status === 403) {
+                http403++;
+                const wait403 = Math.min(Math.max(err.retryAfterMs || 0, 60000), PACK_WAIT_CEIL_MS);
+                // Log seulement les 3 premiers puis tous les 10 : inutile de remplir le
+                // journal pendant une protection anti-bot qui dure.
+                if (http403 <= 3 || http403 % 10 === 0) {
+                    wmLog(`⛔ 403 sur l'ouverture (${http403}× d'affilée) — pause ${Math.round(wait403 / 1000)}s, on réessaie`);
+                }
+                if (!(await waitWithTicker(wait403, '⛔ 403 — pause', '#EF4444'))) break;
+                continue;
+            }
+
+            failures++;
+            // Pas d'arrêt automatique sur échecs répétés : le module doit survivre à une
+            // coupure réseau ou à une maintenance et repartir tout seul. Seul le 401
+            // (session morte, cf. ci-dessus) justifie d'arrêter — rien ne le débloquera.
+            // On signale une fois, puis on continue à réessayer avec un backoff plafonné.
+            if (failures === PACK_WARN_FAILURES) {
+                wmLog(`⚠️ <b>${failures} échecs d'ouverture d'affilée</b> — le bot continue de réessayer. Dernière erreur : ${esc((err && err.message) || 'inconnue')}`);
+                sendToDiscord(`⚠️ **Pack Opener** : ${failures} échecs d'ouverture d'affilée, le bot continue de réessayer.\n${(err && err.message) || 'erreur inconnue'}`, 16753920);
+            }
+
+            // 429 / 5xx / page HTML de Cloudflare : Retry-After s'il est fourni,
+            // sinon backoff exponentiel plafonné.
+            const wait = Math.min(Math.max((err && err.retryAfterMs) || 0, packBackoffMs(failures)), PACK_WAIT_CEIL_MS);
+            const label = status === 429 ? '🚦 429 trop de requêtes — pause'
+                : status ? `⚠️ HTTP ${status} — retry dans`
+                : '⚠️ Réseau — retry dans';
+            if (failures <= 3 || failures % 10 === 0) {
+                wmLog(`⚠️ Ouverture échouée (${failures}× d'affilée) : ${esc((err && err.message) || 'erreur')}`
+                    + (err && err.body ? ` <span style="color:#666;font-size:9px;">${esc(err.body.slice(0, 120))}</span>` : '')
+                    + ` — retry dans ${Math.round(wait / 1000)}s`);
+            }
+            if (!(await waitWithTicker(wait, label, status === 429 ? '#fbbf24' : '#EF4444'))) break;
         }
     }
 }
@@ -11553,7 +15651,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         function renderKwList() {
             kwListEl.innerHTML = pendingKeywords.map((kw, i) =>
-                `<span class="wm-ob-kw-tag">${kw}<button data-i="${i}" title="Retirer">×</button></span>`
+                `<span class="wm-ob-kw-tag">${esc(kw)}<button data-i="${i}" title="Retirer">×</button></span>`
             ).join('') || '<span style="color:#444;font-size:10px;">Aucun mot-clé ajouté</span>';
             kwListEl.querySelectorAll('button[data-i]').forEach(b => {
                 b.onclick = () => {
@@ -11604,7 +15702,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 tags.forEach(t => {
                     // Pré-sélectionne "Trash" s'il existe
                     const sel = t.name.toLowerCase() === 'trash' ? ' selected' : '';
-                    opts += `<option value="existing:${t.id}" data-name="${t.name.replace(/"/g, '&quot;')}"${sel}>${t.name}</option>`;
+                    opts += `<option value="existing:${t.id}" data-name="${esc(t.name)}"${sel}>${esc(t.name)}</option>`;
                 });
             }
             opts += '<option value="new">➕ Créer un nouveau tag…</option>';
@@ -11649,10 +15747,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 tagChoice = { mode: 'existing', name, id: result.id || null };
                 if (result.id) { TRASH_TAG_ID = result.id; try { localStorage.setItem(TRASH_TAG_CACHE_KEY, result.id); } catch(e) {} }
                 tagStatusEl.innerHTML = result.alreadyExists
-                    ? `<span style="color:#fbbf24;">⚠️ Le tag "<b>${name}</b>" existait déjà — on l'utilisera.</span>`
-                    : `<span style="color:#4ade80;">✅ Tag "<b>${name}</b>" créé et sélectionné !</span>`;
+                    ? `<span style="color:#fbbf24;">⚠️ Le tag "<b>${esc(name)}</b>" existait déjà — on l'utilisera.</span>`
+                    : `<span style="color:#4ade80;">✅ Tag "<b>${esc(name)}</b>" créé et sélectionné !</span>`;
             } else {
-                tagStatusEl.innerHTML = `<span style="color:#ef4444;">❌ Échec : ${result.error}. Tu peux créer le tag manuellement sur wiki-masters.</span>`;
+                tagStatusEl.innerHTML = `<span style="color:#ef4444;">❌ Échec : ${esc(result.error)}. Tu peux créer le tag manuellement sur wiki-masters.</span>`;
             }
         };
 
@@ -11677,13 +15775,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
             // 2) Mots-clés (merge avec les défauts existants)
             try {
-                const existing = JSON.parse(localStorage.getItem(KEYWORDS_STORAGE_KEY) || '[]');
-                const merged = [...existing];
-                pendingKeywords.forEach(kw => {
-                    if (!merged.some(k => k.toLowerCase() === kw.toLowerCase())) merged.push(kw);
-                });
-                localStorage.setItem(KEYWORDS_STORAGE_KEY, JSON.stringify(merged));
-                KEYWORDS_ALERT = merged;
+                // Les mots-clés importés entrent en mode MANUEL : un import de wishlist
+                // ne doit jamais se mettre à dépenser tout seul.
+                pendingKeywords.forEach(kw => watchlistAdd(kw, { mode: 'manuel' }, true));
             } catch(e) {}
 
             // 3) Tag : selon le choix (existant sélectionné, créé, ou passé)
@@ -11691,7 +15785,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (tagChoice.mode === 'existing' && tagChoice.name) {
                 setSetting('sellTagName', tagChoice.name);
                 if (tagChoice.id) { TRASH_TAG_ID = tagChoice.id; try { localStorage.setItem(TRASH_TAG_CACHE_KEY, tagChoice.id); } catch(e) {} }
-                tagSummary = ` · tag <b>${tagChoice.name}</b>`;
+                tagSummary = ` · tag <b>${esc(tagChoice.name)}</b>`;
             }
             // mode 'new' non créé ou 'skip' → on ne touche pas au réglage tag
 
@@ -11722,7 +15816,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
               text: "Ouvre tes packs en boucle, tout seul. Il repère les cartes qui matchent tes mots-clés (alerte + son), tient les stats (raretés, drops, sessions) et respecte le cooldown de ton compte. Le bouton <b>▶ START</b> le lance." },
             { el: () => document.getElementById('wm-market-btn') && document.getElementById('wm-market-btn').closest('.wm-panel'),
               title: '🛒 Market Watcher',
-              text: "Surveille le marché en continu. Tu définis des mots-clés : <b>Standards</b> (alerte), <b>⭐ Prioritaires</b> (auto-bid), <b>🕵️ Fourbe</b> (snipe pile en fin d'enchère), <b>🚫 Exclus</b>. Il peut miser et riposter tout seul, avec un plafond par carte. Le <b>⚡ Hunter</b> mise sur tout ce qui passe sous ton seuil ; la case <b>🕵️ mode fourbe</b> juste en dessous change sa façon de miser : plus de mise immédiate, snipe en fin d'enchère plafonné à ce même seuil. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce, densité max) et <b>🖼 Cadres</b> (grille avec l'image de la carte et un bouton Miser sous chacune). Le bouton <b>🔭</b> sur chaque annonce (Détaillé/Cadres) compare les vues Wikipédia réelles du mois dernier au cache de WikiMasters — utile pour repérer une carte dont la rareté est sur le point de changer avant que le site ne s'en aperçoive." },
+              text: "Surveille le marché en continu. Tu ajoutes des <b>mots-clés</b> dans une seule liste, et chacun porte son mode : <b>👁️ MANUEL</b> (l'annonce s'affiche, tu cliques Miser toi-même) ou <b>🤖 AUTO</b> (le bot mise seul, sans jamais dépasser le <b>plafond</b> du mot-clé). Un clic sur le badge du mode le bascule. Deux limites bornent la dépense, en haut du panneau : un <b>prix maximum par mise</b> et un <b>nombre maximum de mises par heure</b>. Le bouton <b>🤖 Mises auto</b> est l'interrupteur maître : en pause, rien ne mise, tout reste affiché. Le badge <b>🔎</b> de chaque mot-clé bascule entre recherche <b>étendue</b> (cherche aussi dans la description de la carte, comme la recherche du site) et <b>stricte</b> (titre + catégorie seuls). La liste <b>🚫 Jamais</b> masque toute annonce contenant la phrase. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce) et <b>🖼 Cadres</b> (grille avec l'image et un bouton Miser sous chacune). Sous le tri, trois filtres d'affichage qui ne touchent pas au scan : les pastilles de <b>rareté</b> (cliquables, cumulables), la liste <b>mot-clé</b> pour ne voir que les résultats d'un mot, et <b>🧹 Vider</b> qui efface la liste — ce qui revient au scan suivant recompte alors comme nouveau. Le <b>tri</b> permet aussi de regrouper par <b>mot-clé</b> ou de classer par <b>rareté</b>. Le bouton <b>🔭</b> sur chaque annonce compare les vues Wikipédia réelles au cache du site — utile pour repérer une carte dont la rareté va changer." },
             { el: () => document.getElementById('wm-trash-btn') && document.getElementById('wm-trash-btn').closest('.wm-panel'),
               title: '🏷️ Trash Seller',
               text: "Met en vente automatiquement toutes les cartes que tu as taguées (« Trash » par défaut). Tu choisis le prix (par rareté ou au prix moyen du marché) et quelles cartes prioriser. Le bouton <b>🔄 Refresh ventes</b> renouvelle les annonces." },
@@ -11890,6 +15984,522 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
     }
     window.addEventListener('online', handleNetworkChange);
+
+    /* ═══════════ SURCOUCHE COLLECTION ═══════════
+       Sur la page /collection du site, ajoute sur chaque carte :
+         · le prix moyen du marché (médiane des ventes passées) ;
+         · un bouton 🗑️ qui pose le tag de vente, pour défausser sans ouvrir la carte.
+
+       Deux contraintes ont dicté la conception :
+
+       1. Le DOM du site ne contient AUCUN identifiant de carte — seulement un titre.
+          On relie donc chaque tuile à sa carte par son titre, via un index alimenté
+          gratuitement : le site charge lui-même /api/my-collection, et l'intercepteur
+          réseau lit cette réponse au passage. Zéro requête ajoutée pour la liaison.
+
+       2. La cote vient de /api/marketplace/cards/{id}/sales, l'endpoint qui s'est déjà
+          fait refuser en 403 pour cause de sur-sollicitation. Une collection de 500
+          cartes ne doit donc PAS déclencher 500 requêtes : seules les tuiles réellement
+          VISIBLES à l'écran mettent leur carte en file (IntersectionObserver), et la
+          file reste celle, étalée et auto-limitée, du reste du bot. */
+
+    const collectionTitleIndex = new Map(); // titre normalisé → card_id
+
+    /* Le titre du <h3> et celui de l'API ne sont pas toujours octet pour octet
+       identiques : espaces insécables, espaces multiples, formes Unicode composées ou
+       décomposées (« é » en un ou deux caractères). Une seule clé pour les deux côtés. */
+    function normTitle(t) {
+        let s = String(t == null ? '' : t);
+        try { s = s.normalize('NFC'); } catch (e) {}
+        // Le site affiche volontiers la ponctuation typographique (’ – «…») là où l'API
+        // renvoie la forme ASCII : « Équipe de voltige de l’Armée de l’air » contre
+        // « … de l'Armée de l'air ». Sans ce repli, la comparaison exacte échouait.
+        s = s.replace(/[\u2018\u2019\u02bc\u0060\u00b4]/g, "'")
+             .replace(/[\u2010\u2011\u2012\u2013\u2014\u2212]/g, '-')
+             .replace(/[\u201c\u201d\u00ab\u00bb]/g, '"');
+        return s.replace(/[\s\u00a0\u202f]+/g, ' ').trim().toLowerCase();
+    }
+
+    // Alimente l'index depuis n'importe quelle réponse ressemblant à une collection.
+    // Tolérant sur la forme : le site encapsule tantôt la carte dans `card`, tantôt pas.
+    function indexCollectionPayload(data) {
+        const items = (data && (data.collection || data.items || data.cards)) || [];
+        if (!Array.isArray(items)) return 0;
+        let added = 0;
+        for (const item of items) {
+            const card = (item && item.card) || item;
+            const title = card && (card.wikipedia_title || card.title);
+            const id = (item && item.card_id) || (card && card.id);
+            if (!title || !id) continue;
+            const key = normTitle(title);
+            if (!collectionTitleIndex.has(key)) { collectionTitleIndex.set(key, id); added++; }
+        }
+        return added;
+    }
+
+    /* ── Étiquette de vente : poser ET retirer ──
+       Le bouton était à sens unique. Or défausser est une décision qu'on révise : il
+       doit pouvoir enlever l'étiquette aussi bien que la poser, et surtout MONTRER
+       l'état courant — sans ça on ne sait pas ce qu'un clic va faire. */
+    const trashTaggedCardIds = new Set();
+    let trashTaggedLoadedAt = 0;
+
+    function supabaseAuthHeaders() {
+        const { token } = getSupabaseAccessToken();
+        return {
+            'apikey': SUPABASE_KEY,
+            'Authorization': `Bearer ${token || SUPABASE_KEY}`,
+            'Accept': 'application/json',
+        };
+    }
+
+    /* Une seule requête donne toutes les cartes déjà étiquetées du compte — bien mieux
+       qu'une interrogation par carte sur une collection de plusieurs centaines. */
+    async function loadTrashTaggedCardIds(force) {
+        if (!force && Date.now() - trashTaggedLoadedAt < 60000) return trashTaggedCardIds;
+        const tagId = await ensureTrashTagId();
+        if (!tagId) return trashTaggedCardIds;
+        try {
+            const res = await fetch(
+                `${SUPABASE_URL}/user_card_tags?tag_id=eq.${tagId}&select=user_cards(card_id)&limit=1000`,
+                { credentials: 'omit', headers: supabaseAuthHeaders() });
+            if (!res.ok) return trashTaggedCardIds;
+            const rows = await res.json();
+            trashTaggedCardIds.clear();
+            for (const r of (rows || [])) {
+                const id = r && r.user_cards && r.user_cards.card_id;
+                if (id) trashTaggedCardIds.add(id);
+            }
+            trashTaggedLoadedAt = Date.now();
+        } catch (e) {}
+        return trashTaggedCardIds;
+    }
+
+    /* Bascule l'étiquette de vente sur une carte. Relit l'état réel côté serveur avant
+       d'agir : l'état affiché peut dater, et poser deux fois ou retirer une étiquette
+       absente produirait un faux succès. */
+    async function toggleTrashTag(cardId, title) {
+        const tagId = await ensureTrashTagId();
+        if (!tagId) {
+            return { ok: false, error: `étiquette « ${getSellTagName()} » introuvable sur ton compte — crée-la sur le site` };
+        }
+        const { token } = getSupabaseAccessToken();
+        const claims = decodeJWT(token);
+        const userId = claims && claims.sub;
+        if (!userId || !token) return { ok: false, error: 'session Supabase absente — recharge la page' };
+
+        let items = [];
+        try {
+            const res = await fetch(
+                `${SUPABASE_URL}/user_cards?card_id=eq.${cardId}&user_id=eq.${userId}&select=id,user_card_tags(tag_id)&limit=20`,
+                { credentials: 'omit', headers: supabaseAuthHeaders() });
+            if (!res.ok) return { ok: false, error: `HTTP ${res.status} à la lecture des exemplaires` };
+            items = await res.json();
+        } catch (e) {
+            return { ok: false, error: (e && e.message) || 'lecture des exemplaires impossible' };
+        }
+        if (!Array.isArray(items) || !items.length) {
+            return { ok: false, error: 'aucun exemplaire de cette carte dans ta collection' };
+        }
+
+        const tagged = items.find(i => (i.user_card_tags || []).some(t => t.tag_id === tagId));
+        if (tagged) {
+            try {
+                const del = await fetch(
+                    `${SUPABASE_URL}/user_card_tags?tag_id=eq.${tagId}&user_card_id=eq.${tagged.id}`,
+                    { method: 'DELETE', credentials: 'omit',
+                      headers: Object.assign({}, supabaseAuthHeaders(), { 'Prefer': 'return=representation' }) });
+                if (!del.ok) return { ok: false, error: `HTTP ${del.status} au retrait` };
+                const arr = await del.json().catch(() => []);
+                // Requête acceptée mais 0 ligne touchée = règle RLS côté serveur.
+                if (Array.isArray(arr) && arr.length === 0) {
+                    return { ok: false, error: 'le serveur a refusé le retrait (droits)' };
+                }
+                trashTaggedCardIds.delete(cardId);
+                return { ok: true, action: 'removed' };
+            } catch (e) {
+                return { ok: false, error: (e && e.message) || 'retrait impossible' };
+            }
+        }
+
+        const free = items.find(i => !(i.user_card_tags || []).some(t => t.tag_id === tagId)) || items[0];
+        const r = await addTagToUserCard(free.id, tagId);
+        if (!r.ok) return { ok: false, error: r.error || `HTTP ${r.status}` };
+        trashTaggedCardIds.add(cardId);
+        return { ok: true, action: 'added' };
+    }
+
+    const COLLECTION_BADGE_CLASS = 'wm-coll-price';
+    const COLLECTION_BTN_CLASS = 'wm-coll-trash';
+
+    function isCollectionPage() {
+        return /\/collection(\/|$|\?)/.test(location.pathname + location.search);
+    }
+
+    /* Les fenêtres modales du site (« Mettre aux enchères »…) contiennent une mini-carte
+       de même structure. Les décorer y ajoute un doublon inutile — le site y affiche déjà
+       sa MOYENNE — et un bouton par-dessus ses propres commandes. On reconnaît une modale
+       à son fond qui COUVRE LE VIEWPORT. Tester seulement `position: fixed` était bien
+       trop large : n'importe quel conteneur de mise en page fixe (barre, coquille
+       d'application) suffisait alors à écarter toutes les cartes de la grille. */
+    function inViewportModal(el) {
+        for (let a = el; a && a !== document.body; a = a.parentElement) {
+            if (getComputedStyle(a).position !== 'fixed') continue;
+            const r = a.getBoundingClientRect();
+            if (r.width >= innerWidth * 0.9 && r.height >= innerHeight * 0.9) return true;
+        }
+        return false;
+    }
+
+    /* Repère les tuiles de cartes sans dépendre d'un nom de classe (le site est en
+       Tailwind, ses classes changent à chaque retouche de style).
+
+       On partait de l'IMAGE : la tuile était le plus petit ancêtre contenant une image
+       dont l'`alt` égale le titre du <h3>. Les cartes SANS illustration Wikipédia (le logo
+       « WM » à la place) n'ont pas cette image — elles n'étaient donc jamais reconnues :
+       ni cote, ni bouton de défausse. On part désormais du TITRE, toujours présent : la
+       tuile est le plus petit ancêtre du <h3> qui porte le badge de rareté, à condition
+       qu'il ne contienne qu'UN titre (sinon on est remonté jusqu'à la grille).
+
+       Coût : une tuile déjà décorée est écartée d'un simple `closest`, avant tout calcul
+       de style. C'est ce qui rend les passages suivants quasi gratuits. */
+    function findCollectionTiles() {
+        const tiles = [];
+        const seen = new Set();
+        for (const h3 of document.querySelectorAll('h3')) {
+            if (h3.closest('[data-wm-decorated="1"]') || isBotOwnNode(h3)) continue;
+            const title = (h3.textContent || '').trim();
+            if (!title || title.length > 300) continue;
+            let tile = null;
+            for (let el = h3.parentElement, depth = 0; el && depth < 8; el = el.parentElement, depth++) {
+                if (el.querySelectorAll('h3').length > 1) break;   // remonté trop haut
+                if (tileRarity(el)) { tile = el; break; }
+            }
+            if (!tile || seen.has(tile)) continue;
+            seen.add(tile);
+            if (inViewportModal(tile)) continue;
+            tiles.push({ tile, title, rarity: tileRarity(tile) });
+        }
+        return tiles;
+    }
+
+    /* Rareté affichée sur la tuile. Le site la met dans un petit badge dont le texte
+       est exactement le code (« SR »). On cherche donc le premier élément de la tuile
+       dont le texte est l'un des six codes — plus robuste qu'un nom de classe, et ça
+       compte : une carte n'a pas la même cote selon sa rareté. */
+    const RARITY_CODES = new Set(['L', 'UR', 'SR', 'R', 'PC', 'C']);
+    function tileRarity(tile) {
+        for (const el of tile.querySelectorAll('div,span')) {
+            const t = (el.textContent || '').trim().toUpperCase();
+            if (t.length <= 2 && RARITY_CODES.has(t)) return t;
+        }
+        return '';
+    }
+
+    function collectionPriceText(cardId, rarity) {
+        if (!cardId) return { text: '—', title: 'Carte non reconnue dans ta collection (index en cours de chargement).' };
+        const entry = getCachedSales(cardId);
+        if (!entry) {
+            if (salesFetchBlocked(cardId)) {
+                return { text: '?', title: "Le site a refusé l'historique des ventes de cette carte. Nouvelle tentative automatique dans quelques minutes." };
+            }
+            const pauseMs = salesEndpointCooldownUntil - Date.now();
+            if (pauseMs > 0) {
+                return { text: '⏸', title: `Le site limite les demandes de cote — reprise automatique dans ${Math.ceil(pauseMs / 60000)} min.` };
+            }
+            return { text: '⋯', title: 'Cote en cours de chargement…' };
+        }
+        if (!entry.count) return { text: '—', title: 'Aucune vente passée pour cette carte : pas de cote.' };
+        // Une même carte n'a pas la même cote selon sa rareté : on prend celle de
+        // l'exemplaire affiché quand on la connaît.
+        const rar = (rarity || '').toUpperCase();
+        if (entry.byRarity) {
+            const v = entry.byRarity[rar];
+            const all = Object.entries(entry.byRarity)
+                .map(([k, n]) => `${k} ${n.toLocaleString('fr-FR')}`).join(' · ');
+            if (v != null) {
+                return { text: `≈ ${v.toLocaleString('fr-FR')}`,
+                         title: `Moyenne du marché en ${rar} : ${v}. Toutes raretés : ${all}` };
+            }
+            return { text: '—', title: `Aucune vente en ${rar || '?'}. Autres raretés : ${all}` };
+        }
+        return {
+            text: `≈ ${entry.median.toLocaleString('fr-FR')}`,
+            title: `Médiane ${entry.median} · moyenne ${entry.avg} · min ${entry.min} · max ${entry.max}`
+                 + ` · sur ${entry.count} vente(s)${entry.last != null ? ` · dernière ${entry.last}` : ''}`,
+        };
+    }
+
+    // Une seule observation de visibilité pour toute la page : c'est elle qui décide
+    // quelles cotes sont réellement demandées.
+    let collectionVisibilityObserver = null;
+    /* Sondes des tuiles actuellement à l'écran. L'observateur se désabonnait après la
+       première apparition (« une fois suffit ») : une cote refusée une fois, ou écartée
+       pendant une pause du site, n'était plus JAMAIS redemandée tant que la carte restait
+       affichée — d'où les « ? » et « ⋯ » qui ne partaient pas, alors que le site, lui,
+       connaissait bien le prix. On suit donc la visibilité en continu, et
+       healCollectionQuotes() re-demande ce qui manque dès que c'est permis. */
+    const collectionVisibleProbes = new Set();
+    function ensureVisibilityObserver() {
+        if (collectionVisibilityObserver || typeof IntersectionObserver !== 'function') return;
+        collectionVisibilityObserver = new IntersectionObserver((entries) => {
+            let queued = 0;
+            for (const e of entries) {
+                if (!e.isIntersecting) { collectionVisibleProbes.delete(e.target); continue; }
+                collectionVisibleProbes.add(e.target);
+                const id = e.target.dataset.wmCardId;
+                if (id && !getCachedSales(id)) { queueSalesFetch(id); queued++; }
+            }
+            if (queued && !salesFetchRunning) {
+                processSalesQueue(() => refreshCollectionBadges());
+            }
+        }, { rootMargin: '200px' });
+    }
+
+    // Re-met en file les cartes VISIBLES encore sans cote, dès que le site le permet
+    // (blocage par carte expiré, pause globale terminée). Aucune requête sinon.
+    function healCollectionQuotes() {
+        if (Date.now() < salesEndpointCooldownUntil || botNetPaused()) return;
+        let queued = 0;
+        for (const el of collectionVisibleProbes) {
+            if (!el.isConnected) { collectionVisibleProbes.delete(el); continue; }
+            const id = el.dataset.wmCardId;
+            if (!id || getCachedSales(id) || salesFetchBlocked(id) || salesFetchQueued.has(id)) continue;
+            queueSalesFetch(id);
+            queued++;
+        }
+        if (queued && !salesFetchRunning) processSalesQueue(() => refreshCollectionBadges());
+    }
+
+    function refreshCollectionBadges() {
+        for (const el of document.querySelectorAll('.' + COLLECTION_BADGE_CLASS)) {
+            const { text, title } = collectionPriceText(el.dataset.wmCardId, el.dataset.wmRarity);
+            // N'écrit que ce qui change : réécrire des dizaines de badges identiques toutes
+            // les 5 s forçait le navigateur à recalculer la page pour rien.
+            const next = '💰 ' + text;
+            if (el.textContent !== next) el.textContent = next;
+            if (el.title !== title) el.title = title;
+        }
+    }
+
+    function paintTrashButton(btn, tagged) {
+        btn.dataset.wmTagged = tagged ? '1' : '0';
+        btn.textContent = tagged ? '♻️' : '🗑️';
+        btn.style.borderColor = tagged ? 'rgba(74,222,128,0.75)' : 'rgba(255,255,255,0.25)';
+        btn.style.background = tagged ? 'rgba(22,101,52,0.55)' : 'rgba(0,0,0,0.45)';
+        const t = btn.dataset.wmTitle || 'cette carte';
+        btn.title = tagged
+            ? `« ${t} » porte l'étiquette « ${getSellTagName()} » — cliquer pour la RETIRER.`
+            : `Défausser « ${t} » : pose l'étiquette « ${getSellTagName()} », le Trash Seller la vendra.`
+              + " Rien n'est supprimé, et un second clic retire l'étiquette.";
+    }
+
+    function makeTrashButton(cardId, title, rarity) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = COLLECTION_BTN_CLASS;
+        btn.dataset.wmCardId = cardId;
+        btn.dataset.wmTitle = title;
+        btn.dataset.wmRarity = rarity || '';
+        btn.style.cssText = 'cursor:pointer;border:1px solid rgba(255,255,255,0.25);'
+            + 'border-radius:6px;padding:1px 4px;font-size:13px;line-height:1.1;color:#fff;backdrop-filter:blur(2px);';
+        paintTrashButton(btn, trashTaggedCardIds.has(cardId));
+        btn.onclick = async (ev) => {
+            // Sans ça, le clic ouvre la fiche de la carte : le bouton est POSÉ sur la
+            // tuile, qui est elle-même cliquable.
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (btn.disabled) return;
+            btn.disabled = true;
+            const wasTagged = btn.dataset.wmTagged === '1';
+            btn.textContent = '⏳';
+            try {
+                const r = await toggleTrashTag(cardId, title);
+                if (r.ok) {
+                    paintTrashButton(btn, r.action === 'added');
+                    // Le pool du Trash Seller est en cache (rescan toutes les 12 min) : sans
+                    // ça, une carte défaussée ici n'était vue par le vendeur que 12 min plus tard.
+                    if (r.action === 'added') pushToTrashPoolCache(cardId, title, btn.dataset.wmRarity || 'C');
+                    else removeFromTrashPoolCache(cardId);
+                    wmLog(r.action === 'added'
+                        ? `🗑️ Défaussée : <b>${esc(title)}</b> → étiquette <b>${esc(getSellTagName())}</b>.`
+                        : `♻️ Étiquette retirée : <b>${esc(title)}</b> n'est plus à vendre.`);
+                } else {
+                    paintTrashButton(btn, wasTagged); // ne jamais mentir sur l'état réel
+                    btn.textContent = '⚠️';
+                    btn.title = `Échec : ${r.error}`;
+                    wmLog(`⚠️ Étiquette <b>${esc(title)}</b> : ${esc(r.error)}`);
+                }
+            } catch (e) {
+                paintTrashButton(btn, wasTagged);
+                btn.textContent = '⚠️';
+                btn.title = String((e && e.message) || e);
+            } finally {
+                btn.disabled = false;
+            }
+        };
+        return btn;
+    }
+
+    let collectionDecorateScheduled = false;
+    let collectionMatchLogged = false;
+
+    /* Titres affichés mais absents de l'index (la réponse /api/my-collection qui les
+       contenait n'est pas passée par l'intercepteur, ou le site les a chargés autrement).
+       Un seul aller-retour groupé à la table `cards`, au plus toutes les 30 s, et un titre
+       déjà cherché n'est pas redemandé avant 10 min. Si plusieurs cartes portent le même
+       titre, on ne devine pas : la tuile reste sans décoration plutôt que d'agir sur la
+       mauvaise carte. */
+    const titleLookupAskedAt = new Map();
+    let titleLookupLastTs = 0;
+    let titleLookupRunning = false;
+    async function resolveUnknownCollectionTitles(titles) {
+        if (titleLookupRunning || Date.now() - titleLookupLastTs < 30000) return;
+        const now = Date.now();
+        const todo = [...new Set(titles.map(t => String(t).trim()))]
+            .filter(t => t && now - (titleLookupAskedAt.get(normTitle(t)) || 0) > 600000)
+            .slice(0, 40);
+        if (!todo.length) return;
+        titleLookupRunning = true;
+        titleLookupLastTs = now;
+        todo.forEach(t => titleLookupAskedAt.set(normTitle(t), now));
+        try {
+            const list = todo.map(t => '"' + t.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"').join(',');
+            const res = await fetch(
+                `${SUPABASE_URL}/cards?select=id,wikipedia_title&wikipedia_title=in.(${encodeURIComponent(list)})&limit=200`,
+                { credentials: 'omit', headers: supabaseAuthHeaders() });
+            if (!res.ok) return;
+            const rows = await res.json();
+            const byKey = new Map();
+            for (const r of (Array.isArray(rows) ? rows : [])) {
+                if (!r || !r.id || !r.wikipedia_title) continue;
+                const k = normTitle(r.wikipedia_title);
+                byKey.set(k, byKey.has(k) ? null : r.id);   // null = homonymes → on s'abstient
+            }
+            let added = 0;
+            for (const [k, id] of byKey) {
+                if (id && !collectionTitleIndex.has(k)) { collectionTitleIndex.set(k, id); added++; }
+            }
+            if (added) scheduleCollectionDecorate();
+        } catch (e) {
+        } finally {
+            titleLookupRunning = false;
+        }
+    }
+
+    function decorateCollectionTiles() {
+        if (!isCollectionPage()) return;
+        ensureVisibilityObserver();
+        const tiles = findCollectionTiles();
+        let decorated = 0, unknown = 0;
+        const unknownTitles = [];
+        for (const { tile, title, rarity } of tiles) {
+            if (tile.dataset.wmDecorated === '1') continue;
+            // Garde-fou : une tuile qui porte déjà nos éléments (détection passée par un
+            // autre ancêtre) ne doit pas en recevoir une seconde série.
+            if (tile.querySelector('.' + COLLECTION_BADGE_CLASS)) { tile.dataset.wmDecorated = '1'; continue; }
+            const cardId = collectionTitleIndex.get(normTitle(title)) || '';
+            if (!cardId) { unknown++; unknownTitles.push(title); continue; } // on retentera
+            tile.dataset.wmDecorated = '1';
+            decorated++;
+
+            // Le badge se place en bas à gauche de la tuile. `position:absolute` se
+            // rattache à la tuile, qui est déjà `relative` côté site ; on ne force sa
+            // position que si ce n'était pas le cas, pour ne rien casser de sa mise en page.
+            if (getComputedStyle(tile).position === 'static') tile.style.position = 'relative';
+            const badge = document.createElement('div');
+            badge.className = COLLECTION_BADGE_CLASS;
+            badge.dataset.wmCardId = cardId;
+            badge.dataset.wmRarity = rarity || '';
+            const { text, title: tip } = collectionPriceText(cardId, rarity);
+            badge.textContent = '💰 ' + text;
+            badge.title = tip;
+            badge.style.cssText = 'position:absolute;left:4px;bottom:4px;z-index:40;pointer-events:auto;'
+                + 'font-size:10px;font-weight:700;padding:1px 5px;border-radius:6px;'
+                + 'background:rgba(0,0,0,0.6);color:#fbbf24;border:1px solid rgba(251,191,36,0.45);'
+                + 'backdrop-filter:blur(2px);white-space:nowrap;';
+            tile.appendChild(badge);
+
+            // Le bouton rejoint la pile d'icônes du site (à côté de l'étoile « favoris »)
+            // quand elle existe ; sinon on le pose en haut à droite de la tuile.
+            const btn = makeTrashButton(cardId, title, rarity);
+            const fav = tile.querySelector('button[aria-label="Ajouter aux favoris"]');
+            if (fav && fav.parentElement) {
+                fav.parentElement.appendChild(btn);
+            } else {
+                btn.style.position = 'absolute';
+                btn.style.right = '4px';
+                btn.style.top = '4px';
+                btn.style.zIndex = '40';
+                tile.appendChild(btn);
+            }
+
+            const probe = document.createElement('span');
+            probe.dataset.wmCardId = cardId;
+            probe.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
+            tile.appendChild(probe);
+            if (collectionVisibilityObserver) collectionVisibilityObserver.observe(probe);
+            else queueSalesFetch(cardId); // pas d'IntersectionObserver → repli simple
+        }
+
+        // État initial des étiquettes : une seule requête pour toute la collection,
+        // puis on repeint les boutons déjà posés.
+        if (decorated && Date.now() - trashTaggedLoadedAt > 60000) {
+            loadTrashTaggedCardIds().then((set) => {
+                for (const b of document.querySelectorAll('.' + COLLECTION_BTN_CLASS)) {
+                    if (b.disabled || b.textContent === '⏳') continue;
+                    paintTrashButton(b, set.has(b.dataset.wmCardId));
+                }
+            }).catch(() => {});
+        }
+
+        if (unknownTitles.length) resolveUnknownCollectionTitles(unknownTitles);
+
+        if (decorated && !collectionMatchLogged) {
+            collectionMatchLogged = true;
+            wmLog(`🖼️ Collection : cotes du marché affichées sur les cartes${unknown ? ` (${unknown} carte(s) pas encore reconnue(s), l'index se remplit)` : ''}.`);
+        }
+        if (!salesFetchRunning && salesFetchQueue.length > 0) {
+            processSalesQueue(() => refreshCollectionBadges());
+        }
+    }
+
+    function scheduleCollectionDecorate() {
+        if (collectionDecorateScheduled) return;
+        collectionDecorateScheduled = true;
+        // Débounce : le site re-rend sa grille par salves, et nos propres insertions
+        // déclenchent elles aussi l'observateur.
+        setTimeout(() => {
+            collectionDecorateScheduled = false;
+            // Pas de catch muet : une erreur ici laisse la page sans cote ni bouton,
+            // sans rien pour comprendre pourquoi. On le dit, une seule fois.
+            try { decorateCollectionTiles(); }
+            catch (e) {
+                if (!scheduleCollectionDecorate._errLogged) {
+                    scheduleCollectionDecorate._errLogged = true;
+                    wmLog(`⚠️ Surcouche Collection : ${esc((e && e.message) || e)}`);
+                    console.error('[WikiMasters] surcouche collection', e);
+                }
+            }
+        }, 400);
+    }
+
+    function installCollectionOverlay() {
+        if (typeof MutationObserver !== 'function') return;
+        new MutationObserver(scheduleCollectionDecorate).observe(document.body, { childList: true, subtree: true });
+        // Le site est une application à navigation interne : l'URL change sans rechargement.
+        window.addEventListener('popstate', scheduleCollectionDecorate);
+        scheduleCollectionDecorate();
+        // Les cotes arrivent de façon asynchrone : on rafraîchit les badges régulièrement,
+        // sans rien redemander au réseau.
+        setInterval(() => {
+            if (!isCollectionPage()) return;
+            healCollectionQuotes();
+            refreshCollectionBadges();
+        }, 5000);
+    }
+    installCollectionOverlay();
+
     window.addEventListener('offline', handleNetworkChange);
     // Exposé pour que les boucles réseau puissent vérifier l'état
     window.wmIsOnline = () => navigator.onLine;
