@@ -82,6 +82,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
 - `tests/antibot-manual-price.test.mjs` : vérification anti-bot du site respectée (pause de
   10 s sans aucune requête du bot, bandeau, reprise), prix manuel de la Revente (sous le payé, sans cote,
   fixe sur invendu, vente en cours retirée puis remise, retour au prix auto).
+- `tests/hunt-traffic.test.mjs` : voie rapide par enchère (une Chasse en fin ne fait plus relire
+  les autres enchères à 0,15 s), rythme serré 0,5 s, cotes de la Chasse opti limitées (6, < 90 s).
 - `tests/hunt-cap-safety.test.mjs` : une Chasse qui lâche une enchère n'efface pas le plafond
   posé par un autre réglage (auto-bid, Chasseur ciblé).
 - `tests/top-cards.test.mjs` : 💎 Cartes les plus chères — collection entière, cote de la

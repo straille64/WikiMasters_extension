@@ -1341,6 +1341,28 @@ l'interface du site attend aussi. Statut du Market Watcher : « 🛡️ pause an
 Test : `antibot-manual-price` A — fork.41 : 59 requêtes pendant la pause ; fork.42 : 0, puis
 reprise (requêtes et mise acceptée 10,1 s après le refus).
 
+### #60 — Trafic des Chasses : voie rapide globale, 0,15 s, 12 cotes par passage (fork.42)
+
+**Constat (demande du 03/10 : « optimiser les trames, laisser mon navigateur respirer »)** :
+
+- la voie rapide relisait **toutes** les enchères suivies au rythme de la plus urgente : une Chasse
+  dans ses 30 dernières secondes faisait relire aussi celles qui finissent dans 4 min ;
+- ce rythme était de 0,15 s, alors que le site met 1 à 6 s à répondre ;
+- la Chasse opti lisait jusqu'à 12 cotes par passage, sur tout l'horizon de 3 min.
+
+**✅ Corrigé (1.3.13-fork.43)**, sans retirer de fonctionnalité :
+
+1. **Voie rapide par enchère** : chaque enchère est relue à SON rythme, d'après son temps restant
+   (0,5 s dans sa fenêtre de Chasse / Fourbe ou ses 12 dernières secondes, puis 1 s, 2 s, 5 s ;
+   au-delà de 5 min, le suivi ciblé de 20 s suffit).
+2. **Rythme le plus serré : 0,5 s** au lieu de 0,15 s.
+3. **Cotes de la Chasse opti** : au plus 6 par passage, seulement pour les enchères qui finissent
+   dans les 90 s (les autres sont revues aux passages suivants ; une cote reste 12 h en cache).
+
+Test : `hunt-traffic` — 1 Chasse en fin + 4 enchères à ~4 min, sur 10 s : fork.42 **315 lectures**
+(63 par enchère), fork.43 **28** (20 pour la Chasse, 2 pour chacune des autres). Cotes en un
+passage (10 UR bradées, 3 à ~60 s, 7 à ~150 s) : fork.42 10, fork.43 3.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.42';
+    const WM_VERSION = '1.3.13-fork.43';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -6098,6 +6098,27 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Calcule l'intervalle de polling en fonction de l'enchère trackée la plus urgente.
     // Retourne null si rien d'urgent à surveiller (le main scan suffit).
+    const HOT_LANE_FAST_MS = 500;
+    /* Voie rapide PAR ENCHÈRE (fork.43). Avant, chaque passage relisait TOUTES les enchères
+       suivies au rythme de la plus urgente : une seule Chasse dans ses 30 dernières secondes
+       faisait relire toutes les autres (même à 3 min de leur fin) toutes les 0,15 s. Chaque
+       enchère a maintenant son propre rythme, d'après SON temps restant. null = froide : le
+       suivi ciblé (20 s) suffit. */
+    const hotLaneLastRead = new Map();   // id → début de la dernière lecture (ms local)
+    function hotLaneItemInterval(id) {
+        const hit = activeHitsMap.get(id);
+        const end = hit && hit.endAt ? new Date(hit.endAt).getTime() : NaN;
+        if (!Number.isFinite(end)) return 5000;          // état initial inconnu : on le découvre
+        const ms = end - serverNow();
+        if (ms <= 0) return 2000;                         // fin passée : état final (gagnée / perdue)
+        if (legendHunt.has(id) && ms < (getSetting('legendHuntWindowSec') + 10) * 1000) return HOT_LANE_FAST_MS;
+        if (snipeSet.has(id) && ms < (getSetting('snipeSecondsBefore') + 10) * 1000) return HOT_LANE_FAST_MS;
+        if (ms < 12_000)      return HOT_LANE_FAST_MS;
+        if (ms < 30_000)      return 1000;
+        if (ms < 90_000)      return 2000;
+        if (ms < 5 * 60_000)  return 5000;
+        return null;
+    }
     function computeHotLaneInterval() {
         const tracked = new Set([...myBidsSet, ...autoBidSet, ...snipeSet, ...legendHunt.keys()]);
         if (tracked.size === 0) return null;
@@ -6114,20 +6135,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (snipeSet.has(id) && ms > 0 && ms < minSnipeMs) minSnipeMs = ms;
             if (legendHunt.has(id) && ms > 0 && ms < minLegendMs) minLegendMs = ms;
         });
-        if (minLegendMs < (getSetting('legendHuntWindowSec') + 10) * 1000) return 150;
+        // Rythme le plus serré : 0,5 s (fork.43). Le site met 1 à 6 s à répondre : relire toutes
+        // les 0,15 s empilait des requêtes sans donner l'information plus tôt.
+        if (minLegendMs < (getSetting('legendHuntWindowSec') + 10) * 1000) return HOT_LANE_FAST_MS;
 
         // Snipe imminent : polling très serré (~150ms) pour tirer pile au bon moment. La
         // fenêtre suit le RÉGLAGE (+10s de marge) : figée à 20s, un snipe réglé à 60s était
         // décidé par un tick lent, donc jusqu'à 2s en retard sur la cible.
         const snipeWindowMs = (getSetting('snipeSecondsBefore') + 10) * 1000;
-        if (minSnipeMs < snipeWindowMs) return 150;
+        if (minSnipeMs < snipeWindowMs) return HOT_LANE_FAST_MS;
 
         // Aucune enchère trackée connue dans activeHitsMap → on poll quand même
         // toutes les 5s pour découvrir leur état initial.
         if (minMs === Infinity) return 5000;
 
-        if (minMs < 5_000)       return 250;   // mort de l'enchère : 4 ticks/s
-        if (minMs < 12_000)      return 500;   // snipe : 2 ticks/s
+        if (minMs < 12_000)      return HOT_LANE_FAST_MS;   // fin de l'enchère / snipe : 2 ticks/s
         if (minMs < 30_000)      return 1000;  // très chaud : 1s
         if (minMs < 90_000)      return 2000;  // chaud : 2s
         if (minMs < 5 * 60_000)  return 5000;  // tiède : 5s
@@ -6146,7 +6168,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
            peut-être un filtre `rarity=L` : on l'essaie et on le VÉRIFIE (toutes les annonces
            renvoyées doivent être des L), sinon repli sur le début « vivant » du marché trié
            par fin proche — là où se trouvent justement les enchères qui vont finir.
-         · TIR, dans la hot lane (sondage à ~150 ms près de la fin) : sous la fenêtre, si je
+         · TIR, dans la hot lane (sondage à ~0,5 s près de la fin) : sous la fenêtre, si je
            ne mène pas et que la mise minimale est ≤ max → placeBid. Réévalué à chaque tick :
            une surenchère adverse relance donc une riposte, jusqu'au max.
        Même garde-fous que toute mise automatique : interrupteur « Mises auto », plafond
@@ -6266,6 +6288,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function optiRarities() {
         return String(getSetting('optiRarities') || '').toUpperCase().split(/[,\s]+/).filter(r => RARITY[r]);
     }
+    const OPTI_COTE_BUDGET = 6;
+    const OPTI_COTE_HORIZON_MS = 90 * 1000;
     async function discoverOpti() {
         if (!getSetting('optiHuntEnabled') || !marketWatcherActive || botNetPaused()) return;
         for (const [id, e] of [...legendHunt.entries()]) {
@@ -6306,7 +6330,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!(next <= maxBid)) continue;
             cands.push({ a, rar, next, remaining, cardId: a.card?.id || a.card_id });
         }
-        let budget = 12;
+        /* fork.43 : au plus 6 cotes par passage, et seulement pour les enchères qui finissent
+           dans les 90 s (les autres seront revues aux passages suivants — la cote lue reste
+           en cache 12 h). Avant : 12 par passage, sur tout l'horizon de 3 min. */
+        let budget = OPTI_COTE_BUDGET;
         /* Cotes à lire, À TOUR DE RÔLE par rareté (retour du 30/09 : « toutes les chasses opti
            se font sur des Légendaires »). Lues dans l'ordre L, UR, SR…, les nombreuses L qui
            finissent bientôt consommaient tout le budget du passage : les autres raretés
@@ -6314,6 +6341,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const byRar = new Map();
         for (const c of cands) {
             if (!c.cardId || getCachedSales(c.cardId) || salesFetchBlocked(c.cardId)) continue;
+            if (c.remaining > OPTI_COTE_HORIZON_MS) continue;
             if (!byRar.has(c.rar)) byRar.set(c.rar, []);
             if (!byRar.get(c.rar).some(x => x.cardId === c.cardId)) byRar.get(c.rar).push(c);
         }
@@ -6369,9 +6397,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const tracked = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet, ...legendHunt.keys()])];
         if (tracked.length === 0) return;
 
-        // Ne pas fetch les enchères en cours de bid (lock)
-        const toFetch = tracked.filter(id => !bidLockSet.has(id));
+        // Ne pas fetch les enchères en cours de bid (lock), ni celles dont le rythme propre
+        // ne demande pas encore de nouvelle lecture.
+        const now = Date.now();
+        const trackedSet = new Set(tracked);
+        for (const id of [...hotLaneLastRead.keys()]) if (!trackedSet.has(id)) hotLaneLastRead.delete(id);
+        const toFetch = tracked.filter(id => {
+            if (bidLockSet.has(id)) return false;
+            const iv = hotLaneItemInterval(id);
+            return iv !== null && now - (hotLaneLastRead.get(id) || 0) >= iv - 50;
+        });
         if (toFetch.length === 0) return;
+        for (const id of toFetch) hotLaneLastRead.set(id, now);
 
         hotLaneTickCount++;
 
