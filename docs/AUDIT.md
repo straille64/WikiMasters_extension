@@ -1322,6 +1322,25 @@ sans bandeau ; fork.41 : 1 refus, reprise 10,1 s après. Prix manuel : 150 sous 
 (et encore 150 après un invendu), 500 sans cote, vente à 1 754 retirée puis remise à 400, retour à
 la cote (400) après effacement.
 
+### #59 — Pendant la pause anti-bot, le bot continuait d'interroger le site (fork.41)
+
+**Constat (question de l'utilisateur, 03/10)** : la pause de #57 ne bloquait que les MISES. Scan
+du marché, Chasses (pages par rareté + cotes), voie rapide, solde, ventes, Revente… continuaient :
+mesuré en test, **59 requêtes pendant une pause de 10 s**.
+
+**✅ Corrigé (1.3.13-fork.42)** : pendant la pause, **aucune requête du bot**. Tout le code du bot
+appelle `fetch(...)` ; une fonction `fetch` déclarée en tête du script (portée du script, donc
+prioritaire sur `window.fetch`) retient chaque requête jusqu'à la fin de la pause. Les requêtes
+du **site** (`window.fetch`, dont sa propre vérification) ne passent jamais par là. En plus, pour
+qu'aucune rafale ne parte à la reprise : scan du marché, voie rapide, découverte des Chasses,
+moniteur des ventes, rafraîchissement des ventes / de la collection, cotes de la collection se
+mettent en veille ; la lecture des cotes (fetch d'origine) et les délais d'abandon
+(`fetchWithTimeout`) attendent la fin de la pause avant de démarrer ; la mise en vente par
+l'interface du site attend aussi. Statut du Market Watcher : « 🛡️ pause anti-bot ».
+
+Test : `antibot-manual-price` A — fork.41 : 59 requêtes pendant la pause ; fork.42 : 0, puis
+reprise (requêtes et mise acceptée 10,1 s après le refus).
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

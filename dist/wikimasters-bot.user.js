@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.41
+// @version      1.3.13-fork.42
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,9 +22,43 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.41';
+    const WM_VERSION = '1.3.13-fork.42';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
+
+    /* ===================== PAUSE RÉSEAU DU BOT ===================== */
+
+    /* Pendant une pause « vérification anti-bot » (cf. onHumanCheckRequired), le bot ne fait
+       PLUS AUCUNE requête : demande de l'utilisateur du 03/10 — avant, seules les mises
+       s'arrêtaient, scans, cotes, voie rapide, ventes… continuaient d'interroger le site.
+       Tout le code du bot appelle `fetch(...)` : cette fonction, déclarée dans la portée du
+       script, passe donc avant window.fetch. Les requêtes du SITE (window.fetch, dont sa
+       propre vérification) ne sont jamais retenues. Une requête du bot lancée pendant la
+       pause attend sa fin (ou son propre délai d'abandon, s'il en a un). */
+    const botNet = { pausedUntil: 0 };
+    function botNetPaused() { return Date.now() < botNet.pausedUntil; }
+    function waitBotNetResume(signal) {
+        if (!botNetPaused()) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            let t = null;
+            const onAbort = () => { if (t) clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')); };
+            const check = () => {
+                if (signal && signal.aborted) return onAbort();
+                const left = botNet.pausedUntil - Date.now();
+                if (left <= 0) {
+                    if (signal) signal.removeEventListener('abort', onAbort);
+                    return resolve();
+                }
+                t = setTimeout(check, Math.min(left + 20, 5000));
+            };
+            if (signal) signal.addEventListener('abort', onAbort, { once: true });
+            check();
+        });
+    }
+    function fetch(input, init) {
+        if (!botNetPaused()) return window.fetch(input, init);
+        return waitBotNetResume(init && init.signal).then(() => window.fetch(input, init));
+    }
 
     /* ===================== ÉCHAPPEMENT HTML ===================== */
 
@@ -340,6 +374,7 @@
        fichier, qui dépasserait largement le problème signalé. */
     const FETCH_TIMEOUT_MS = 15000;
     async function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+        await waitBotNetResume();   // le délai court à partir de l'envoi réel, pas pendant la pause
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
@@ -1238,6 +1273,7 @@
             // fetch d'origine : notre intercepteur capte les cotes demandées par le SITE ; il
             // stockait aussi une 2e fois celles du bot (et réécrivait tout le cache en local).
             const rawFetch = window.wmOriginalFetch || fetch;
+            await waitBotNetResume();   // fetch d'origine : la pause réseau doit être attendue ici
             // 12 s maximum : la file n'a que 4 places, une lecture bloquée les gèlerait toutes
             // (Chasse, Revente, Trash Seller, surcouche). Abandon = « pas lu », retenté plus tard.
             const ctrl = new AbortController();
@@ -3966,23 +4002,24 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        toutes les 4 à 5 s pendant plus de 3 minutes (même enchère, toujours refusée).
        Pause : 10 s, puis 30 s, 1 min, 2 min, 5 min si le site redemande la vérification
        juste après la reprise ; retour à 10 s après une mise acceptée (ou 15 min sans refus).
-       Seules les mises AUTOMATIQUES sont suspendues : la Revente (mises en vente) et les
-       mises manuelles continuent. */
+       fork.42 (demande du 03/10) : pendant la pause, le bot ne fait plus AUCUNE requête
+       (scans, Chasses, cotes, voie rapide, Revente, Trash Seller, paquets…) — cf. fetch()
+       et botNet en tête du script. Le site, lui, n'est jamais bloqué. */
     const HUMAN_CHECK_RE = /human_verification|anti-?bot|captcha|v[ée]rification humaine/i;
     const HUMAN_CHECK_PAUSES_MS = [10000, 30000, 60000, 120000, 300000];
-    let humanCheckUntil = 0, humanCheckStreak = 0, humanCheckLastAt = 0;
+    let humanCheckStreak = 0, humanCheckLastAt = 0;
     let humanCheckTimer = null, humanCheckTick = null;
-    function humanCheckActive() { return Date.now() < humanCheckUntil; }
+    function humanCheckActive() { return botNetPaused(); }
     function isHumanCheckRefusal(data, err) {
         return !!((data && data.code === 'human_verification_required') || HUMAN_CHECK_RE.test(String(err || '')));
     }
     function renderHumanCheckBanner() {
         const el = document.getElementById('wm-antibot-banner');
         if (!el) return;
-        const left = Math.ceil((humanCheckUntil - Date.now()) / 1000);
+        const left = Math.ceil((botNet.pausedUntil - Date.now()) / 1000);
         if (left <= 0 || !getSetting('antiBotBanner')) { el.style.display = 'none'; el.innerHTML = ''; return; }
         el.style.display = 'block';
-        el.innerHTML = `🛡️ <b>Vérification anti-bot du site</b> — mises automatiques en pause, reprise dans <b>${left} s</b>. La Revente continue.`;
+        el.innerHTML = `🛡️ <b>Vérification anti-bot du site</b> — le bot est en pause (aucune requête), reprise dans <b>${left} s</b>.`;
     }
     function notifyHumanCheck(body) {
         if (!getSetting('antiBotNotif')) return;
@@ -4007,11 +4044,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const ms = HUMAN_CHECK_PAUSES_MS[Math.min(humanCheckStreak, HUMAN_CHECK_PAUSES_MS.length - 1)];
         humanCheckStreak++;
         humanCheckLastAt = Date.now();
-        humanCheckUntil = Date.now() + ms;
+        botNet.pausedUntil = Date.now() + ms;   // coupe TOUTES les requêtes du bot (cf. fetch en tête)
         const pause = ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Math.round(ms / 1000)} s`;
-        wmLog(`🛡️ Le site demande une <b>vérification anti-bot</b> (${esc(contexte || 'mise')} · <b>${esc(title || '?')}</b>) — mises automatiques en pause <b>${pause}</b>${humanCheckStreak > 1 ? ` (${humanCheckStreak}ᵉ fois d'affilée)` : ''}. La Revente continue.`);
+        wmLog(`🛡️ Le site demande une <b>vérification anti-bot</b> (${esc(contexte || 'mise')} · <b>${esc(title || '?')}</b>) — <b>tout le bot en pause ${pause}</b>, aucune requête au site${humanCheckStreak > 1 ? ` (${humanCheckStreak}ᵉ fois d'affilée)` : ''}.`);
         playSound('antibot');
-        notifyHumanCheck(`Mises automatiques en pause ${pause}. Elles reprendront toutes seules.`);
+        notifyHumanCheck(`Bot en pause ${pause} (aucune requête). Il reprendra tout seul.`);
         renderHumanCheckBanner();
         if (humanCheckTick) clearInterval(humanCheckTick);
         humanCheckTick = setInterval(renderHumanCheckBanner, 1000);
@@ -4020,7 +4057,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (humanCheckTick) { clearInterval(humanCheckTick); humanCheckTick = null; }
             humanCheckTimer = null;
             renderHumanCheckBanner();
-            wmLog('🛡️ Fin de la pause anti-bot — mises automatiques reprises.');
+            wmLog('🛡️ Fin de la pause anti-bot — le bot reprend (requêtes et mises).');
         }, ms + 50);
     }
 
@@ -6167,7 +6204,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     }
 
     async function discoverLegends() {
-        if (!getSetting('legendHuntEnabled') || !marketWatcherActive) return;
+        if (!getSetting('legendHuntEnabled') || !marketWatcherActive || botNetPaused()) return;
         // Ménage : enchères terminées depuis plus de 30 s.
         for (const id of [...legendHunt.keys()]) {
             const hit = activeHitsMap.get(id);
@@ -6251,7 +6288,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return String(getSetting('optiRarities') || '').toUpperCase().split(/[,\s]+/).filter(r => RARITY[r]);
     }
     async function discoverOpti() {
-        if (!getSetting('optiHuntEnabled') || !marketWatcherActive) return;
+        if (!getSetting('optiHuntEnabled') || !marketWatcherActive || botNetPaused()) return;
         for (const [id, e] of [...legendHunt.entries()]) {
             if (e.kind !== 'opti') continue;
             const hit = activeHitsMap.get(id);
@@ -6349,6 +6386,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     window.wmDiscoverLegends = () => discoverLegends();
 
     async function hotLaneTick() {
+        if (botNetPaused()) return;   // pause anti-bot : aucune lecture (le tick suivant repassera)
         const tracked = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet, ...legendHunt.keys()])];
         if (tracked.length === 0) return;
 
@@ -6660,6 +6698,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Une boucle d'un démarrage précédent ne programme plus rien : une seule boucle vit.
         if (!marketWatcherActive || loopGen !== marketLoopGen) return;
         window.__wmMarketEls = { alertEl: marketAlertEl, statusEl: marketStatusEl };
+        // Pause anti-bot : aucun scan ; la boucle repasse à la fin de la pause.
+        if (botNetPaused()) {
+            if (marketStatusEl) marketStatusEl.innerHTML = `<span style="color:#ef4444;font-size:10px;white-space:nowrap;">🛡️ pause anti-bot</span>`;
+            marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl, loopGen),
+                Math.max(500, botNet.pausedUntil - Date.now() + 300));
+            return;
+        }
         if (marketScanInProgress) {
             // Un scan (périmé) finit sa page en cours : on repasse dans un instant au lieu
             // d'abandonner — avant, ce `return` tuait la boucle jusqu'à la fin du vieux scan.
@@ -7772,6 +7817,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         let limitReached = false; // 409 « plafond serveur atteint » → inutile d'insister
         for (const item of cards) {
             if (limitReached) { skipped++; continue; }
+            // Pause anti-bot : la mise en vente par l'interface passe par les requêtes du SITE
+            // (non retenues par fetch du bot) — on attend donc ici la fin de la pause.
+            await waitBotNetResume();
             const rarity = (item.card_id ? (item.card?.rarity || "C") : "C").toUpperCase();
             const cardId = item.card_id || item.card?.id;
             const duration = getSellDuration(rarity);
@@ -13987,13 +14035,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // le martèlement de /api/my-collection semble saturer le serveur. Appelle maintenant
         // fetchCollection() directement, sans vider le cache : reste incrémental et léger.
         setInterval(async () => {
-            if (refreshBtn.disabled) return;
+            if (refreshBtn.disabled || botNetPaused()) return;
             await fetchCollection(collProgress);
         }, 3*60*1000);
 
         // Refresh auto des ventes actives toutes les 30s, indépendamment du trash seller.
         // Porte AUSSI la synchro des enchères gagnées, pour ne pas rouvrir une requête /mine.
         const refreshActiveSales = async () => {
+            if (botNetPaused()) return;   // pause anti-bot : pas de requête (et pas d'empilement)
             try {
                 // Affichage seulement : un état lu il y a moins de 25 s (par la Revente ou le
                 // Trash Seller) suffit — pas de nouvelle requête /mine + base.
@@ -14012,7 +14061,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Filet de sécurité : réconcilie les ventes en attente toutes les 5 min (retag des
         // invendues revenues), même si le Trash Seller n'est pas lancé. Sans effet si rien
         // n'est en attente. Complète la passe unique du démarrage.
-        setInterval(() => { reconcilePendingSales().catch(() => {}); }, 5 * 60 * 1000);
+        setInterval(() => { if (!botNetPaused()) reconcilePendingSales().catch(() => {}); }, 5 * 60 * 1000);
 
         // (La synchro des enchères gagnées est portée par refreshActiveSales ci-dessus : elle
         // tourne donc bien même Market Watcher à l'arrêt, sans requête supplémentaire.)
@@ -14194,7 +14243,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // de 5 min, un rechargement renverrait des « VENDU » déjà annoncés).
     let _salesMonitorPrimed = false;
     async function checkRecentSales() {
-        if (_checkRecentSalesRunning) return;
+        if (_checkRecentSalesRunning || botNetPaused()) return;
         _checkRecentSalesRunning = true;
         try {
             const recentSales = await fetchSoldFromDb(30);
@@ -16109,7 +16158,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Re-met en file les cartes VISIBLES encore sans cote, dès que le site le permet
     // (blocage par carte expiré, pause globale terminée). Aucune requête sinon.
     function healCollectionQuotes() {
-        if (Date.now() < salesEndpointCooldownUntil) return;
+        if (Date.now() < salesEndpointCooldownUntil || botNetPaused()) return;
         let queued = 0;
         for (const el of collectionVisibleProbes) {
             if (!el.isConnected) { collectionVisibleProbes.delete(el); continue; }

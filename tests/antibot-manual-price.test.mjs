@@ -54,7 +54,9 @@ async function scenarioAntiBot() {
   const t0 = Date.now();
   const st = { cur: null, bidder: null, end: t0 + 42000 };
   const bids = [];          // { t, amount, status }
+  const reqs = [];          // toutes les requêtes du bot vers le site : { t, url }
   let firstRefusal = 0;
+  page.on('request', r => { const u = r.url(); if (/\/api\/|\/rest\/v1\//.test(u)) reqs.push({ t: Date.now(), url: u }); });
   await page.goto(origin);
   await page.evaluate(() => {
     for (const [k, v] of Object.entries({
@@ -107,7 +109,7 @@ async function scenarioAntiBot() {
   });
   const log = await logOf(page);
   await page.close();
-  return { bids, firstRefusal, banner, bannerAfter, log, errors };
+  return { bids, reqs, firstRefusal, banner, bannerAfter, log, errors };
 }
 
 // ── B. Prix manuel
@@ -222,6 +224,11 @@ else {
   const early = A.bids.filter(b => b.t > A.firstRefusal + 50 && b.t < A.firstRefusal + 9500);
   if (early.length) problems.push(`A. ${early.length} mise(s) renvoyée(s) pendant la vérification (${early.map(b => Math.round((b.t - A.firstRefusal) / 100) / 10 + ' s').join(', ')} après le refus) — attendu : pause de 10 s`);
   if (!okBid) problems.push('A. les mises ne reprennent pas après la pause');
+  // fork.42 : pendant la pause, AUCUNE requête du bot (scan, Chasse, voie rapide, solde…).
+  const during = A.reqs.filter(r => r.t > A.firstRefusal + 500 && r.t < A.firstRefusal + 9500);
+  if (during.length) problems.push(`A. ${during.length} requête(s) pendant la pause : ${[...new Set(during.map(r => r.url.replace(/^https?:\/\/[^/]+/, '').split('?')[0]))].slice(0, 6).join(', ')}`);
+  const after = A.reqs.filter(r => r.t > A.firstRefusal + 10000);
+  if (!after.length) problems.push('A. aucune requête après la pause : le bot ne reprend pas');
   if (refusals.length > 1) problems.push(`A. ${refusals.length} refus anti-bot : la vérification a été sollicitée en boucle`);
 }
 if (!/reprise dans/.test(A.banner)) problems.push(`A. bandeau rouge absent pendant la pause (« ${A.banner} »)`);
@@ -254,4 +261,4 @@ if (problems.length) {
   process.exit(1);
 }
 const resume = okBid ? Math.round((okBid.t - A.firstRefusal) / 100) / 10 : '?';
-console.log(`✅ anti-bot : 1 refus, pause 10 s (bandeau + journal), mise reprise ${resume} s après · prix manuel : 150 sous le payé (invendue → 150 encore), sans cote → 500, en vente à 1754 → retirée puis 400, vide → retour à la cote (400)`);
+console.log(`✅ anti-bot : 1 refus, pause 10 s sans aucune requête (bandeau + journal), mise reprise ${resume} s après · prix manuel : 150 sous le payé (invendue → 150 encore), sans cote → 500, en vente à 1754 → retirée puis 400, vide → retour à la cote (400)`);
