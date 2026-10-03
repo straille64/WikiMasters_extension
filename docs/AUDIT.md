@@ -1363,6 +1363,37 @@ Test : `hunt-traffic` — 1 Chasse en fin + 4 enchères à ~4 min, sur 10 s : fo
 (63 par enchère), fork.43 **28** (20 pour la Chasse, 2 pour chacune des autres). Cotes en un
 passage (10 UR bradées, 3 à ~60 s, 7 à ~150 s) : fork.42 10, fork.43 3.
 
+### #61 — Enchères finies depuis des heures relues en boucle (fork.43)
+
+**Constat (capture F12 du 03/10, 29 s)** : 123 lectures d'enchères, dont **119 sur 27 enchères
+finies depuis 1 à 3 h** (anciennes mises, surtout de la Chasse) ; les 2 vraies opportunités, 2
+lectures chacune. Trois causes :
+
+1. avec un mot-clé actif, mes enchères absentes des résultats sont relues une par une ; l'API
+   renvoie une enchère finie par son id → elle comptait comme « présente » → **jamais purgée**,
+   suivie à vie (et `trackMyBid` la remettait même dans le suivi si j'étais le gagnant) ;
+2. un mot-clé **refusé** par le site (fréquent) sautait toute purge ;
+3. la voie rapide relisait toutes les 2 s une enchère dont la fin était passée, sans limite.
+
+**✅ Corrigé (1.3.13-fork.44)** :
+
+- une enchère finie depuis plus de 15 s (heure serveur) ne compte plus comme présente ; son
+  dernier état est gardé pour le journal « gagnée / perdue » ; elle n'est plus remise dans le
+  suivi ;
+- recherche refusée : les enchères suivies dont l'état a plus d'1 min sont relues (25 max) et
+  celles **prouvées** finies sont purgées (la purge reste interdite sur une simple absence) ;
+  le code de purge est sorti dans `pruneTrackedAuctions` ;
+- voie rapide : une enchère finie est relue 1 min au plus (état final), puis plus du tout ;
+- recherche des Chasses toutes les 30 s au lieu de 15 s (demande de l'utilisateur).
+
+Test : `tracked-prune` — 3 enchères finies il y a 2 h + 1 vivante, mot-clé qui répond puis mot-clé
+refusé : fork.43 les garde toutes et les relit en boucle ; fork.44 les purge (« Enchère perdue …
+rival » au journal), plus aucune relecture ensuite, la vivante est conservée.
+
+**Ce que la capture montre aussi** : la toute première mise de la session (20 s après le
+démarrage, 135 requêtes en tout) a été refusée « Vérification anti-bot requise ». Le volume de
+requêtes n'est donc pas ce qui déclenche la vérification.
+
 ## 🟠 Fragilités structurelles
 
 ### 6. `window.fetch` monkey-patché globalement

@@ -84,6 +84,8 @@ Produit `dist/wikimasters-bot.user.js`, vérifie l'alignement des versions et pa
   fixe sur invendu, vente en cours retirée puis remise, retour au prix auto).
 - `tests/hunt-traffic.test.mjs` : voie rapide par enchère (une Chasse en fin ne fait plus relire
   les autres enchères à 0,15 s), rythme serré 0,5 s, cotes de la Chasse opti limitées (6, < 90 s).
+- `tests/tracked-prune.test.mjs` : enchères suivies finies depuis longtemps purgées (mot-clé
+  qui répond ou refusé), plus relues ensuite ; enchère vivante conservée.
 - `tests/hunt-cap-safety.test.mjs` : une Chasse qui lâche une enchère n'efface pas le plafond
   posé par un autre réglage (auto-bid, Chasseur ciblé).
 - `tests/top-cards.test.mjs` : 💎 Cartes les plus chères — collection entière, cote de la

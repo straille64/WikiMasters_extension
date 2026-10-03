@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WikiMasters Bot (fork perso)
 // @namespace    wikimasters-extension
-// @version      1.3.13-fork.43
+// @version      1.3.13-fork.44
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller, étiquetage en masse — pour wiki-masters.com
 // @author       Sephiroth-ctrl (original) — fork straille64
 // @match        https://www.wiki-masters.com/*
@@ -22,7 +22,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.3.13-fork.43';
+    const WM_VERSION = '1.3.13-fork.44';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3614,7 +3614,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         for (const id of missing) {
             try {
                 const a = await fetchSingleAuction(id);
-                if (a && a.id && !seen.has(a.id)) { seen.add(a.id); auctions.push(a); }
+                if (!a || !a.id || seen.has(a.id)) continue;
+                // Dernier état connu (gagnant, prix final) : c'est lui que la purge journalise.
+                if (a.end_at) activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
+                /* fork.44 : une enchère TERMINÉE n'est plus ajoutée au scan. L'API la renvoie
+                   encore par son id des heures après sa fin : elle comptait comme « présente »,
+                   n'était donc jamais purgée, et restait suivie à vie — relue à chaque scan et
+                   toutes les 2 s par la voie rapide (capture du 03/10 : 27 enchères finies
+                   depuis des heures, 119 lectures en 29 s). */
+                if (isAuctionOver(a)) continue;
+                seen.add(a.id); auctions.push(a);
             } catch (e) {}
         }
 
@@ -4879,6 +4888,166 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return false;
     }
 
+    /* Relit (25 au plus, par 5) les enchères suivies dont le dernier état a plus d'une minute,
+       pour que la purge « prouvée » puisse trancher. */
+    async function refreshTrackedStates(scanGen) {
+        const ids = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet,
+            ...hunterFourbeMap.keys(), ...autoBidMaxMap.keys()])];
+        const stale = ids.filter(id => {
+            const l = activeHitsMap.get(id);
+            return !(l && l.at && Date.now() - l.at < 60000);
+        }).slice(0, 25);
+        for (let i = 0; i < stale.length; i += 5) {
+            if (isScanStale(scanGen)) return;
+            const grp = stale.slice(i, i + 5);
+            const res = await Promise.allSettled(grp.map(id => fetchSingleAuction(id)));
+            res.forEach(r => {
+                const a = r.status === 'fulfilled' ? r.value : null;
+                if (a && a.id && a.end_at) activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
+            });
+        }
+    }
+    /* Purge des enchères suivies terminées (mes mises, auto-bid, Fourbe, plafonds…). Sortie
+       de checkMarketplace (fork.44) pour servir aussi quand la recherche est refusée. */
+    function pruneTrackedAuctions(auctions, scan, incomplete) {
+        // Prune : retire de myBidsSet les enchères qui ne sont plus en cours.
+        // Un scan PARTIEL (mot-clé refusé par le serveur) ne prouve rien sur ce qui
+        // manque : purger sur cette base déclarerait terminées des enchères vivantes.
+        // Une enchère listée mais finie depuis plus de 15 s (heure serveur) ne compte plus
+        // comme présente : le site peut la lister ou la renvoyer longtemps après sa fin.
+        const liveIds = new Set(auctions.filter(a => {
+            const end = a.end_at ? new Date(a.end_at).getTime() : NaN;
+            return !(Number.isFinite(end) && end < serverNow() - 15000);
+        }).map(a => a.id));
+        for (const a of auctions) {
+            if (a.end_at && myBidsSet.has(a.id) && !liveIds.has(a.id)) {
+                activeHitsMap.set(a.id, { auction: a, endAt: a.end_at, at: Date.now() });
+            }
+        }
+        /* Scan PARTIEL (mot-clé refusé) : on ne purge que ce qui est PROUVÉ fini — une
+           lecture de moins d'une minute dont la fin est passée de plus de 15 s. Avant,
+           rien n'était purgé du tout, et les refus de recherche sont fréquents. */
+        const provenOver = (id) => {
+            const l = activeHitsMap.get(id);
+            return !!(l && l.at && Date.now() - l.at < 60000 && l.auction && l.auction.end_at
+                && new Date(l.auction.end_at).getTime() < serverNow() - 15000);
+        };
+        const prunable = (set) => [...set].filter(id => !incomplete || provenOver(id));
+        // Suivi ciblé : relectures ratées sans fin connue → présumées vivantes (rien n'est
+        // purgé sur une absence non prouvée), sans bloquer la purge des autres.
+        if (scan.keepIds) for (const id of scan.keepIds) liveIds.add(id);
+        let prunedAny = false;
+        for (const id of prunable(myBidsSet)) {
+            if (liveIds.has(id)) continue;
+            const last = activeHitsMap.get(id);
+            // Garde-fou : si on connaît end_at et qu'il est dans le futur,
+            // c'est juste un blip de scan (pagination ratée, enchère qui glisse entre 2 pages…)
+            // → on attend le scan suivant pour décider
+            if (last && last.auction && last.auction.end_at) {
+                const endTs = new Date(last.auction.end_at).getTime();
+                // Même règle que auctionLikelyStillLive : heure SERVEUR, 15 s de grâce.
+                if (endTs > serverNow() - 15000) continue;
+            }
+            // Tente de récupérer le dernier état connu pour logger qui a gagné / à combien
+            if (last && last.auction) {
+                const a = last.auction;
+                const t = a.card?.wikipedia_title || '?';
+                const r = (a.card?.rarity || '').toUpperCase();
+                const finalBid = a.current_bid ?? a.base_amount;
+                const winner = a.current_bidder?.username || null;
+                if (winner === currentUsername) {
+                    // Note : le comptage des achats (bidsWon/bidsSpent) est fait par
+                    // syncWonAuctions() à partir de l'endpoint serveur, plus fiable.
+                    // Ici on ne fait que logguer en temps réel.
+                    wmLog(`🏆 Enchère gagnée : <b>${t}</b> [${r}] à <span style="color:#fbbf24;">${finalBid} 💰</span>`);
+                } else if (winner) {
+                    wmLog(`🏳️ Enchère perdue : <b>${t}</b> [${r}] · <b>${winner}</b> à <span style="color:#fbbf24;">${finalBid} 💰</span>`);
+                } else {
+                    wmLog(`📭 Enchère terminée sans vente : <b>${t}</b> [${r}]`);
+                }
+            } else {
+                wmLog(`📭 Enchère ${id.slice(0,8)}… terminée`);
+            }
+            myBidsSet.delete(id);
+            prunedAny = true;
+        }
+        if (prunedAny) saveMyBids();
+
+        // Prune autoBidSet : UNIQUEMENT les enchères réellement terminées.
+        // Garde-fou anti-blip → on ne coupe plus l'auto-bid sur une enchère qui a
+        // juste glissé entre 2 pages du scan (cause du « il se désactive sans raison »).
+        let autoBidPruned = false;
+        for (const id of prunable(autoBidSet)) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue; // blip de scan : on garde l'auto-bid
+            const last = activeHitsMap.get(id);
+            const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
+            autoBidSet.delete(id);
+            autoBidPruned = true;
+            wmLog(`🤖 Auto-bid retiré (enchère terminée) : <b>${t}</b>`);
+        }
+        if (autoBidPruned) saveAutoBidSet();
+
+        // Prune le mode Fourbe — même garde-fou anti-blip que l'auto-bid.
+        let snipePruned = false;
+        for (const id of prunable(snipeSet)) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            const last = activeHitsMap.get(id);
+            const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
+            snipeSet.delete(id);
+            snipePruned = true;
+            wmLog(`🕵️ Fourbe retiré (enchère terminée) : <b>${t}</b>`);
+        }
+        if (snipePruned) saveSnipeSet();
+
+        // Prune le suivi du Hunter agressif — même garde-fou anti-blip. Sans ça, la Map
+        // grossirait indéfiniment et un désarmement futur restaurerait des plafonds sur
+        // des enchères mortes depuis longtemps.
+        let aggroPruned = false;
+        for (const id of prunable(hunterFourbeMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            hunterFourbeMap.delete(id); aggroPruned = true;
+        }
+        if (aggroPruned) saveHunterFourbe();
+
+        // Prune les plafonds auto-bid — même garde-fou (sinon on perdrait le plafond
+        // sur un simple blip, et la carte repasserait en auto-bid SANS limite).
+        let maxPruned = false;
+        for (const id of prunable(autoBidMaxMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            autoBidMaxMap.delete(id); maxPruned = true;
+        }
+        if (maxPruned) saveAutoBidMax();
+
+        // Purge le suivi auto-désactivation pour les enchères terminées SANS être
+        // gagnées (perdues, annulées…) — sinon la map grossirait indéfiniment. Une
+        // victoire réelle est déjà retirée de la map par syncWonAuctions() lui-même.
+        let hadPruned = false;
+        for (const id of prunable(hunterAutoDisableMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            hunterAutoDisableMap.delete(id); hadPruned = true;
+        }
+        if (hadPruned) saveHunterAutoDisableMap();
+
+        // Purge le suivi "montant de ma dernière mise" pour les enchères terminées
+        for (const id of prunable(myLastBidMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            myLastBidMap.delete(id);
+        }
+
+        // Purge la dé-dup de log des surenchères pour les enchères terminées (borne la taille,
+        // puisque clearOutbid ne la vide plus lors d'une reprise de lead).
+        for (const id of prunable(outbidLogMap.keys())) {
+            if (liveIds.has(id)) continue;
+            if (auctionLikelyStillLive(id)) continue;
+            outbidLogMap.delete(id);
+        }
+    }
     async function checkMarketplace(marketAlertEl, marketStatusEl, scanGen) {
         if (scanGen === undefined) scanGen = marketScanGen;
         // Pause propre si le réseau est coupé
@@ -4916,6 +5085,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // parcours). C'est ce qui a fait rater les 2 « Marcel Dassault » UR.
             if (scan && scan.refused) {
                 if (isScanStale(scanGen)) return null;
+                // Purge quand même ce qui est PROUVÉ fini (relu il y a < 1 min) : sans ça, des
+                // enchères finies depuis des heures restaient suivies tant que la recherche
+                // était refusée (fréquent), et relues en boucle.
+                await refreshTrackedStates(scanGen);
+                if (isScanStale(scanGen)) return null;
+                pruneTrackedAuctions([], {}, true);
                 marketStatusEl.innerHTML = `<span style="color:#fbbf24;font-size:10px;white-space:nowrap;">⚠️ recherche refusée par le site — nouvel essai dans 20 s</span>`;
                 return 20000 * marketThrottleFactor;
             }
@@ -4946,127 +5121,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
             // Auto-track : si je suis le current bidder sur une enchère, je la mémorise
             auctions.forEach(a => {
-                if (isSelf(a.current_bidder?.username)) trackMyBid(a.id);
+                // Enchère finie : ne pas la (re)mettre dans le suivi — elle vient d'en sortir.
+                if (!isAuctionOver(a) && isSelf(a.current_bidder?.username)) trackMyBid(a.id);
             });
 
-            // Prune : retire de myBidsSet les enchères qui ne sont plus en cours.
-            // Un scan PARTIEL (mot-clé refusé par le serveur) ne prouve rien sur ce qui
-            // manque : purger sur cette base déclarerait terminées des enchères vivantes.
-            const liveIds = new Set(auctions.map(a => a.id));
-            // Suivi ciblé : relectures ratées sans fin connue → présumées vivantes (rien n'est
-            // purgé sur une absence non prouvée), sans bloquer la purge des autres.
-            if (scan.keepIds) for (const id of scan.keepIds) liveIds.add(id);
-            let prunedAny = false;
-            for (const id of (incomplete ? [] : [...myBidsSet])) {
-                if (liveIds.has(id)) continue;
-                const last = activeHitsMap.get(id);
-                // Garde-fou : si on connaît end_at et qu'il est dans le futur,
-                // c'est juste un blip de scan (pagination ratée, enchère qui glisse entre 2 pages…)
-                // → on attend le scan suivant pour décider
-                if (last && last.auction && last.auction.end_at) {
-                    const endTs = new Date(last.auction.end_at).getTime();
-                    // Même règle que auctionLikelyStillLive : heure SERVEUR, 15 s de grâce.
-                    if (endTs > serverNow() - 15000) continue;
-                }
-                // Tente de récupérer le dernier état connu pour logger qui a gagné / à combien
-                if (last && last.auction) {
-                    const a = last.auction;
-                    const t = a.card?.wikipedia_title || '?';
-                    const r = (a.card?.rarity || '').toUpperCase();
-                    const finalBid = a.current_bid ?? a.base_amount;
-                    const winner = a.current_bidder?.username || null;
-                    if (winner === currentUsername) {
-                        // Note : le comptage des achats (bidsWon/bidsSpent) est fait par
-                        // syncWonAuctions() à partir de l'endpoint serveur, plus fiable.
-                        // Ici on ne fait que logguer en temps réel.
-                        wmLog(`🏆 Enchère gagnée : <b>${t}</b> [${r}] à <span style="color:#fbbf24;">${finalBid} 💰</span>`);
-                    } else if (winner) {
-                        wmLog(`🏳️ Enchère perdue : <b>${t}</b> [${r}] · <b>${winner}</b> à <span style="color:#fbbf24;">${finalBid} 💰</span>`);
-                    } else {
-                        wmLog(`📭 Enchère terminée sans vente : <b>${t}</b> [${r}]`);
-                    }
-                } else {
-                    wmLog(`📭 Enchère ${id.slice(0,8)}… terminée`);
-                }
-                myBidsSet.delete(id);
-                prunedAny = true;
-            }
-            if (prunedAny) saveMyBids();
-
-            // Prune autoBidSet : UNIQUEMENT les enchères réellement terminées.
-            // Garde-fou anti-blip → on ne coupe plus l'auto-bid sur une enchère qui a
-            // juste glissé entre 2 pages du scan (cause du « il se désactive sans raison »).
-            let autoBidPruned = false;
-            for (const id of (incomplete ? [] : [...autoBidSet])) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue; // blip de scan : on garde l'auto-bid
-                const last = activeHitsMap.get(id);
-                const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
-                autoBidSet.delete(id);
-                autoBidPruned = true;
-                wmLog(`🤖 Auto-bid retiré (enchère terminée) : <b>${t}</b>`);
-            }
-            if (autoBidPruned) saveAutoBidSet();
-
-            // Prune le mode Fourbe — même garde-fou anti-blip que l'auto-bid.
-            let snipePruned = false;
-            for (const id of (incomplete ? [] : [...snipeSet])) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                const last = activeHitsMap.get(id);
-                const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
-                snipeSet.delete(id);
-                snipePruned = true;
-                wmLog(`🕵️ Fourbe retiré (enchère terminée) : <b>${t}</b>`);
-            }
-            if (snipePruned) saveSnipeSet();
-
-            // Prune le suivi du Hunter agressif — même garde-fou anti-blip. Sans ça, la Map
-            // grossirait indéfiniment et un désarmement futur restaurerait des plafonds sur
-            // des enchères mortes depuis longtemps.
-            let aggroPruned = false;
-            for (const id of (incomplete ? [] : [...hunterFourbeMap.keys()])) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                hunterFourbeMap.delete(id); aggroPruned = true;
-            }
-            if (aggroPruned) saveHunterFourbe();
-
-            // Prune les plafonds auto-bid — même garde-fou (sinon on perdrait le plafond
-            // sur un simple blip, et la carte repasserait en auto-bid SANS limite).
-            let maxPruned = false;
-            for (const id of (incomplete ? [] : [...autoBidMaxMap.keys()])) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                autoBidMaxMap.delete(id); maxPruned = true;
-            }
-            if (maxPruned) saveAutoBidMax();
-
-            // Purge le suivi auto-désactivation pour les enchères terminées SANS être
-            // gagnées (perdues, annulées…) — sinon la map grossirait indéfiniment. Une
-            // victoire réelle est déjà retirée de la map par syncWonAuctions() lui-même.
-            let hadPruned = false;
-            for (const id of (incomplete ? [] : [...hunterAutoDisableMap.keys()])) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                hunterAutoDisableMap.delete(id); hadPruned = true;
-            }
-            if (hadPruned) saveHunterAutoDisableMap();
-
-            // Purge le suivi "montant de ma dernière mise" pour les enchères terminées
-            for (const id of (incomplete ? [] : [...myLastBidMap.keys()])) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                myLastBidMap.delete(id);
-            }
-
-            // Purge la dé-dup de log des surenchères pour les enchères terminées (borne la taille,
-            // puisque clearOutbid ne la vide plus lors d'une reprise de lead).
-            for (const id of (incomplete ? [] : [...outbidLogMap.keys()])) {
-                if (liveIds.has(id)) continue;
-                if (auctionLikelyStillLive(id)) continue;
-                outbidLogMap.delete(id);
-            }
+            pruneTrackedAuctions(auctions, scan, incomplete);
 
             /* ── Classement mots-clés en masse : optimisé pour ~N annonces × ~M mots-clés ──
                AVANT : hasKeyword/hasPriorityKeyword/hasFourbeKeyword/hasHunterKeyword
@@ -6131,7 +6190,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const end = hit && hit.endAt ? new Date(hit.endAt).getTime() : NaN;
         if (!Number.isFinite(end)) return 5000;          // état initial inconnu : on le découvre
         const ms = end - serverNow();
-        if (ms <= 0) return 2000;                         // fin passée : état final (gagnée / perdue)
+        // Fin passée : état final (gagnée / perdue) pendant 1 min, puis plus rien — la purge
+        // du scan s'en charge. Avant : relue toutes les 2 s, sans limite de durée.
+        if (ms <= 0) return ms > -60_000 ? 2000 : null;
         if (legendHunt.has(id) && ms < (getSetting('legendHuntWindowSec') + 10) * 1000) return HOT_LANE_FAST_MS;
         if (snipeSet.has(id) && ms < (getSetting('snipeSecondsBefore') + 10) * 1000) return HOT_LANE_FAST_MS;
         if (ms < 12_000)      return HOT_LANE_FAST_MS;
@@ -6398,13 +6459,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     }
     window.wmDiscoverOpti = () => discoverOpti();
 
+    const LEGEND_DISCOVER_MS = 30 * 1000;
     function startLegendHunt() {
         stopLegendHunt();
         const tick = async () => {
             try { await discoverLegends(); } catch (e) {}
             try { await discoverOpti(); } catch (e) {}
             if (!marketWatcherActive) return;
-            legendHuntTimer = setTimeout(tick, 15000 * marketThrottleFactor);
+            // Recherche toutes les 30 s (demande du 03/10 ; 15 s avant) : l'horizon est de 3 min,
+            // une enchère intéressante est vue plusieurs fois avant sa fenêtre de mise.
+            legendHuntTimer = setTimeout(tick, LEGEND_DISCOVER_MS * marketThrottleFactor);
         };
         legendHuntTimer = setTimeout(tick, 2000);
     }
